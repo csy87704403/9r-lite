@@ -368,12 +368,12 @@ function apiKeyEditor(id,p,isCustom){
   return '<div class="field"><label>API Keys</label><div id="keyList_'+id+'" class="key-list">'+keys.map(key=>apiKeyRowHTML(id,key)).join('')+'</div><div class="bar"><button class="small secondary" onclick="addAPIKeyInput(\''+id+'\')" type="button">新增 API Key</button><span class="muted">按顺序尝试；额度不足时自动切到下一个。</span></div></div>';
 }
 function hydrateCustomKeyEditors(cfg){
-  (cfg.providers || []).filter(isCustomProvider).forEach(p=>{
+  (cfg.providers || []).forEach(p=>{
     const input=document.getElementById('key_'+p.id);
     if(!input) return;
     const field=input.closest('.field');
     if(!field) return;
-    field.outerHTML=apiKeyEditor(p.id,p,true);
+    field.outerHTML=apiKeyEditor(p.id,p,isCustomProvider(p));
     const base=document.getElementById('base_'+p.id);
     const baseField=base && base.closest ? base.closest('.field') : null;
     if(baseField && !document.getElementById('mediaBase_'+p.id)){
@@ -436,23 +436,17 @@ function buildAPIProvider(id){
   const custom=isCustomProvider(prev);
   const keys=custom?apiKeyValues(id):[];
   const next={ ...prev, name:custom?(document.getElementById('name_'+id).value.trim() || prev.name || 'Custom OpenAI Compatible'):prev.name, enabled:!!document.getElementById('enabled_'+id).checked, base_url:document.getElementById('base_'+id).value.trim(), api_key:custom?(keys[0] || ''):document.getElementById('key_'+id).value.trim() };
+  next.image_endpoint=mediaBaseInputValue(id,'image');
+  next.video_endpoint=mediaBaseInputValue(id,'video');
+  next.audio_endpoint=mediaBaseInputValue(id,'audio');
+  delete next.image_base_url;
+  delete next.video_base_url;
+  delete next.audio_base_url;
   if(custom){
     next.api_keys=keys;
-    next.image_endpoint=mediaBaseInputValue(id,'image');
-    next.video_endpoint=mediaBaseInputValue(id,'video');
-    next.audio_endpoint=mediaBaseInputValue(id,'audio');
-    delete next.image_base_url;
-    delete next.video_base_url;
-    delete next.audio_base_url;
     next.provider_specific_data={...(next.provider_specific_data || {}), customProvider:'true'};
   }else{
     delete next.api_keys;
-    delete next.image_endpoint;
-    delete next.video_endpoint;
-    delete next.audio_endpoint;
-    delete next.image_base_url;
-    delete next.video_base_url;
-    delete next.audio_base_url;
   }
   return next;
 }
