@@ -300,6 +300,11 @@ function oauthControls(id){
   if(id==='cline') return '<div class="bar"><button class="small" onclick="startCline()">开始登录</button><span id="clineStatus" class="muted"></span></div>';
   return '';
 }
+function canFetchOAuthModels(id){ return ['oc','mmf','qoder','kilo'].includes(id); }
+function fetchOAuthModelsButton(p){
+  if(!canFetchOAuthModels(p.id)) return '';
+  return '<button class="small secondary" onclick="fetchOAuthProviderModels(\''+p.id+'\')" '+(!providerConnected(p)?'disabled':'')+'>拉取模型</button>';
+}
 function modelRows(p){
   const selected=new Set(selectedModels(p));
   const available=new Set(availableModels(p));
@@ -390,7 +395,7 @@ function renderPublishProviders(){
     const authText=auth==='needs_login' ? '<div class="err">登录失效，需要重新登录。'+esc(authError(p))+'</div>' : '';
     const listControls=models.length ? '<div class="bar"><button class="small secondary" onclick="selectProviderModels(\''+p.id+'\',true)">全选</button><button class="small secondary" onclick="selectProviderModels(\''+p.id+'\',false)">取消所有选择</button></div>' : '';
     const rows=models.length ? '<div class="model-list">'+modelRows(p)+'</div>' : '<div class="muted">登录或拉取后会显示模型。</div>';
-    return '<div class="card"><h3><span class="'+(connected?'green-dot':'gray-dot')+'"></span>'+esc(p.name)+'</h3>'+oauthControls(p.id)+authText+'<div class="muted">已加载 '+models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div><div class="bar"><button class="small" onclick="probeProvider(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!connected || !models.length?'disabled':'')+'>探测可用</button><button class="small secondary" onclick="saveModelSelection(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!models.length?'disabled':'')+'>保存发布列表</button><span id="publishStatus_'+p.id+'" class="muted"></span></div><div id="probeProgress_'+p.id+'" class="progress-wrap"><progress value="0" max="'+models.length+'"></progress><span class="muted">0/'+models.length+'</span></div>'+listControls+rows+'<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="disableProvider(\''+p.id+'\')">停用</button></div></div>';
+    return '<div class="card"><h3><span class="'+(connected?'green-dot':'gray-dot')+'"></span>'+esc(p.name)+'</h3>'+oauthControls(p.id)+authText+'<div class="muted">已加载 '+models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div><div class="bar">'+fetchOAuthModelsButton(p)+'<button class="small" onclick="probeProvider(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!connected || !models.length?'disabled':'')+'>探测可用</button><button class="small secondary" onclick="saveModelSelection(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!models.length?'disabled':'')+'>保存发布列表</button><span id="publishStatus_'+p.id+'" class="muted"></span></div><div id="probeProgress_'+p.id+'" class="progress-wrap"><progress value="0" max="'+models.length+'"></progress><span class="muted">0/'+models.length+'</span></div>'+listControls+rows+'<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="disableProvider(\''+p.id+'\')">停用</button></div></div>';
   });
   root.innerHTML=items.join('') || '<div class="muted">还没有可发布的模型。</div>';
 }
@@ -515,6 +520,7 @@ async function deleteAPIProvider(id){
   }catch(e){ setText('apiStatus_'+id,'err',e.message); }
 }
 async function fetchAPIProviderModels(id){ try{ setText('apiStatus_'+id,'muted','正在保存...'); const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid'); applyGatewaySettings(cfg); const next=buildAPIProvider(id); cfg.providers=cfg.providers.map(p=>p.id===id?next:p); ensureBlankCustomProvider(cfg); await saveConfigObject(cfg); setText('apiStatus_'+id,'muted','正在拉取模型...'); const res=await fetch('/api/provider/models',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id})}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); await reloadConfig(); setText('apiStatus_'+id,'ok','已拉取 '+(data.count || 0)+' 个模型'); }catch(e){ setText('apiStatus_'+id,'err',e.message); } }
+async function fetchOAuthProviderModels(id){ try{ const statusID='publishStatus_'+id; setText(statusID,'muted','正在拉取模型...'); const res=await fetch('/api/provider/models',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id})}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); await reloadConfig(); setText(statusID,'ok','已拉取 '+(data.count || 0)+' 个模型'); }catch(e){ setText('publishStatus_'+id,'err',e.message); } }
 async function addAPIModel(id){
   try{
     const input=document.getElementById('manualModel_'+id); const model=(input && input.value || '').trim();

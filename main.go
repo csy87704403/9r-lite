@@ -546,27 +546,21 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider not found"})
 		return
 	}
-	if p.Type != "openai" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "only openai-compatible providers support model fetch"})
-		return
-	}
-	if strings.TrimSpace(p.BaseURL) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider base_url is empty"})
-		return
-	}
-	if len(providerAPIKeys(p)) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider api_key is empty"})
-		return
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
-	ids, err := fetchOpenAIModels(ctx, s.client, p)
+	ids, err := s.fetchProviderModels(ctx, p)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 		return
 	}
+	oldEnabled := append([]string(nil), p.EnabledModels...)
+	manual := providerManualPublishOverride(p)
 	p.Models = uniqueStrings(ids)
-	p.EnabledModels = append([]string(nil), p.Models...)
+	if manual {
+		p.EnabledModels = orderedIntersection(p.Models, oldEnabled)
+	} else {
+		p.EnabledModels = append([]string(nil), p.Models...)
+	}
 	p.AvailableModels = nil
 	p.ModelLatencyMS = nil
 	p.ModelErrors = nil
@@ -576,7 +570,9 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 		p.ProviderSpecificData = map[string]string{}
 	}
 	p.ProviderSpecificData["apiModelsFetched"] = "true"
-	clearManualPublishOverride(&p)
+	if !manual {
+		clearManualPublishOverride(&p)
+	}
 	if err := s.updateProvider(p); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -1107,6 +1103,45 @@ func (s *Server) modelsForProvider(ctx context.Context, p ProviderConfig) []stri
 		return p.Models
 	default:
 		return p.Models
+	}
+}
+
+func (s *Server) fetchProviderModels(ctx context.Context, p ProviderConfig) ([]string, error) {
+	switch p.Type {
+	case "opencode-free":
+		ids, err := fetchOpenCodeModels(ctx, s.client)
+		if err != nil {
+			return nil, err
+		}
+		if len(ids) == 0 {
+			return nil, errors.New("opencode returned no models")
+		}
+		return ids, nil
+	case "mimo-free":
+		if len(p.Models) > 0 {
+			return p.Models, nil
+		}
+		return []string{"mimo-auto"}, nil
+	case "qoder":
+		if p.AccessToken == "" || p.ProviderSpecificData["userId"] == "" {
+			return nil, errors.New("qoder is not logged in")
+		}
+		return fetchQoderModels(ctx, s.client, p, true)
+	case "kilocode":
+		return fetchKiloFreeModels(ctx, s.client, p)
+	case "openai":
+		if strings.TrimSpace(p.BaseURL) == "" {
+			return nil, errors.New("provider base_url is empty")
+		}
+		if len(providerAPIKeys(p)) == 0 {
+			return nil, errors.New("provider api_key is empty")
+		}
+		return fetchOpenAIModels(ctx, s.client, p)
+	default:
+		if len(p.Models) == 0 {
+			return nil, fmt.Errorf("%s does not support model fetch", p.ID)
+		}
+		return p.Models, nil
 	}
 }
 
