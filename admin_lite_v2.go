@@ -183,7 +183,8 @@ function authError(p){ return (p && p.provider_specific_data && p.provider_speci
 function manualOverride(p){ return !!(p && p.provider_specific_data && p.provider_specific_data.manualPublishOverride==='true'); }
 function isCustomProvider(p){ return !!(p && p.type==='openai' && /^custom/.test(p.id || '')); }
 function providerAPIKeys(p){ return unique([((p && p.api_key) || ''), ...((p && Array.isArray(p.api_keys)) ? p.api_keys : [])].map(x=>String(x || '').trim()).filter(Boolean)); }
-function customHasContent(p){ return !!(p && (providerAPIKeys(p).length || ((p.base_url || '').trim() && p.base_url !== 'https://example.com/v1') || (p.provider_specific_data && p.provider_specific_data.apiModelsFetched==='true'))); }
+function hasMediaBaseURL(p){ return !!(p && ((p.image_base_url || '').trim() || (p.video_base_url || '').trim() || (p.audio_base_url || '').trim())); }
+function customHasContent(p){ return !!(p && (providerAPIKeys(p).length || hasMediaBaseURL(p) || ((p.base_url || '').trim() && p.base_url !== 'https://example.com/v1') || (p.provider_specific_data && p.provider_specific_data.apiModelsFetched==='true'))); }
 function nextCustomID(cfg){ const ids=new Set((cfg.providers || []).map(p=>p.id)); let i=1; while(ids.has(i===1?'custom':'custom'+i)) i++; return i===1?'custom':'custom'+i; }
 function ensureBlankCustomProvider(cfg){
   if(!Array.isArray(cfg.providers)) cfg.providers=[];
@@ -367,8 +368,31 @@ function hydrateCustomKeyEditors(cfg){
     const field=input.closest('.field');
     if(!field) return;
     field.outerHTML=apiKeyEditor(p.id,p,true);
+    const base=document.getElementById('base_'+p.id);
+    const baseField=base && base.closest ? base.closest('.field') : null;
+    if(baseField && !document.getElementById('mediaBase_'+p.id)){
+      baseField.insertAdjacentHTML('afterend', mediaBaseEditor(p.id,p));
+    }
     refreshAPIKeyRemoveButtons(p.id);
   });
+}
+function mediaBaseValue(p, kind){ return (p && p[kind+'_base_url']) || ''; }
+function mediaBaseEditor(id,p){
+  const kinds=[['image','图片'],['video','视频'],['audio','音频']];
+  return '<div id="mediaBase_'+id+'" class="field"><label>媒体 Base URL</label><div class="bar">'+kinds.map(([kind,label])=>'<button class="small secondary" type="button" onclick="showMediaBaseInput(\''+id+'\',\''+kind+'\')">新增'+label+' Base URL</button>').join('')+'</div><div class="key-list">'+kinds.map(([kind,label])=>mediaBaseInputHTML(id,kind,label,mediaBaseValue(p,kind))).join('')+'</div></div>';
+}
+function mediaBaseInputHTML(id,kind,label,value){
+  return '<div id="'+kind+'BaseRow_'+id+'" class="field" style="'+(value?'':'display:none')+'"><label>'+label+' Base URL</label><input id="'+kind+'Base_'+id+'" value="'+esc(value || '')+'" placeholder="https://example.com/v1"></div>';
+}
+function showMediaBaseInput(id,kind){
+  const row=document.getElementById(kind+'BaseRow_'+id);
+  if(row) row.style.display='';
+  const input=document.getElementById(kind+'Base_'+id);
+  if(input) input.focus();
+}
+function mediaBaseInputValue(id,kind){
+  const input=document.getElementById(kind+'Base_'+id);
+  return input ? input.value.trim() : '';
 }
 function renderAPIProviders(){
   const root=document.getElementById('apiProviders'); const cfg=parseConfig();
@@ -408,9 +432,15 @@ function buildAPIProvider(id){
   const next={ ...prev, name:custom?(document.getElementById('name_'+id).value.trim() || prev.name || 'Custom OpenAI Compatible'):prev.name, enabled:!!document.getElementById('enabled_'+id).checked, base_url:document.getElementById('base_'+id).value.trim(), api_key:custom?(keys[0] || ''):document.getElementById('key_'+id).value.trim() };
   if(custom){
     next.api_keys=keys;
+    next.image_base_url=mediaBaseInputValue(id,'image');
+    next.video_base_url=mediaBaseInputValue(id,'video');
+    next.audio_base_url=mediaBaseInputValue(id,'audio');
     next.provider_specific_data={...(next.provider_specific_data || {}), customProvider:'true'};
   }else{
     delete next.api_keys;
+    delete next.image_base_url;
+    delete next.video_base_url;
+    delete next.audio_base_url;
   }
   return next;
 }

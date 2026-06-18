@@ -57,6 +57,9 @@ type ProviderConfig struct {
 	Type                  string            `json:"type"`
 	Enabled               bool              `json:"enabled"`
 	BaseURL               string            `json:"base_url,omitempty"`
+	ImageBaseURL          string            `json:"image_base_url,omitempty"`
+	VideoBaseURL          string            `json:"video_base_url,omitempty"`
+	AudioBaseURL          string            `json:"audio_base_url,omitempty"`
 	APIKey                string            `json:"api_key,omitempty"`
 	APIKeys               []string          `json:"api_keys,omitempty"`
 	AccessToken           string            `json:"access_token,omitempty"`
