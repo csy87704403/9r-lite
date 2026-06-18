@@ -57,6 +57,9 @@ type ProviderConfig struct {
 	Type                  string            `json:"type"`
 	Enabled               bool              `json:"enabled"`
 	BaseURL               string            `json:"base_url,omitempty"`
+	ImageEndpoint         string            `json:"image_endpoint,omitempty"`
+	VideoEndpoint         string            `json:"video_endpoint,omitempty"`
+	AudioEndpoint         string            `json:"audio_endpoint,omitempty"`
 	ImageBaseURL          string            `json:"image_base_url,omitempty"`
 	VideoBaseURL          string            `json:"video_base_url,omitempty"`
 	AudioBaseURL          string            `json:"audio_base_url,omitempty"`
@@ -128,6 +131,11 @@ type chatRequest struct {
 	Raw    json.RawMessage `json:"-"`
 }
 
+type mediaRequest struct {
+	Model string          `json:"model"`
+	Raw   json.RawMessage `json:"-"`
+}
+
 type internalBypassKey struct{}
 
 func main() {
@@ -160,6 +168,12 @@ func main() {
 	mux.HandleFunc("/health", srv.handleHealth)
 	mux.HandleFunc("/v1/models", srv.handleModels)
 	mux.HandleFunc("/v1/chat/completions", srv.handleChatCompletions)
+	mux.HandleFunc("/v1/images", srv.handleMedia("image"))
+	mux.HandleFunc("/v1/images/models", srv.handleMediaModels("image"))
+	mux.HandleFunc("/v1/videos", srv.handleMedia("video"))
+	mux.HandleFunc("/v1/videos/models", srv.handleMediaModels("video"))
+	mux.HandleFunc("/v1/audio", srv.handleMedia("audio"))
+	mux.HandleFunc("/v1/audio/models", srv.handleMediaModels("audio"))
 
 	go srv.autoProbeLoop()
 
@@ -863,6 +877,102 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleMediaModels(kind string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !s.requireAccessKey(w, r) {
+			return
+		}
+		var models []map[string]any
+		grouped := map[string][]string{}
+		for _, p := range s.enabledProviders() {
+			if mediaEndpoint(p, kind) == "" {
+				continue
+			}
+			for _, id := range mediaModelsForKind(p.Models, kind) {
+				grouped[p.Name] = append(grouped[p.Name], id)
+				models = append(models, map[string]any{
+					"id":       p.ID + "/" + id,
+					"object":   "model",
+					"created":  0,
+					"owned_by": p.ID,
+					"type":     kind,
+				})
+			}
+		}
+		sort.Slice(models, func(i, j int) bool {
+			return fmt.Sprint(models[i]["id"]) < fmt.Sprint(models[j]["id"])
+		})
+		if wantsHTML(r) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(renderModelsHTML(grouped)))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
+	}
+}
+
+func (s *Server) handleMedia(kind string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !s.requireAccessKey(w, r) {
+			return
+		}
+		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<20))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		var req mediaRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		providerID, upstreamModel, ok := strings.Cut(strings.TrimSpace(req.Model), "/")
+		if !ok || providerID == "" || upstreamModel == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "model must be provider/model"})
+			return
+		}
+		p, ok := s.providerByID(providerID)
+		if !ok || !p.Enabled {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider is not enabled: " + providerID})
+			return
+		}
+		target := mediaEndpoint(p, kind)
+		if target == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": kind + " endpoint is not configured for provider: " + providerID})
+			return
+		}
+		keys := providerAPIKeys(p)
+		if len(keys) == 0 {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "provider api_key is empty"})
+			return
+		}
+		body, err := replaceModel(raw, upstreamModel)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		headers := map[string]string{
+			"Content-Type":  "application/json",
+			"Authorization": "Bearer " + keys[0],
+			"Accept":        "application/json",
+			"User-Agent":    "9router-lite/0.1",
+		}
+		if len(keys) > 1 {
+			s.proxyPostRotating(w, r, target, body, keys, headers)
+			return
+		}
+		s.proxyRaw(w, r, target, body, headers)
+	}
+}
+
 func (s *Server) proxyOpenCode(w http.ResponseWriter, r *http.Request, req chatRequest, upstreamModel string) {
 	body, err := replaceModel(req.Raw, upstreamModel)
 	if err != nil {
@@ -952,17 +1062,25 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, p ProviderC
 
 func (s *Server) proxyOpenAIRotating(w http.ResponseWriter, r *http.Request, p ProviderConfig, req chatRequest, upstreamModel string, body []byte, keys []string) {
 	target := joinURL(p.BaseURL, "/chat/completions")
+	headers := map[string]string{
+		"Content-Type": "application/json",
+		"Accept":       acceptHeader(req.Stream),
+		"User-Agent":   "9router-lite/0.1",
+	}
+	s.proxyPostRotating(w, r, target, body, keys, headers)
+}
+
+func (s *Server) proxyPostRotating(w http.ResponseWriter, r *http.Request, target string, body []byte, keys []string, baseHeaders map[string]string) {
 	var lastStatus int
 	var lastHeader http.Header
 	var lastBody []byte
 	var lastErr error
 	for i, key := range keys {
-		headers := map[string]string{
-			"Content-Type":  "application/json",
-			"Authorization": "Bearer " + key,
-			"Accept":        acceptHeader(req.Stream),
-			"User-Agent":    "9router-lite/0.1",
+		headers := make(map[string]string, len(baseHeaders)+1)
+		for k, v := range baseHeaders {
+			headers[k] = v
 		}
+		headers["Authorization"] = "Bearer " + key
 		status, header, respBody, err := s.postUpstreamBuffered(r.Context(), target, body, headers)
 		lastStatus, lastHeader, lastBody, lastErr = status, header, respBody, err
 		if err != nil {
@@ -1808,6 +1926,53 @@ func joinURL(baseURL, suffix string) string {
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + suffix
 	return u.String()
+}
+
+func mediaEndpoint(p ProviderConfig, kind string) string {
+	switch kind {
+	case "image":
+		if strings.TrimSpace(p.ImageEndpoint) != "" {
+			return strings.TrimSpace(p.ImageEndpoint)
+		}
+		return strings.TrimSpace(p.ImageBaseURL)
+	case "video":
+		if strings.TrimSpace(p.VideoEndpoint) != "" {
+			return strings.TrimSpace(p.VideoEndpoint)
+		}
+		return strings.TrimSpace(p.VideoBaseURL)
+	case "audio":
+		if strings.TrimSpace(p.AudioEndpoint) != "" {
+			return strings.TrimSpace(p.AudioEndpoint)
+		}
+		return strings.TrimSpace(p.AudioBaseURL)
+	default:
+		return ""
+	}
+}
+
+func mediaModelsForKind(models []string, kind string) []string {
+	var needles []string
+	switch kind {
+	case "image":
+		needles = []string{"image", "imagen", "flux", "sdxl", "dall-e", "gpt-image", "agnes-image"}
+	case "video":
+		needles = []string{"video", "veo", "sora", "kling", "runway", "agnes-video"}
+	case "audio":
+		needles = []string{"audio", "tts", "speech", "voice", "music", "lyria", "whisper"}
+	default:
+		return nil
+	}
+	var out []string
+	for _, model := range uniqueStrings(models) {
+		lower := strings.ToLower(model)
+		for _, needle := range needles {
+			if strings.Contains(lower, needle) {
+				out = append(out, model)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func uniqueStrings(in []string) []string {

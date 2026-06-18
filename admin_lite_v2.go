@@ -88,6 +88,12 @@ details{margin-top:22px}
 <div class="endpoint-grid"><span class="muted">Base URL</span><input id="programBaseUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programBaseUrl','Base URL')" type="button">复制</button></div>
 <div class="endpoint-grid"><span class="muted">模型列表</span><input id="programModelsUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programModelsUrl','模型列表地址')" type="button">复制</button></div>
 <div class="endpoint-grid"><span class="muted">健康检查</span><input id="programHealthUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programHealthUrl','健康检查地址')" type="button">复制</button></div>
+<div class="endpoint-grid"><span class="muted">图片接口</span><input id="programImagesUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programImagesUrl','图片接口')" type="button">复制</button></div>
+<div class="endpoint-grid"><span class="muted">图片模型</span><input id="programImageModelsUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programImageModelsUrl','图片模型列表')" type="button">复制</button></div>
+<div class="endpoint-grid"><span class="muted">视频接口</span><input id="programVideosUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programVideosUrl','视频接口')" type="button">复制</button></div>
+<div class="endpoint-grid"><span class="muted">视频模型</span><input id="programVideoModelsUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programVideoModelsUrl','视频模型列表')" type="button">复制</button></div>
+<div class="endpoint-grid"><span class="muted">音频接口</span><input id="programAudioUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programAudioUrl','音频接口')" type="button">复制</button></div>
+<div class="endpoint-grid"><span class="muted">音频模型</span><input id="programAudioModelsUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programAudioModelsUrl','音频模型列表')" type="button">复制</button></div>
 <div class="muted">第三方 Agent 的 Base URL 填 <code>/v1</code>，API Key 填上面的访问密钥；程序健康检查建议使用 JSON 地址。</div>
 </div>
 
@@ -168,6 +174,12 @@ function setConfig(cfg){
   document.getElementById('programBaseUrl').value=location.origin+'/v1';
   document.getElementById('programModelsUrl').value=location.origin+'/v1/models';
   document.getElementById('programHealthUrl').value=location.origin+'/health?format=json';
+  document.getElementById('programImagesUrl').value=location.origin+'/v1/images';
+  document.getElementById('programImageModelsUrl').value=location.origin+'/v1/images/models';
+  document.getElementById('programVideosUrl').value=location.origin+'/v1/videos';
+  document.getElementById('programVideoModelsUrl').value=location.origin+'/v1/videos/models';
+  document.getElementById('programAudioUrl').value=location.origin+'/v1/audio';
+  document.getElementById('programAudioModelsUrl').value=location.origin+'/v1/audio/models';
   document.getElementById('autoProbeEnabled').checked=!!cfg.auto_probe_enabled;
   document.getElementById('autoProbeInterval').value=cfg.auto_probe_interval_minutes || 60;
   document.getElementById('autoModelEnabled').checked=!!cfg.auto_model.enabled;
@@ -183,8 +195,8 @@ function authError(p){ return (p && p.provider_specific_data && p.provider_speci
 function manualOverride(p){ return !!(p && p.provider_specific_data && p.provider_specific_data.manualPublishOverride==='true'); }
 function isCustomProvider(p){ return !!(p && p.type==='openai' && /^custom/.test(p.id || '')); }
 function providerAPIKeys(p){ return unique([((p && p.api_key) || ''), ...((p && Array.isArray(p.api_keys)) ? p.api_keys : [])].map(x=>String(x || '').trim()).filter(Boolean)); }
-function hasMediaBaseURL(p){ return !!(p && ((p.image_base_url || '').trim() || (p.video_base_url || '').trim() || (p.audio_base_url || '').trim())); }
-function customHasContent(p){ return !!(p && (providerAPIKeys(p).length || hasMediaBaseURL(p) || ((p.base_url || '').trim() && p.base_url !== 'https://example.com/v1') || (p.provider_specific_data && p.provider_specific_data.apiModelsFetched==='true'))); }
+function hasMediaEndpoint(p){ return !!(p && ((p.image_endpoint || p.image_base_url || '').trim() || (p.video_endpoint || p.video_base_url || '').trim() || (p.audio_endpoint || p.audio_base_url || '').trim())); }
+function customHasContent(p){ return !!(p && (providerAPIKeys(p).length || hasMediaEndpoint(p) || ((p.base_url || '').trim() && p.base_url !== 'https://example.com/v1') || (p.provider_specific_data && p.provider_specific_data.apiModelsFetched==='true'))); }
 function nextCustomID(cfg){ const ids=new Set((cfg.providers || []).map(p=>p.id)); let i=1; while(ids.has(i===1?'custom':'custom'+i)) i++; return i===1?'custom':'custom'+i; }
 function ensureBlankCustomProvider(cfg){
   if(!Array.isArray(cfg.providers)) cfg.providers=[];
@@ -376,13 +388,13 @@ function hydrateCustomKeyEditors(cfg){
     refreshAPIKeyRemoveButtons(p.id);
   });
 }
-function mediaBaseValue(p, kind){ return (p && p[kind+'_base_url']) || ''; }
+function mediaBaseValue(p, kind){ return (p && (p[kind+'_endpoint'] || p[kind+'_base_url'])) || ''; }
 function mediaBaseEditor(id,p){
   const kinds=[['image','图片'],['video','视频'],['audio','音频']];
-  return '<div id="mediaBase_'+id+'" class="field"><label>媒体 Base URL</label><div class="bar">'+kinds.map(([kind,label])=>'<button class="small secondary" type="button" onclick="showMediaBaseInput(\''+id+'\',\''+kind+'\')">新增'+label+' Base URL</button>').join('')+'</div><div class="key-list">'+kinds.map(([kind,label])=>mediaBaseInputHTML(id,kind,label,mediaBaseValue(p,kind))).join('')+'</div></div>';
+  return '<div id="mediaBase_'+id+'" class="field"><label>媒体完整 Endpoint</label><div class="bar">'+kinds.map(([kind,label])=>'<button class="small secondary" type="button" onclick="showMediaBaseInput(\''+id+'\',\''+kind+'\')">新增'+label+' Endpoint</button>').join('')+'</div><div class="key-list">'+kinds.map(([kind,label])=>mediaBaseInputHTML(id,kind,label,mediaBaseValue(p,kind))).join('')+'</div><div class="muted">填写上游文档里的完整请求地址，例如 https://apihub.agnes-ai.com/v1/videos。</div></div>';
 }
 function mediaBaseInputHTML(id,kind,label,value){
-  return '<div id="'+kind+'BaseRow_'+id+'" class="field" style="'+(value?'':'display:none')+'"><label>'+label+' Base URL</label><input id="'+kind+'Base_'+id+'" value="'+esc(value || '')+'" placeholder="https://example.com/v1"></div>';
+  return '<div id="'+kind+'BaseRow_'+id+'" class="field" style="'+(value?'':'display:none')+'"><label>'+label+' Endpoint</label><input id="'+kind+'Base_'+id+'" value="'+esc(value || '')+'" placeholder="https://example.com/v1/'+(kind==='image'?'images':kind==='video'?'videos':'audio')+'"></div>';
 }
 function showMediaBaseInput(id,kind){
   const row=document.getElementById(kind+'BaseRow_'+id);
@@ -432,12 +444,18 @@ function buildAPIProvider(id){
   const next={ ...prev, name:custom?(document.getElementById('name_'+id).value.trim() || prev.name || 'Custom OpenAI Compatible'):prev.name, enabled:!!document.getElementById('enabled_'+id).checked, base_url:document.getElementById('base_'+id).value.trim(), api_key:custom?(keys[0] || ''):document.getElementById('key_'+id).value.trim() };
   if(custom){
     next.api_keys=keys;
-    next.image_base_url=mediaBaseInputValue(id,'image');
-    next.video_base_url=mediaBaseInputValue(id,'video');
-    next.audio_base_url=mediaBaseInputValue(id,'audio');
+    next.image_endpoint=mediaBaseInputValue(id,'image');
+    next.video_endpoint=mediaBaseInputValue(id,'video');
+    next.audio_endpoint=mediaBaseInputValue(id,'audio');
+    delete next.image_base_url;
+    delete next.video_base_url;
+    delete next.audio_base_url;
     next.provider_specific_data={...(next.provider_specific_data || {}), customProvider:'true'};
   }else{
     delete next.api_keys;
+    delete next.image_endpoint;
+    delete next.video_endpoint;
+    delete next.audio_endpoint;
     delete next.image_base_url;
     delete next.video_base_url;
     delete next.audio_base_url;
