@@ -162,6 +162,17 @@ const publishProviderIDs=['oc','mmf','qoder','gemini','kilo','cline'];
 const statusProviderIDs=['oc','mmf','qoder','gemini','kilo','cline','glm','groq','deepseek','mimo'];
 let probeStopRequested=false;
 function parseConfig(){ try { return JSON.parse(document.getElementById('cfg').value); } catch { return null; } }
+function ensureEndpointRow(afterID,id,label,path){
+  if(!document.getElementById(id)){
+    const after=document.getElementById(afterID);
+    const parent=after && after.closest ? after.closest('.endpoint-grid') : null;
+    if(parent){
+      parent.insertAdjacentHTML('afterend','<div class="endpoint-grid"><span class="muted">'+esc(label)+'</span><input id="'+esc(id)+'" type="text" readonly><button class="secondary" onclick="copyEndpoint(\''+esc(id)+'\',\''+esc(label)+'\')" type="button">复制</button></div>');
+    }
+  }
+  const input=document.getElementById(id);
+  if(input) input.value=location.origin+path;
+}
 function setConfig(cfg){
   ensureBlankCustomProvider(cfg);
   if(!cfg.auto_model) cfg.auto_model={enabled:false,models:[]};
@@ -171,6 +182,7 @@ function setConfig(cfg){
   document.getElementById('programBaseUrl').value=location.origin+'/v1';
   document.getElementById('programModelsUrl').value=location.origin+'/v1/models';
   document.getElementById('programHealthUrl').value=location.origin+'/health?format=json';
+  ensureEndpointRow('programHealthUrl','programToolsUrl','Tools','/v1/tools');
   document.getElementById('programImagesUrl').value=location.origin+'/v1/images';
   document.getElementById('programVideosUrl').value=location.origin+'/v1/videos';
   document.getElementById('programAudioUrl').value=location.origin+'/v1/audio';

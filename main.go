@@ -167,6 +167,8 @@ func main() {
 	mux.HandleFunc("/api/oauth/cline/callback", srv.handleClineCallback)
 	mux.HandleFunc("/health", srv.handleHealth)
 	mux.HandleFunc("/v1/models", srv.handleModels)
+	mux.HandleFunc("/v1/tools", srv.handleTools)
+	mux.HandleFunc("/tools.json", srv.handleTools)
 	mux.HandleFunc("/v1/chat/completions", srv.handleChatCompletions)
 	mux.HandleFunc("/v1/images", srv.handleMedia("image"))
 	mux.HandleFunc("/v1/images/models", srv.handleMediaModels("image"))
@@ -913,6 +915,29 @@ func (s *Server) handleMediaModels(kind string) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
 	}
+}
+
+func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireAccessKey(w, r) {
+		return
+	}
+	base := requestBaseURL(r)
+	tools := []map[string]any{}
+	for _, kind := range []string{"image", "video", "audio"} {
+		tool := s.mediaToolDefinition(kind, base)
+		if tool != nil {
+			tools = append(tools, tool)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"object":   "tool_list",
+		"base_url": base + "/v1",
+		"tools":    tools,
+	})
 }
 
 func (s *Server) handleMedia(kind string) http.HandlerFunc {
@@ -1973,6 +1998,109 @@ func mediaModelsForKind(models []string, kind string) []string {
 		}
 	}
 	return out
+}
+
+func (s *Server) mediaToolDefinition(kind, base string) map[string]any {
+	var name, path, description string
+	var schema map[string]any
+	var example map[string]any
+	switch kind {
+	case "image":
+		name = "generate_image"
+		path = "/v1/images"
+		description = "Generate an image from a text prompt."
+		schema = map[string]any{
+			"model":  "provider/model",
+			"prompt": "text prompt",
+			"size":   "optional image size, for example 1024x1024",
+		}
+		example = map[string]any{
+			"model":  firstMediaModel(s.enabledProviders(), kind),
+			"prompt": "a futuristic city at sunset",
+			"size":   "1024x1024",
+		}
+	case "video":
+		name = "generate_video"
+		path = "/v1/videos"
+		description = "Generate a video from a text prompt."
+		schema = map[string]any{
+			"model":  "provider/model",
+			"prompt": "text prompt",
+		}
+		example = map[string]any{
+			"model":  firstMediaModel(s.enabledProviders(), kind),
+			"prompt": "a cinematic shot of waves crashing on black rocks",
+		}
+	case "audio":
+		name = "generate_audio"
+		path = "/v1/audio"
+		description = "Generate or process audio with the configured upstream audio endpoint."
+		schema = map[string]any{
+			"model": "provider/model",
+			"input": "text or audio input, depending on the upstream endpoint",
+			"voice": "optional voice name for TTS endpoints",
+		}
+		example = map[string]any{
+			"model": firstMediaModel(s.enabledProviders(), kind),
+			"input": "Hello, this is an audio generation test.",
+			"voice": "alloy",
+		}
+	default:
+		return nil
+	}
+
+	var models []string
+	for _, p := range s.enabledProviders() {
+		if mediaEndpoint(p, kind) == "" {
+			continue
+		}
+		for _, model := range mediaModelsForKind(p.Models, kind) {
+			models = append(models, p.ID+"/"+model)
+		}
+	}
+	models = uniqueStrings(models)
+	if len(models) == 0 {
+		return nil
+	}
+	return map[string]any{
+		"name":        name,
+		"type":        kind,
+		"method":      http.MethodPost,
+		"endpoint":    base + path,
+		"description": description,
+		"models":      models,
+		"schema":      schema,
+		"example":     example,
+	}
+}
+
+func firstMediaModel(providers []ProviderConfig, kind string) string {
+	for _, p := range providers {
+		if mediaEndpoint(p, kind) == "" {
+			continue
+		}
+		models := mediaModelsForKind(p.Models, kind)
+		if len(models) > 0 {
+			return p.ID + "/" + models[0]
+		}
+	}
+	return "provider/model"
+}
+
+func requestBaseURL(r *http.Request) string {
+	proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
+	if proto == "" {
+		if r.TLS != nil {
+			proto = "https"
+		} else {
+			proto = "http"
+		}
+	}
+	host := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = r.Host
+	}
+	return proto + "://" + host
 }
 
 func uniqueStrings(in []string) []string {
