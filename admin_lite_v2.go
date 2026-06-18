@@ -89,11 +89,8 @@ details{margin-top:22px}
 <div class="endpoint-grid"><span class="muted">模型列表</span><input id="programModelsUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programModelsUrl','模型列表地址')" type="button">复制</button></div>
 <div class="endpoint-grid"><span class="muted">健康检查</span><input id="programHealthUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programHealthUrl','健康检查地址')" type="button">复制</button></div>
 <div class="endpoint-grid"><span class="muted">图片接口</span><input id="programImagesUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programImagesUrl','图片接口')" type="button">复制</button></div>
-<div class="endpoint-grid"><span class="muted">图片模型</span><input id="programImageModelsUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programImageModelsUrl','图片模型列表')" type="button">复制</button></div>
 <div class="endpoint-grid"><span class="muted">视频接口</span><input id="programVideosUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programVideosUrl','视频接口')" type="button">复制</button></div>
-<div class="endpoint-grid"><span class="muted">视频模型</span><input id="programVideoModelsUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programVideoModelsUrl','视频模型列表')" type="button">复制</button></div>
 <div class="endpoint-grid"><span class="muted">音频接口</span><input id="programAudioUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programAudioUrl','音频接口')" type="button">复制</button></div>
-<div class="endpoint-grid"><span class="muted">音频模型</span><input id="programAudioModelsUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programAudioModelsUrl','音频模型列表')" type="button">复制</button></div>
 <div class="muted">第三方 Agent 的 Base URL 填 <code>/v1</code>，API Key 填上面的访问密钥；程序健康检查建议使用 JSON 地址。</div>
 </div>
 
@@ -175,11 +172,8 @@ function setConfig(cfg){
   document.getElementById('programModelsUrl').value=location.origin+'/v1/models';
   document.getElementById('programHealthUrl').value=location.origin+'/health?format=json';
   document.getElementById('programImagesUrl').value=location.origin+'/v1/images';
-  document.getElementById('programImageModelsUrl').value=location.origin+'/v1/images/models';
   document.getElementById('programVideosUrl').value=location.origin+'/v1/videos';
-  document.getElementById('programVideoModelsUrl').value=location.origin+'/v1/videos/models';
   document.getElementById('programAudioUrl').value=location.origin+'/v1/audio';
-  document.getElementById('programAudioModelsUrl').value=location.origin+'/v1/audio/models';
   document.getElementById('autoProbeEnabled').checked=!!cfg.auto_probe_enabled;
   document.getElementById('autoProbeInterval').value=cfg.auto_probe_interval_minutes || 60;
   document.getElementById('autoModelEnabled').checked=!!cfg.auto_model.enabled;
