@@ -1,0 +1,7 @@
+.git
+data
+*.log
+*.err.log
+9router-lite
+9router-lite.exe
+9router-lite-linux-amd64

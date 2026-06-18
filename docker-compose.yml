@@ -1,0 +1,17 @@
+services:
+  9router-lite:
+    build: .
+    container_name: 9router-lite
+    restart: unless-stopped
+    ports:
+      - "${PORT:-20129}:20129"
+    environment:
+      PORT: "20129"
+      DATA_DIR: /data
+      LITE_MEMORY_LIMIT_MB: "${LITE_MEMORY_LIMIT_MB:-24}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
+      HTTP_PROXY: "${HTTP_PROXY:-}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-}"
+      NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,::1}"
+    volumes:
+      - ./data:/data
