@@ -926,9 +926,10 @@ func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	base := requestBaseURL(r)
+	key := strings.TrimSpace(r.URL.Query().Get("key"))
 	tools := []map[string]any{}
 	for _, kind := range []string{"image", "video", "audio"} {
-		tool := s.mediaToolDefinition(kind, base)
+		tool := s.mediaToolDefinition(kind, base, key)
 		if tool != nil {
 			tools = append(tools, tool)
 		}
@@ -2000,7 +2001,7 @@ func mediaModelsForKind(models []string, kind string) []string {
 	return out
 }
 
-func (s *Server) mediaToolDefinition(kind, base string) map[string]any {
+func (s *Server) mediaToolDefinition(kind, base, key string) map[string]any {
 	var name, path, description string
 	var schema map[string]any
 	var example map[string]any
@@ -2066,12 +2067,23 @@ func (s *Server) mediaToolDefinition(kind, base string) map[string]any {
 		"name":        name,
 		"type":        kind,
 		"method":      http.MethodPost,
-		"endpoint":    base + path,
+		"endpoint":    appendQueryKey(base+path, key),
 		"description": description,
 		"models":      models,
 		"schema":      schema,
 		"example":     example,
 	}
+}
+
+func appendQueryKey(rawURL, key string) string {
+	if strings.TrimSpace(key) == "" {
+		return rawURL
+	}
+	sep := "?"
+	if strings.Contains(rawURL, "?") {
+		sep = "&"
+	}
+	return rawURL + sep + "key=" + url.QueryEscape(key)
 }
 
 func firstMediaModel(providers []ProviderConfig, kind string) string {

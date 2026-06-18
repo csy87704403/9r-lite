@@ -173,6 +173,10 @@ function ensureEndpointRow(afterID,id,label,path){
   const input=document.getElementById(id);
   if(input) input.value=location.origin+path;
 }
+function pathWithKey(path,cfg){
+  const key=(cfg && cfg.access_key) || '';
+  return key ? path+(path.includes('?')?'&':'?')+'key='+encodeURIComponent(key) : path;
+}
 function setConfig(cfg){
   ensureBlankCustomProvider(cfg);
   if(!cfg.auto_model) cfg.auto_model={enabled:false,models:[]};
@@ -180,12 +184,12 @@ function setConfig(cfg){
   document.getElementById('accessKey').value=cfg.access_key || '';
   document.getElementById('baseUrl').value=location.origin+'/v1';
   document.getElementById('programBaseUrl').value=location.origin+'/v1';
-  document.getElementById('programModelsUrl').value=location.origin+'/v1/models';
+  document.getElementById('programModelsUrl').value=location.origin+pathWithKey('/v1/models',cfg);
   document.getElementById('programHealthUrl').value=location.origin+'/health?format=json';
-  ensureEndpointRow('programHealthUrl','programToolsUrl','Tools','/v1/tools');
-  document.getElementById('programImagesUrl').value=location.origin+'/v1/images';
-  document.getElementById('programVideosUrl').value=location.origin+'/v1/videos';
-  document.getElementById('programAudioUrl').value=location.origin+'/v1/audio';
+  ensureEndpointRow('programHealthUrl','programToolsUrl','Tools',pathWithKey('/v1/tools',cfg));
+  document.getElementById('programImagesUrl').value=location.origin+pathWithKey('/v1/images',cfg);
+  document.getElementById('programVideosUrl').value=location.origin+pathWithKey('/v1/videos',cfg);
+  document.getElementById('programAudioUrl').value=location.origin+pathWithKey('/v1/audio',cfg);
   document.getElementById('autoProbeEnabled').checked=!!cfg.auto_probe_enabled;
   document.getElementById('autoProbeInterval').value=cfg.auto_probe_interval_minutes || 60;
   document.getElementById('autoModelEnabled').checked=!!cfg.auto_model.enabled;
