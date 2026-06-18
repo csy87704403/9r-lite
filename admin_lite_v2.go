@@ -183,9 +183,21 @@ function isCustomProvider(p){ return !!(p && p.type==='openai' && /^custom/.test
 function customHasContent(p){ return !!(p && ((p.api_key || '').trim() || ((p.base_url || '').trim() && p.base_url !== 'https://example.com/v1') || (p.provider_specific_data && p.provider_specific_data.apiModelsFetched==='true'))); }
 function nextCustomID(cfg){ const ids=new Set((cfg.providers || []).map(p=>p.id)); let i=1; while(ids.has(i===1?'custom':'custom'+i)) i++; return i===1?'custom':'custom'+i; }
 function ensureBlankCustomProvider(cfg){
-  const custom=(cfg.providers || []).filter(isCustomProvider);
-  if(custom.some(p=>!customHasContent(p))) return cfg;
-  cfg.providers.push({id:nextCustomID(cfg),name:'Custom OpenAI Compatible',type:'openai',enabled:false,base_url:'',models:[],provider_specific_data:{customProvider:'true'}});
+  if(!Array.isArray(cfg.providers)) cfg.providers=[];
+  let blankKept=false;
+  cfg.providers=cfg.providers.filter(p=>{
+    if(!isCustomProvider(p) || customHasContent(p)) return true;
+    if(blankKept) return false;
+    p.name=p.name || 'Custom OpenAI Compatible';
+    p.type='openai';
+    p.enabled=false;
+    p.base_url='';
+    p.models=[];
+    p.provider_specific_data={...(p.provider_specific_data || {}), customProvider:'true'};
+    blankKept=true;
+    return true;
+  });
+  if(!blankKept) cfg.providers.push({id:nextCustomID(cfg),name:'Custom OpenAI Compatible',type:'openai',enabled:false,base_url:'',models:[],provider_specific_data:{customProvider:'true'}});
   return cfg;
 }
 function apiProviderIDs(cfg){ return [...fixedAPIProviderIDs, ...(cfg.providers || []).filter(isCustomProvider).map(p=>p.id)]; }
