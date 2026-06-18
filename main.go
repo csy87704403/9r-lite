@@ -101,12 +101,13 @@ type HealthAutoModel struct {
 }
 
 type Server struct {
-	dataDir string
-	config  Config
-	mu      sync.RWMutex
-	probeMu sync.Mutex
-	client  *http.Client
-	mimo    *MimoAuth
+	dataDir     string
+	config      Config
+	mu          sync.RWMutex
+	probeMu     sync.Mutex
+	client      *http.Client
+	mimo        *MimoAuth
+	adminSecret string
 }
 
 type MimoAuth struct {
@@ -185,9 +186,10 @@ func NewServer(dataDir string) (*Server, error) {
 		},
 	}
 	return &Server{
-		dataDir: dataDir,
-		config:  cfg,
-		client:  client,
+		dataDir:     dataDir,
+		config:      cfg,
+		client:      client,
+		adminSecret: newSessionID(),
 		mimo: &MimoAuth{
 			sessionID: newSessionID(),
 			client:    client,
@@ -449,8 +451,40 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		if err := r.ParseForm(); err != nil {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(renderAdminLoginHTML("登录请求无效")))
+			return
+		}
+		if strings.TrimSpace(r.Form.Get("password")) != s.adminPassword() {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(renderAdminLoginHTML("密码错误")))
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     "nr_admin",
+			Value:    s.adminCookieValue(),
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   86400 * 30,
+		})
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return
+	}
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if strings.TrimSpace(r.URL.Query().Get("logout")) == "1" {
+		http.SetCookie(w, &http.Cookie{Name: "nr_admin", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return
+	}
+	if !s.hasAdminSession(r) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(renderAdminLoginHTML("")))
 		return
 	}
 	s.refreshKiloModelsIfStale(r.Context())
@@ -461,6 +495,9 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.currentConfig())
@@ -489,6 +526,9 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -549,6 +589,9 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProviderProbe(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -593,6 +636,9 @@ func (s *Server) handleProviderProbe(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProviderProbeModel(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -656,6 +702,9 @@ func (s *Server) handleProviderProbeModel(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleProviderSelection(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -1233,6 +1282,41 @@ func (s *Server) requireAccessKey(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+func (s *Server) adminPassword() string {
+	if v := strings.TrimSpace(os.Getenv("ADMIN_PASSWORD")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(s.currentConfig().AccessKey); v != "" {
+		return v
+	}
+	return "123456"
+}
+
+func (s *Server) adminCookieValue() string {
+	sum := sha256.Sum256([]byte(s.adminPassword() + "|" + s.adminSecret))
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Server) hasAdminSession(r *http.Request) bool {
+	cookie, err := r.Cookie("nr_admin")
+	if err != nil {
+		return false
+	}
+	return cookie.Value == s.adminCookieValue()
+}
+
+func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if s.hasAdminSession(r) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/html") {
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return false
+	}
+	writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "admin login required"})
+	return false
+}
+
 func (s *Server) enabledProviders() []ProviderConfig {
 	cfg := s.currentConfig()
 	var out []ProviderConfig
@@ -1634,6 +1718,14 @@ func renderHealthHTML(status HealthStatus) string {
 	}
 	b.WriteString(`</tbody></table></main></body></html>`)
 	return b.String()
+}
+
+func renderAdminLoginHTML(message string) string {
+	msg := ""
+	if strings.TrimSpace(message) != "" {
+		msg = `<div class="err">` + htmlEscape(message) + `</div>`
+	}
+	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>9Router Lite 登录</title><style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#fafafa;color:#111;min-height:100vh;display:grid;place-items:center}.box{width:min(420px,calc(100vw - 32px));background:#fff;border:1px solid #ddd;border-radius:8px;padding:24px;box-sizing:border-box}h1{font-size:26px;margin:0 0 8px}.muted{color:#666;font-size:13px;margin-bottom:18px}.field{display:grid;gap:6px;margin:12px 0}.field label{font-size:13px;color:#444}.field input{width:100%;box-sizing:border-box;padding:11px 12px;border:1px solid #ddd;border-radius:6px;font:16px/1.3 system-ui,-apple-system,Segoe UI,sans-serif}button{width:100%;background:#111;color:#fff;border:0;border-radius:6px;padding:11px 14px;font:inherit;cursor:pointer;margin-top:8px}.err{color:#b91c1c;font-size:13px;margin:10px 0}.hint{color:#666;font-size:12px;margin-top:14px;line-height:1.5}code{background:#eee;padding:2px 5px;border-radius:4px}</style></head><body><form class="box" method="post" action="/admin"><h1>9Router Lite</h1><div class="muted">请输入管理密码访问后台</div>` + msg + `<div class="field"><label>管理密码</label><input name="password" type="password" autocomplete="current-password" autofocus></div><button type="submit">登录</button><div class="hint">优先使用环境变量 <code>ADMIN_PASSWORD</code>；未设置时使用网关访问密钥；首次未设置访问密钥时默认是 <code>123456</code>。</div></form></body></html>`
 }
 
 func renderModelsHTML(grouped map[string][]string) string {

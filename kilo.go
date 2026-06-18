@@ -31,6 +31,9 @@ type kiloPollRequest struct {
 }
 
 func (s *Server) handleKiloDeviceCode(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -74,6 +77,9 @@ func (s *Server) handleKiloDeviceCode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleKiloPoll(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
