@@ -1339,7 +1339,10 @@ func (s *Server) providerByID(id string) (ProviderConfig, bool) {
 }
 
 func providerHasCredential(p ProviderConfig) bool {
-	return p.APIKey != "" || p.AccessToken != "" || p.Type == "opencode-free" || p.Type == "mimo-free"
+	if p.APIKey != "" || p.AccessToken != "" || p.Type == "opencode-free" || p.Type == "mimo-free" {
+		return true
+	}
+	return isCustomOpenAIProvider(p) && strings.TrimSpace(p.BaseURL) != "" && p.BaseURL != "https://example.com/v1"
 }
 
 func (s *Server) visibleModelsForProvider(ctx context.Context, p ProviderConfig) []string {

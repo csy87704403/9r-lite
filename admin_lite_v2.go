@@ -171,7 +171,11 @@ function setConfig(cfg){
   document.getElementById('autoModelEnabled').checked=!!cfg.auto_model.enabled;
   renderAutoModels(cfg);
 }
-function providerConnected(p){ return !!(p && p.enabled && (p.api_key || p.access_token || p.type === 'opencode-free' || p.type === 'mimo-free')); }
+function providerConnected(p){
+  if(!p || !p.enabled) return false;
+  if(p.api_key || p.access_token || p.type === 'opencode-free' || p.type === 'mimo-free') return true;
+  return isCustomProvider(p) && !!((p.base_url || '').trim()) && p.base_url !== 'https://example.com/v1';
+}
 function authStatus(p){ return (p && p.provider_specific_data && p.provider_specific_data.authStatus) || 'ok'; }
 function authError(p){ return (p && p.provider_specific_data && p.provider_specific_data.lastAuthError) || ''; }
 function manualOverride(p){ return !!(p && p.provider_specific_data && p.provider_specific_data.manualPublishOverride==='true'); }
