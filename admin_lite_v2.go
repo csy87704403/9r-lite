@@ -89,6 +89,24 @@ details{margin-top:22px}
 <div class="muted">第三方 Agent 的 Base URL 填 <code>/v1</code>，API Key 填上面的访问密钥；程序健康检查建议使用 JSON 地址。</div>
 </div>
 
+<div class="card">
+<h3>导入本地 config.json</h3>
+<div class="muted">选择本地 Lite 配置文件，或把 config.json 内容粘贴到下面。导入后会覆盖当前服务器的配置。</div>
+<div class="field">
+<label>选择文件</label>
+<input id="importConfigFile" type="file" accept=".json,application/json" onchange="loadImportConfigFile()">
+</div>
+<div class="field">
+<label>配置内容</label>
+<textarea id="importConfigText" style="min-height:160px" spellcheck="false" placeholder="把本地 data/config.json 的内容粘贴到这里"></textarea>
+</div>
+<div class="bar">
+<button class="secondary" onclick="previewImportConfig()" type="button">检查配置</button>
+<button onclick="importConfigJSON()" type="button">导入并保存</button>
+<span id="importConfigStatus" class="muted"></span>
+</div>
+</div>
+
 <div class="bar">
 <label class="toggle"><input type="checkbox" id="autoProbeEnabled"> 启用定时自动探测</label>
 <label class="inline-field muted">基础间隔分钟 <input id="autoProbeInterval" type="number" min="1" step="1" value="60"></label>
@@ -329,6 +347,50 @@ function buildAPIProvider(id){
   return next;
 }
 async function saveConfigObject(cfg){ const res=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(cfg)}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); return data; }
+async function loadImportConfigFile(){
+  const input=document.getElementById('importConfigFile');
+  const file=input && input.files && input.files[0];
+  if(!file) return;
+  try{
+    document.getElementById('importConfigText').value=await file.text();
+    previewImportConfig();
+  }catch(e){
+    setText('importConfigStatus','err','读取失败：'+e.message);
+  }
+}
+function parseImportConfig(){
+  const text=(document.getElementById('importConfigText').value || '').trim();
+  if(!text) throw new Error('请先选择或粘贴 config.json');
+  const cfg=JSON.parse(text);
+  if(!cfg || typeof cfg !== 'object' || !Array.isArray(cfg.providers)) throw new Error('不是有效的 9Router Lite 配置');
+  return cfg;
+}
+function previewImportConfig(){
+  try{
+    const cfg=parseImportConfig();
+    const connected=(cfg.providers || []).filter(providerConnected).length;
+    setText('importConfigStatus','ok','配置有效：'+cfg.providers.length+' 个 provider，已连接 '+connected+' 个');
+  }catch(e){
+    setText('importConfigStatus','err',e.message);
+  }
+}
+async function importConfigJSON(){
+  try{
+    const cfg=parseImportConfig();
+    if(!confirm('导入会覆盖当前服务器的 data/config.json，确定继续？')) return;
+    ensureBlankCustomProvider(cfg);
+    await saveConfigObject(cfg);
+    setText('importConfigStatus','ok','已导入，正在刷新...');
+    try{
+      await reloadConfig();
+      setText('importConfigStatus','ok','已导入并保存');
+    }catch(e){
+      setText('importConfigStatus','ok','已导入并保存；如果访问密码已变化，请重新登录后台');
+    }
+  }catch(e){
+    setText('importConfigStatus','err','导入失败：'+e.message);
+  }
+}
 function applyGatewaySettings(cfg){
   cfg.access_key=document.getElementById('accessKey').value.trim();
   cfg.auto_probe_enabled=!!document.getElementById('autoProbeEnabled').checked;
@@ -338,8 +400,26 @@ function applyGatewaySettings(cfg){
 }
 async function saveGateway(){ try{ const cfg=parseConfig(); if(!cfg) throw new Error('config is invalid'); applyGatewaySettings(cfg); ensureBlankCustomProvider(cfg); await saveConfigObject(cfg); await reloadConfig(); setText('status','ok','已保存'); }catch(e){ setText('status','err',e.message); } }
 function toggleAccessKey(){ const el=document.getElementById('accessKey'); el.type=el.type==='password'?'text':'password'; }
-async function copyBaseURL(){ try{ await navigator.clipboard.writeText(document.getElementById('baseUrl').value); setText('status','ok','Base URL 已复制'); }catch(e){ setText('status','err','复制失败：'+e.message); } }
-async function copyEndpoint(id, label){ try{ await navigator.clipboard.writeText(document.getElementById(id).value); setText('status','ok',(label || '地址')+'已复制'); }catch(e){ setText('status','err','复制失败：'+e.message); } }
+async function copyTextValue(value){
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea=document.createElement('textarea');
+  textarea.value=value;
+  textarea.setAttribute('readonly','');
+  textarea.style.position='fixed';
+  textarea.style.left='-9999px';
+  document.body.appendChild(textarea);
+  textarea.select();
+  try{
+    if(!document.execCommand('copy')) throw new Error('copy command failed');
+  }finally{
+    document.body.removeChild(textarea);
+  }
+}
+async function copyBaseURL(){ try{ await copyTextValue(document.getElementById('baseUrl').value); setText('status','ok','Base URL 已复制'); }catch(e){ setText('status','err','复制失败：'+e.message); } }
+async function copyEndpoint(id, label){ try{ await copyTextValue(document.getElementById(id).value); setText('status','ok',(label || '地址')+'已复制'); }catch(e){ setText('status','err','复制失败：'+e.message); } }
 function openModelsPage(){ const key=document.getElementById('accessKey').value.trim(); if(!key){ setText('status','err','请先设置访问密钥'); return; } window.open('/v1/models?view=html&key='+encodeURIComponent(key),'_blank','noopener,noreferrer'); }
 async function saveAPIProvider(id){ try{ const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid'); applyGatewaySettings(cfg); const next=buildAPIProvider(id); cfg.providers=cfg.providers.map(p=>p.id===id?next:p); ensureBlankCustomProvider(cfg); await saveConfigObject(cfg); await reloadConfig(); setText('apiStatus_'+id,'ok','已保存'); }catch(e){ setText('apiStatus_'+id,'err',e.message); } }
 async function disableProvider(id){
