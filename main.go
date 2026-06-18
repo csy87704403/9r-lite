@@ -58,6 +58,7 @@ type ProviderConfig struct {
 	Enabled               bool              `json:"enabled"`
 	BaseURL               string            `json:"base_url,omitempty"`
 	APIKey                string            `json:"api_key,omitempty"`
+	APIKeys               []string          `json:"api_keys,omitempty"`
 	AccessToken           string            `json:"access_token,omitempty"`
 	RefreshToken          string            `json:"refresh_token,omitempty"`
 	Email                 string            `json:"email,omitempty"`
@@ -378,7 +379,7 @@ func mergeDefaultConfig(cfg Config) Config {
 		if len(p.Models) == 0 {
 			p.Models = d.Models
 		}
-		if p.Type == "openai" && p.FetchModels && p.APIKey != "" && len(p.Models) > 0 {
+		if p.Type == "openai" && p.FetchModels && len(providerAPIKeys(p)) > 0 && len(p.Models) > 0 {
 			if p.ProviderSpecificData == nil {
 				p.ProviderSpecificData = map[string]string{}
 			}
@@ -553,7 +554,7 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider base_url is empty"})
 		return
 	}
-	if strings.TrimSpace(p.APIKey) == "" {
+	if len(providerAPIKeys(p)) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider api_key is empty"})
 		return
 	}
@@ -925,7 +926,8 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, p ProviderC
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider base_url is empty"})
 		return
 	}
-	if strings.TrimSpace(p.APIKey) == "" {
+	keys := providerAPIKeys(p)
+	if len(keys) == 0 {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "provider api_key is empty"})
 		return
 	}
@@ -935,13 +937,86 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, p ProviderC
 		return
 	}
 
+	if isCustomOpenAIProvider(p) && len(keys) > 1 {
+		s.proxyOpenAIRotating(w, r, p, req, upstreamModel, body, keys)
+		return
+	}
+
 	headers := map[string]string{
 		"Content-Type":  "application/json",
-		"Authorization": "Bearer " + p.APIKey,
+		"Authorization": "Bearer " + keys[0],
 		"Accept":        acceptHeader(req.Stream),
 		"User-Agent":    "9router-lite/0.1",
 	}
 	s.proxyRaw(w, r, joinURL(p.BaseURL, "/chat/completions"), body, headers)
+}
+
+func (s *Server) proxyOpenAIRotating(w http.ResponseWriter, r *http.Request, p ProviderConfig, req chatRequest, upstreamModel string, body []byte, keys []string) {
+	target := joinURL(p.BaseURL, "/chat/completions")
+	var lastStatus int
+	var lastHeader http.Header
+	var lastBody []byte
+	var lastErr error
+	for i, key := range keys {
+		headers := map[string]string{
+			"Content-Type":  "application/json",
+			"Authorization": "Bearer " + key,
+			"Accept":        acceptHeader(req.Stream),
+			"User-Agent":    "9router-lite/0.1",
+		}
+		status, header, respBody, err := s.postUpstreamBuffered(r.Context(), target, body, headers)
+		lastStatus, lastHeader, lastBody, lastErr = status, header, respBody, err
+		if err != nil {
+			break
+		}
+		if status >= 200 && status <= 299 {
+			writeBufferedUpstream(w, status, header, respBody)
+			return
+		}
+		if i == len(keys)-1 || !isQuotaKeyError(status, respBody) {
+			break
+		}
+	}
+	if lastErr != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": lastErr.Error()})
+		return
+	}
+	writeBufferedUpstream(w, lastStatus, lastHeader, lastBody)
+}
+
+func (s *Server) postUpstreamBuffered(ctx context.Context, target string, body []byte, headers map[string]string) (int, http.Header, []byte, error) {
+	defer s.client.CloseIdleConnections()
+	defer debug.FreeOSMemory()
+	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+	if err != nil {
+		return http.StatusBadRequest, nil, nil, err
+	}
+	for k, v := range headers {
+		upReq.Header.Set(k, v)
+	}
+	resp, err := s.client.Do(upReq)
+	if err != nil {
+		return http.StatusBadGateway, nil, nil, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		return resp.StatusCode, resp.Header, respBody, err
+	}
+	return resp.StatusCode, resp.Header, respBody, nil
+}
+
+func writeBufferedUpstream(w http.ResponseWriter, status int, header http.Header, body []byte) {
+	for k, values := range header {
+		if shouldSkipHeader(k) {
+			continue
+		}
+		for _, v := range values {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }
 
 func (s *Server) proxyRaw(w http.ResponseWriter, r *http.Request, target string, body []byte, headers map[string]string) int {
@@ -1023,7 +1098,7 @@ func (s *Server) modelsForProvider(ctx context.Context, p ProviderConfig) []stri
 	case "cline":
 		return p.Models
 	case "openai":
-		if p.FetchModels && p.BaseURL != "" && p.APIKey != "" {
+		if p.FetchModels && p.BaseURL != "" && len(providerAPIKeys(p)) > 0 {
 			ids, err := fetchOpenAIModels(ctx, s.client, p)
 			if err == nil && len(ids) > 0 {
 				return ids
@@ -1103,11 +1178,15 @@ func fetchOpenCodeModels(ctx context.Context, client *http.Client) ([]string, er
 }
 
 func fetchOpenAIModels(ctx context.Context, client *http.Client, p ProviderConfig) ([]string, error) {
+	keys := providerAPIKeys(p)
+	if len(keys) == 0 {
+		return nil, errors.New("provider api_key is empty")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(p.BaseURL, "/models"), nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("Authorization", "Bearer "+keys[0])
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -1339,10 +1418,24 @@ func (s *Server) providerByID(id string) (ProviderConfig, bool) {
 }
 
 func providerHasCredential(p ProviderConfig) bool {
-	if p.APIKey != "" || p.AccessToken != "" || p.Type == "opencode-free" || p.Type == "mimo-free" {
+	if len(providerAPIKeys(p)) > 0 || p.AccessToken != "" || p.Type == "opencode-free" || p.Type == "mimo-free" {
 		return true
 	}
 	return isCustomOpenAIProvider(p) && strings.TrimSpace(p.BaseURL) != "" && p.BaseURL != "https://example.com/v1"
+}
+
+func providerAPIKeys(p ProviderConfig) []string {
+	seen := map[string]bool{}
+	var keys []string
+	for _, key := range append([]string{p.APIKey}, p.APIKeys...) {
+		key = strings.TrimSpace(key)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 func (s *Server) visibleModelsForProvider(ctx context.Context, p ProviderConfig) []string {
@@ -1488,6 +1581,24 @@ func formatProbeFailure(status int, body string) string {
 		return truncateString(body, 60)
 	}
 	return fmt.Sprintf("请求失败(%d)", status)
+}
+
+func isQuotaKeyError(status int, body []byte) bool {
+	lower := strings.ToLower(string(body))
+	if strings.Contains(lower, "insufficient_credits") ||
+		strings.Contains(lower, "insufficient credits") ||
+		strings.Contains(lower, "insufficient_quota") ||
+		strings.Contains(lower, "insufficient quota") ||
+		strings.Contains(lower, "quota exceeded") ||
+		strings.Contains(lower, "quota_exceeded") ||
+		strings.Contains(lower, "promotion has ended") ||
+		strings.Contains(lower, "free promotion has ended") ||
+		strings.Contains(lower, "credits") ||
+		strings.Contains(lower, "billing") ||
+		strings.Contains(lower, "balance") {
+		return true
+	}
+	return status == http.StatusPaymentRequired && (strings.Contains(lower, "credit") || strings.Contains(lower, "quota"))
 }
 
 func (s *Server) probeAllProviders(ctx context.Context, autoPublish bool) {

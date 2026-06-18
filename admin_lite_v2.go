@@ -42,6 +42,8 @@ code{background:#eee;padding:2px 5px;border-radius:4px}
 .inline-field{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .inline-field.grow input{flex:1 1 240px}
 .inline-field input[type=number]{width:110px}
+.key-list{display:grid;gap:8px}
+.key-row input{flex:1 1 260px}
 .endpoint-grid{display:grid;grid-template-columns:140px minmax(260px,1fr) auto;gap:8px;align-items:center;margin:8px 0}
 .endpoint-grid input{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid #ddd;border-radius:6px;background:#f3f4f6;color:#374151;font:13px/1.3 ui-monospace,SFMono-Regular,Consolas,monospace}
 @media(max-width:720px){.endpoint-grid{grid-template-columns:1fr}.endpoint-grid button{width:max-content}}
@@ -173,14 +175,15 @@ function setConfig(cfg){
 }
 function providerConnected(p){
   if(!p || !p.enabled) return false;
-  if(p.api_key || p.access_token || p.type === 'opencode-free' || p.type === 'mimo-free') return true;
+  if(providerAPIKeys(p).length || p.access_token || p.type === 'opencode-free' || p.type === 'mimo-free') return true;
   return isCustomProvider(p) && !!((p.base_url || '').trim()) && p.base_url !== 'https://example.com/v1';
 }
 function authStatus(p){ return (p && p.provider_specific_data && p.provider_specific_data.authStatus) || 'ok'; }
 function authError(p){ return (p && p.provider_specific_data && p.provider_specific_data.lastAuthError) || ''; }
 function manualOverride(p){ return !!(p && p.provider_specific_data && p.provider_specific_data.manualPublishOverride==='true'); }
 function isCustomProvider(p){ return !!(p && p.type==='openai' && /^custom/.test(p.id || '')); }
-function customHasContent(p){ return !!(p && ((p.api_key || '').trim() || ((p.base_url || '').trim() && p.base_url !== 'https://example.com/v1') || (p.provider_specific_data && p.provider_specific_data.apiModelsFetched==='true'))); }
+function providerAPIKeys(p){ return unique([((p && p.api_key) || ''), ...((p && Array.isArray(p.api_keys)) ? p.api_keys : [])].map(x=>String(x || '').trim()).filter(Boolean)); }
+function customHasContent(p){ return !!(p && (providerAPIKeys(p).length || ((p.base_url || '').trim() && p.base_url !== 'https://example.com/v1') || (p.provider_specific_data && p.provider_specific_data.apiModelsFetched==='true'))); }
 function nextCustomID(cfg){ const ids=new Set((cfg.providers || []).map(p=>p.id)); let i=1; while(ids.has(i===1?'custom':'custom'+i)) i++; return i===1?'custom':'custom'+i; }
 function ensureBlankCustomProvider(cfg){
   if(!Array.isArray(cfg.providers)) cfg.providers=[];
@@ -325,6 +328,44 @@ function renderProviderStatus(){
   }).filter(Boolean);
   root.innerHTML=items.join('') || '<div class="muted">当前没有已连接的 provider。</div>';
 }
+function apiKeyRowHTML(id, value){
+  return '<div class="inline-field grow key-row"><input data-api-key-provider="'+esc(id)+'" value="'+esc(value || '')+'" placeholder="sk-..."><button class="small secondary" data-key-remove="1" onclick="removeAPIKeyInput(this,\''+id+'\')" type="button">删除</button></div>';
+}
+function refreshAPIKeyRemoveButtons(id){
+  const root=document.getElementById('keyList_'+id); if(!root) return;
+  const rows=[...root.querySelectorAll('.key-row')];
+  rows.forEach(row=>{ const btn=row.querySelector('button[data-key-remove]'); if(btn) btn.disabled=rows.length<=1; });
+}
+function addAPIKeyInput(id){
+  const root=document.getElementById('keyList_'+id); if(!root) return;
+  root.insertAdjacentHTML('beforeend', apiKeyRowHTML(id,''));
+  refreshAPIKeyRemoveButtons(id);
+}
+function removeAPIKeyInput(button,id){
+  const row=button && button.closest ? button.closest('.key-row') : null;
+  if(row) row.remove();
+  const root=document.getElementById('keyList_'+id);
+  if(root && !root.querySelector('.key-row')) root.insertAdjacentHTML('beforeend', apiKeyRowHTML(id,''));
+  refreshAPIKeyRemoveButtons(id);
+}
+function apiKeyValues(id){
+  return unique([...document.querySelectorAll('input[data-api-key-provider="'+id+'"]')].map(node=>node.value.trim()).filter(Boolean));
+}
+function apiKeyEditor(id,p,isCustom){
+  if(!isCustom) return '<div class="field"><label>API Key</label><input id="key_'+id+'" value="'+esc(p.api_key || '')+'" placeholder="sk-..."></div>';
+  const keys=providerAPIKeys(p); if(!keys.length) keys.push('');
+  return '<div class="field"><label>API Keys</label><div id="keyList_'+id+'" class="key-list">'+keys.map(key=>apiKeyRowHTML(id,key)).join('')+'</div><div class="bar"><button class="small secondary" onclick="addAPIKeyInput(\''+id+'\')" type="button">新增 API Key</button><span class="muted">按顺序尝试；额度不足时自动切到下一个。</span></div></div>';
+}
+function hydrateCustomKeyEditors(cfg){
+  (cfg.providers || []).filter(isCustomProvider).forEach(p=>{
+    const input=document.getElementById('key_'+p.id);
+    if(!input) return;
+    const field=input.closest('.field');
+    if(!field) return;
+    field.outerHTML=apiKeyEditor(p.id,p,true);
+    refreshAPIKeyRemoveButtons(p.id);
+  });
+}
 function renderAPIProviders(){
   const root=document.getElementById('apiProviders'); const cfg=parseConfig();
   if(!cfg || !Array.isArray(cfg.providers)){ root.innerHTML=''; return; }
@@ -337,6 +378,7 @@ function renderAPIProviders(){
     const deleteButton='<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="deleteAPIProvider(\''+id+'\')">删除卡片</button></div>';
     return '<div class="api-card"><div class="api-head"><strong>'+esc(p.name)+'</strong><span class="api-meta">'+esc(p.id)+'</span></div>'+(isCustom?'<div class="field"><label>名称</label><input id="name_'+id+'" value="'+esc(p.name || '')+'" placeholder="自定义源"></div>':'')+'<label class="toggle"><input type="checkbox" id="enabled_'+id+'" '+(p.enabled?'checked':'')+'> 启用</label><div class="field"><label>Base URL</label><input id="base_'+id+'" value="'+esc(p.base_url || '')+'" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="key_'+id+'" value="'+esc(p.api_key || '')+'" placeholder="sk-..."></div><div class="bar"><button onclick="saveAPIProvider(\''+id+'\')">保存</button><button class="secondary" onclick="fetchAPIProviderModels(\''+id+'\')">拉取模型</button><span id="apiStatus_'+id+'" class="muted"></span></div><div class="field"><label>手动添加模型</label><div class="inline-field grow"><input id="manualModel_'+id+'" placeholder="model-id"><button class="secondary" onclick="addAPIModel(\''+id+'\')" type="button">添加</button></div></div><div class="bar"><button class="small" onclick="probeProvider(\''+id+'\',\'apiStatus_'+id+'\')" '+(!apiModelsLoaded(p)?'disabled':'')+'>探测可用</button><button class="small secondary" onclick="saveModelSelection(\''+id+'\',\'apiStatus_'+id+'\')" '+(!apiModelsLoaded(p)?'disabled':'')+'>保存发布</button></div><div id="probeProgress_'+id+'" class="progress-wrap"><progress value="0" max="'+(p.models||[]).length+'"></progress><span class="muted">0/'+(p.models||[]).length+'</span></div>'+count+listControls+rows+deleteButton+'</div>';
   }).join('');
+  hydrateCustomKeyEditors(cfg);
 }
 function renderPublishProviders(){
   const root=document.getElementById('publishProviders'); const cfg=parseConfig();
@@ -358,8 +400,14 @@ function buildAPIProvider(id){
   const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid');
   const prev=cfg.providers.find(x=>x.id===id); if(!prev) throw new Error('provider not found: '+id);
   const custom=isCustomProvider(prev);
-  const next={ ...prev, name:custom?(document.getElementById('name_'+id).value.trim() || prev.name || 'Custom OpenAI Compatible'):prev.name, enabled:!!document.getElementById('enabled_'+id).checked, base_url:document.getElementById('base_'+id).value.trim(), api_key:document.getElementById('key_'+id).value.trim() };
-  if(custom) next.provider_specific_data={...(next.provider_specific_data || {}), customProvider:'true'};
+  const keys=custom?apiKeyValues(id):[];
+  const next={ ...prev, name:custom?(document.getElementById('name_'+id).value.trim() || prev.name || 'Custom OpenAI Compatible'):prev.name, enabled:!!document.getElementById('enabled_'+id).checked, base_url:document.getElementById('base_'+id).value.trim(), api_key:custom?(keys[0] || ''):document.getElementById('key_'+id).value.trim() };
+  if(custom){
+    next.api_keys=keys;
+    next.provider_specific_data={...(next.provider_specific_data || {}), customProvider:'true'};
+  }else{
+    delete next.api_keys;
+  }
   return next;
 }
 async function saveConfigObject(cfg){ const res=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(cfg)}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); return data; }
