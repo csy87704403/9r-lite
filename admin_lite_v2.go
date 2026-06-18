@@ -375,7 +375,7 @@ function renderAPIProviders(){
     const rows=apiModelsLoaded(p) ? '<div class="model-list">'+modelRows(p)+'</div>' : '';
     const count=apiModelsLoaded(p) ? '<div class="muted">已拉取 '+p.models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div>' : '';
     const deleteButton='<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="deleteAPIProvider(\''+id+'\')">删除卡片</button></div>';
-    return '<div class="api-card"><div class="api-head"><strong>'+esc(p.name)+'</strong><span class="api-meta">'+esc(p.id)+'</span></div>'+(isCustom?'<div class="field"><label>名称</label><input id="name_'+id+'" value="'+esc(p.name || '')+'" placeholder="自定义源"></div>':'')+'<label class="toggle"><input type="checkbox" id="enabled_'+id+'" onchange="saveAPIProvider(\''+id+'\')" '+(p.enabled?'checked':'')+'> 启用</label><div class="field"><label>Base URL</label><input id="base_'+id+'" value="'+esc(p.base_url || '')+'" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="key_'+id+'" value="'+esc(p.api_key || '')+'" placeholder="sk-..."></div><div class="bar"><button onclick="saveAPIProvider(\''+id+'\')">保存</button><button class="secondary" onclick="fetchAPIProviderModels(\''+id+'\')">保存并拉取模型</button><span id="apiStatus_'+id+'" class="muted"></span></div><div class="field"><label>手动添加模型</label><div class="inline-field grow"><input id="manualModel_'+id+'" placeholder="model-id"><button class="secondary" onclick="addAPIModel(\''+id+'\')" type="button">添加</button></div></div><div class="bar"><button class="small" onclick="probeProvider(\''+id+'\',\'apiStatus_'+id+'\')" '+(!apiModelsLoaded(p)?'disabled':'')+'>探测可用</button><button class="small secondary" onclick="saveModelSelection(\''+id+'\',\'apiStatus_'+id+'\')" '+(!apiModelsLoaded(p)?'disabled':'')+'>保存发布</button></div><div id="probeProgress_'+id+'" class="progress-wrap"><progress value="0" max="'+(p.models||[]).length+'"></progress><span class="muted">0/'+(p.models||[]).length+'</span></div>'+count+listControls+rows+deleteButton+'</div>';
+    return '<div class="api-card"><div class="api-head"><strong>'+esc(p.name)+'</strong><span class="api-meta">'+esc(p.id)+'</span></div>'+(isCustom?'<div class="field"><label>名称</label><input id="name_'+id+'" value="'+esc(p.name || '')+'" placeholder="自定义源"></div>':'')+'<label class="toggle"><input type="checkbox" id="enabled_'+id+'" onchange="saveAPIProvider(\''+id+'\')" '+(p.enabled?'checked':'')+'> 启用</label><div class="field"><label>Base URL</label><input id="base_'+id+'" value="'+esc(p.base_url || '')+'" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="key_'+id+'" value="'+esc(p.api_key || '')+'" placeholder="sk-..."></div><div class="bar"><button onclick="saveAPIProvider(\''+id+'\')">保存</button><button class="secondary" onclick="fetchAPIProviderModels(\''+id+'\')">保存并拉取模型</button><span id="apiStatus_'+id+'" class="muted"></span></div><div class="field"><label>手动添加模型</label><div class="inline-field grow"><input id="manualModel_'+id+'" placeholder="model-id"><button class="secondary" onclick="addAPIModel(\''+id+'\')" type="button">添加</button></div></div><div class="bar"><button class="small" onclick="probeProvider(\''+id+'\',\'apiStatus_'+id+'\')" '+(!providerConnected(p) || !apiModelsLoaded(p)?'disabled':'')+'>探测可用</button><button class="small secondary" onclick="saveModelSelection(\''+id+'\',\'apiStatus_'+id+'\')" '+(!apiModelsLoaded(p)?'disabled':'')+'>保存发布</button></div><div id="probeProgress_'+id+'" class="progress-wrap"><progress value="0" max="'+(p.models||[]).length+'"></progress><span class="muted">0/'+(p.models||[]).length+'</span></div>'+count+listControls+rows+deleteButton+'</div>';
   }).join('');
   hydrateCustomKeyEditors(cfg);
 }
@@ -546,19 +546,41 @@ async function probeOneModel(id, model, autoPublish, dropUnavailable){ if(dropUn
 async function probeProvider(id, statusID){
   probeStopRequested=false;
   const cfg=parseConfig(); const p=cfg.providers.find(x=>x.id===id); if(!p) return;
-  const models=unique(p.models || []); let ok=0; statusID=statusID || 'publishStatus_'+id; setProgress('probeProgress_'+id,0,models.length); setText(statusID,'muted','正在探测...');
+  const models=unique(p.models || []); let ok=0; let failed=0; statusID=statusID || 'publishStatus_'+id; setProgress('probeProgress_'+id,0,models.length); setText(statusID,'muted','正在探测...');
   let done=0;
-  for(let i=0;i<models.length;i++){ if(probeStopRequested) break; const data=await probeOneModel(id,models[i],false); if(data.ok) ok++; done=i+1; setProgress('probeProgress_'+id,done,models.length); setText(statusID,'muted','正在探测 '+done+'/'+models.length); }
-  await reloadConfig(); setText(statusID,probeStopRequested?'muted':'ok',(probeStopRequested?'已停止，已探测 ':'可用 ')+ok+' 个模型');
+  for(let i=0;i<models.length;i++){
+    if(probeStopRequested) break;
+    setText(statusID,'muted','正在探测 '+(i+1)+'/'+models.length+'：'+models[i]);
+    try{
+      const data=await probeOneModel(id,models[i],false);
+      if(data.ok) ok++;
+    }catch(e){
+      failed++;
+      setText(statusID,'err','探测失败：'+e.message);
+    }
+    done=i+1; setProgress('probeProgress_'+id,done,models.length);
+  }
+  await reloadConfig(); setText(statusID,probeStopRequested?'muted':(failed?'err':'ok'),(probeStopRequested?'已停止，已探测 ':'可用 ')+ok+' 个模型'+(failed?'，失败 '+failed+' 个':''));
 }
 async function probeAllProviders(){
   probeStopRequested=false;
   const cfg=parseConfig(); const providers=cfg.providers.filter(p=>providerConnected(p) && visibleModels(p).length);
   const jobs=[]; providers.forEach(p=>visibleModels(p).forEach(model=>jobs.push({id:p.id,model})));
-  let ok=0; setProgress('probeAllProgress',0,jobs.length); setText('probeAllStatus','muted','正在探测...');
+  let ok=0; let failed=0; setProgress('probeAllProgress',0,jobs.length); setText('probeAllStatus','muted','正在探测...');
   let done=0;
-  for(let i=0;i<jobs.length;i++){ if(probeStopRequested) break; const data=await probeOneModel(jobs[i].id,jobs[i].model,true); if(data.ok) ok++; done=i+1; setProgress('probeAllProgress',done,jobs.length); setText('probeAllStatus','muted','正在探测 '+done+'/'+jobs.length); }
-  await reloadConfig(); setText('probeAllStatus',probeStopRequested?'muted':'ok',probeStopRequested?'已停止，已探测 '+done+'/'+jobs.length+'，可用 '+ok+' 个模型':'探测完成，可用 '+ok+' 个模型，已自动发布');
+  for(let i=0;i<jobs.length;i++){
+    if(probeStopRequested) break;
+    setText('probeAllStatus','muted','正在探测 '+(i+1)+'/'+jobs.length+'：'+jobs[i].id+'/'+jobs[i].model);
+    try{
+      const data=await probeOneModel(jobs[i].id,jobs[i].model,true);
+      if(data.ok) ok++;
+    }catch(e){
+      failed++;
+      setText('probeAllStatus','err','探测失败：'+e.message);
+    }
+    done=i+1; setProgress('probeAllProgress',done,jobs.length);
+  }
+  await reloadConfig(); setText('probeAllStatus',probeStopRequested?'muted':(failed?'err':'ok'),probeStopRequested?'已停止，已探测 '+done+'/'+jobs.length+'，可用 '+ok+' 个模型':'探测完成，可用 '+ok+' 个模型'+(failed?'，失败 '+failed+' 个':'，已自动发布'));
 }
 async function saveModelSelection(id,statusID){ try{ statusID=statusID || 'publishStatus_'+id; const nodes=[...document.querySelectorAll('input[data-provider="'+id+'"]:checked')]; const enabled_models=nodes.map(node=>node.getAttribute('data-model')); const res=await fetch('/api/provider/selection',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id, enabled_models})}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); await reloadConfig(); setText(statusID,'ok','已保存发布列表'); }catch(e){ setText(statusID || 'status','err',e.message); } }
 async function save(){ try{ const body=JSON.parse(document.getElementById('cfg').value); applyGatewaySettings(body); ensureBlankCustomProvider(body); const res=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); setText('status','ok','已保存'); renderProviderStatus(); renderAPIProviders(); renderPublishProviders(); }catch(e){ setText('status','err',e.message); } }
