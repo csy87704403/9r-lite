@@ -554,8 +554,8 @@ async function probeProvider(id, statusID){
 }
 async function probeAllProviders(){
   probeStopRequested=false;
-  const cfg=parseConfig(); const providers=cfg.providers.filter(p=>publishProviderIDs.includes(p.id) && providerConnected(p) && Array.isArray(p.models) && p.models.length);
-  const jobs=[]; providers.forEach(p=>unique(p.models).forEach(model=>jobs.push({id:p.id,model})));
+  const cfg=parseConfig(); const providers=cfg.providers.filter(p=>providerConnected(p) && visibleModels(p).length);
+  const jobs=[]; providers.forEach(p=>visibleModels(p).forEach(model=>jobs.push({id:p.id,model})));
   let ok=0; setProgress('probeAllProgress',0,jobs.length); setText('probeAllStatus','muted','正在探测...');
   let done=0;
   for(let i=0;i<jobs.length;i++){ if(probeStopRequested) break; const data=await probeOneModel(jobs[i].id,jobs[i].model,true); if(data.ok) ok++; done=i+1; setProgress('probeAllProgress',done,jobs.length); setText('probeAllStatus','muted','正在探测 '+done+'/'+jobs.length); }

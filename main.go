@@ -1605,10 +1605,11 @@ func (s *Server) probeAllProviders(ctx context.Context, autoPublish bool) {
 	s.probeMu.Lock()
 	defer s.probeMu.Unlock()
 	for _, p := range s.enabledProviders() {
-		if len(p.Models) == 0 {
+		models := s.visibleModelsForProvider(ctx, p)
+		if len(models) == 0 {
 			continue
 		}
-		available, failures, latencies := s.probeProviderModels(ctx, p, p.Models)
+		available, failures, latencies := s.probeProviderModels(ctx, p, models)
 		p.AvailableModels = uniqueStrings(available)
 		p.ModelLatencyMS = latencies
 		p.ModelErrors = failures
