@@ -21,6 +21,8 @@ button{background:#111;color:#fff;border:0;border-radius:6px;padding:9px 14px;cu
 button.secondary{background:#fff;color:#111;border:1px solid #ddd}
 button.small{padding:7px 10px;font-size:13px}
 button.add-auto-model{width:17px;height:17px;padding:0;border-radius:3px;font-size:12px;line-height:1;display:inline-flex;align-items:center;justify-content:center;flex:0 0 17px;margin-top:1px}
+button.model-lock{width:17px;height:17px;padding:0;border-radius:3px;font-size:12px;line-height:1;display:inline-flex;align-items:center;justify-content:center;flex:0 0 17px;margin-top:1px}
+button.model-lock.locked{background:#111;color:#fff;border-color:#111}
 button:disabled{opacity:.55;cursor:not-allowed}
 textarea{width:100%;min-height:340px;box-sizing:border-box;font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;border:1px solid #ddd;border-radius:6px;padding:14px;background:#fff}
 .muted{color:#666;font-size:13px}
@@ -33,19 +35,31 @@ code{background:#eee;padding:2px 5px;border-radius:4px}
 .card h3{justify-content:flex-start;font-size:17px}
 .api-head strong{font-size:17px}
 .api-meta{font-size:12px;color:#666}
+.card-title-row{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin:0 0 8px}
+.card-title-row h3{margin:0}
+.provider-badge{font-size:11px;color:#555;background:#f3f4f6;border:1px solid #ddd;border-radius:999px;padding:2px 8px;white-space:nowrap}
 .green-dot,.gray-dot{width:9px;height:9px;border-radius:50%;display:inline-block;flex:0 0 auto}
 .green-dot{background:#16a34a}.gray-dot{background:#aaa}
 .field{display:grid;gap:6px;margin:10px 0}
 .field label{font-size:13px;color:#444}
 .field input{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid #ddd;border-radius:6px;background:#fff;font:13px/1.3 ui-monospace,SFMono-Regular,Consolas,monospace}
+.field textarea{min-height:110px}
 .field input[readonly]{background:#f3f4f6;color:#374151}
 .inline-field{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .inline-field.grow input{flex:1 1 240px}
 .inline-field input[type=number]{width:110px}
 .key-list{display:grid;gap:8px}
 .key-row input{flex:1 1 260px}
+.key-status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 auto}
+.key-status-dot.active{background:#16a34a}
+.key-status-dot.failed{background:#dc2626}
+.key-status-dot.empty{background:transparent}
 .endpoint-grid{display:grid;grid-template-columns:140px minmax(260px,1fr) auto;gap:8px;align-items:center;margin:8px 0}
 .endpoint-grid input{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid #ddd;border-radius:6px;background:#f3f4f6;color:#374151;font:13px/1.3 ui-monospace,SFMono-Regular,Consolas,monospace}
+.media-tool-row{grid-template-columns:140px auto minmax(260px,1fr)}
+.media-menu{display:none;gap:8px;align-items:center;flex-wrap:wrap}
+.media-menu.active{display:flex}
+.media-menu button{max-width:100%;overflow:hidden;text-overflow:ellipsis}
 @media(max-width:720px){.endpoint-grid{grid-template-columns:1fr}.endpoint-grid button{width:max-content}}
 .toggle{display:flex;gap:8px;align-items:center;font-size:13px;margin:8px 0}
 .model-list{display:grid;gap:8px;margin-top:10px;max-height:280px;overflow:auto;padding-right:4px}
@@ -59,6 +73,11 @@ code{background:#eee;padding:2px 5px;border-radius:4px}
 progress{width:190px;height:12px}
 details{margin-top:22px}
 .section-note{margin:6px 0 12px}
+.tabs{display:flex;gap:8px;align-items:center;margin:18px 0 12px;flex-wrap:wrap}
+.tab-button{background:#fff;color:#111;border:1px solid #ddd}
+.tab-button.active{background:#111;color:#fff;border-color:#111}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
 </style>
 </head>
 <body>
@@ -88,14 +107,15 @@ details{margin-top:22px}
 <div class="endpoint-grid"><span class="muted">Base URL</span><input id="programBaseUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programBaseUrl','Base URL')" type="button">复制</button></div>
 <div class="endpoint-grid"><span class="muted">模型列表</span><input id="programModelsUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programModelsUrl','模型列表地址')" type="button">复制</button></div>
 <div class="endpoint-grid"><span class="muted">健康检查</span><input id="programHealthUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programHealthUrl','健康检查地址')" type="button">复制</button></div>
-<div class="endpoint-grid"><span class="muted">图片接口</span><input id="programImagesUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programImagesUrl','图片接口')" type="button">复制</button></div>
-<div class="endpoint-grid"><span class="muted">视频接口</span><input id="programVideosUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programVideosUrl','视频接口')" type="button">复制</button></div>
-<div class="endpoint-grid"><span class="muted">音频接口</span><input id="programAudioUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programAudioUrl','音频接口')" type="button">复制</button></div>
+<div class="endpoint-grid media-tool-row"><span class="muted">图片接口</span><button class="secondary" onclick="toggleMediaCurlMenu('image')" type="button">选择模型复制 curl</button><div id="mediaMenu_image" class="media-menu"></div></div>
+<div class="endpoint-grid media-tool-row"><span class="muted">视频接口</span><button class="secondary" onclick="toggleMediaCurlMenu('video')" type="button">选择模型复制 curl</button><div id="mediaMenu_video" class="media-menu"></div></div>
+<div class="endpoint-grid media-tool-row"><span class="muted">音频接口</span><button class="secondary" onclick="toggleMediaCurlMenu('audio')" type="button">选择模型复制 curl</button><div id="mediaMenu_audio" class="media-menu"></div></div>
+<div class="endpoint-grid media-tool-row"><span class="muted">TTS 接口</span><button class="secondary" onclick="toggleMediaCurlMenu('tts')" type="button">选择声音复制 curl</button><div id="mediaMenu_tts" class="media-menu"></div></div>
 <div class="muted">第三方 Agent 的 Base URL 填 <code>/v1</code>，API Key 填上面的访问密钥；程序健康检查建议使用 JSON 地址。</div>
 </div>
 
-<div class="card">
-<h3>导入本地 config.json</h3>
+<details class="card">
+<summary><strong>导入本地 config.json</strong></summary>
 <div class="muted">选择本地 Lite 配置文件，或把 config.json 内容粘贴到下面。导入后会覆盖当前服务器的配置。</div>
 <div class="field">
 <label>选择文件</label>
@@ -110,7 +130,7 @@ details{margin-top:22px}
 <button onclick="importConfigJSON()" type="button">导入并保存</button>
 <span id="importConfigStatus" class="muted"></span>
 </div>
-</div>
+</details>
 
 <div class="bar">
 <label class="toggle"><input type="checkbox" id="autoProbeEnabled"> 启用定时自动探测</label>
@@ -118,6 +138,22 @@ details{margin-top:22px}
 <span class="muted">实际间隔会在基础间隔的 70% 到 130% 之间随机浮动，探测后自动把可用模型发布到 <code>/v1/models</code>。</span>
 </div>
 
+<div class="bar">
+<h2 style="margin:0">已连接源</h2>
+<button class="secondary" onclick="probeAllProviders()">一键探测</button>
+<button class="secondary" onclick="stopProbe()">停止探测</button>
+<span id="probeAllStatus" class="muted"></span>
+</div>
+<div id="probeAllProgress" class="progress-wrap"><progress value="0" max="1"></progress><span class="muted">0/0</span></div>
+<div id="providerStatus" class="panel-grid"></div>
+
+<div class="tabs">
+<button id="tab_api" class="tab-button active" onclick="showMainTab('api')" type="button">API 密钥提供商</button>
+<button id="tab_oauth" class="tab-button" onclick="showMainTab('oauth')" type="button">OAuth 提供商</button>
+<button id="tab_auto" class="tab-button" onclick="showMainTab('auto')" type="button">Auto 模型</button>
+</div>
+
+<section id="panel_auto" class="tab-panel">
 <h2>Auto 模型</h2>
 <div class="card">
 <label class="toggle"><input type="checkbox" id="autoModelEnabled"> 启用 <code>auto</code> 模型</label>
@@ -132,23 +168,19 @@ details{margin-top:22px}
 <div id="autoModelList" class="model-list"></div>
 <div class="bar"><button class="secondary" onclick="saveGateway()">保存 Auto 设置</button><span id="autoModelStatus" class="muted"></span></div>
 </div>
+</section>
 
-<div class="bar">
-<h2 style="margin:0">已连接源</h2>
-<button class="secondary" onclick="probeAllProviders()">一键探测</button>
-<button class="secondary" onclick="stopProbe()">停止探测</button>
-<span id="probeAllStatus" class="muted"></span>
-</div>
-<div id="providerStatus" class="panel-grid"></div>
-
+<section id="panel_api" class="tab-panel active">
 <h2>API 密钥提供商</h2>
 <div class="muted section-note">输入 Base URL 和 API Key 后点击拉取模型；模型会直接显示在对应卡片底部，并可在卡片内探测和发布。</div>
 <div id="apiProviders" class="api-grid"></div>
+</section>
 
+<section id="panel_oauth" class="tab-panel">
 <h2>OAuth 提供商</h2>
-<div id="probeAllProgress" class="progress-wrap"><progress value="0" max="1"></progress><span class="muted">0/0</span></div>
 <div class="muted section-note">一键探测只会自动发布探测可用的模型；你也可以手动勾选探测失败的模型并保存发布列表。</div>
 <div id="publishProviders" class="panel-grid"></div>
+</section>
 
 <details>
 <summary>原始配置</summary>
@@ -162,6 +194,12 @@ const publishProviderIDs=['oc','mmf','qoder','gemini','kilo','cline'];
 const statusProviderIDs=['oc','mmf','qoder','gemini','kilo','cline','glm','groq','deepseek','mimo'];
 let probeStopRequested=false;
 function parseConfig(){ try { return JSON.parse(document.getElementById('cfg').value); } catch { return null; } }
+function showMainTab(name){
+  ['api','oauth','auto'].forEach(id=>{
+    const panel=document.getElementById('panel_'+id); if(panel) panel.classList.toggle('active',id===name);
+    const tab=document.getElementById('tab_'+id); if(tab) tab.classList.toggle('active',id===name);
+  });
+}
 function ensureEndpointRow(afterID,id,label,path){
   if(!document.getElementById(id)){
     const after=document.getElementById(afterID);
@@ -184,16 +222,13 @@ function setConfig(cfg){
   document.getElementById('accessKey').value=cfg.access_key || '';
   document.getElementById('baseUrl').value=location.origin+'/v1';
   document.getElementById('programBaseUrl').value=location.origin+'/v1';
-  document.getElementById('programModelsUrl').value=location.origin+pathWithKey('/v1/models',cfg);
+  document.getElementById('programModelsUrl').value=location.origin+'/v1/models';
   document.getElementById('programHealthUrl').value=location.origin+'/health?format=json';
-  ensureEndpointRow('programHealthUrl','programToolsUrl','Tools',pathWithKey('/v1/tools',cfg));
-  document.getElementById('programImagesUrl').value=location.origin+pathWithKey('/v1/images',cfg);
-  document.getElementById('programVideosUrl').value=location.origin+pathWithKey('/v1/videos',cfg);
-  document.getElementById('programAudioUrl').value=location.origin+pathWithKey('/v1/audio',cfg);
   document.getElementById('autoProbeEnabled').checked=!!cfg.auto_probe_enabled;
   document.getElementById('autoProbeInterval').value=cfg.auto_probe_interval_minutes || 60;
   document.getElementById('autoModelEnabled').checked=!!cfg.auto_model.enabled;
   renderAutoModels(cfg);
+  renderMediaCurlMenus(cfg);
 }
 function providerConnected(p){
   if(!p || !p.enabled) return false;
@@ -205,7 +240,7 @@ function authError(p){ return (p && p.provider_specific_data && p.provider_speci
 function manualOverride(p){ return !!(p && p.provider_specific_data && p.provider_specific_data.manualPublishOverride==='true'); }
 function isCustomProvider(p){ return !!(p && p.type==='openai' && /^custom/.test(p.id || '')); }
 function providerAPIKeys(p){ return unique([((p && p.api_key) || ''), ...((p && Array.isArray(p.api_keys)) ? p.api_keys : [])].map(x=>String(x || '').trim()).filter(Boolean)); }
-function hasMediaEndpoint(p){ return !!(p && ((p.image_endpoint || p.image_base_url || '').trim() || (p.video_endpoint || p.video_base_url || '').trim() || (p.audio_endpoint || p.audio_base_url || '').trim())); }
+function hasMediaEndpoint(p){ return !!(p && ((p.image_endpoint || p.image_base_url || '').trim() || (p.image_edit_endpoint || '').trim() || (p.video_endpoint || p.video_base_url || '').trim() || (p.audio_endpoint || p.audio_base_url || '').trim() || (p.tts_endpoint || '').trim())); }
 function customHasContent(p){ return !!(p && (providerAPIKeys(p).length || hasMediaEndpoint(p) || ((p.base_url || '').trim() && p.base_url !== 'https://example.com/v1') || (p.provider_specific_data && p.provider_specific_data.apiModelsFetched==='true'))); }
 function nextCustomID(cfg){ const ids=new Set((cfg.providers || []).map(p=>p.id)); let i=1; while(ids.has(i===1?'custom':'custom'+i)) i++; return i===1?'custom':'custom'+i; }
 function ensureBlankCustomProvider(cfg){
@@ -229,6 +264,150 @@ function ensureBlankCustomProvider(cfg){
 function apiProviderIDs(cfg){ return [...fixedAPIProviderIDs, ...(cfg.providers || []).filter(isCustomProvider).map(p=>p.id)]; }
 function esc(v){ return String(v || '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); }
 function unique(arr){ return [...new Set((arr || []).filter(Boolean))]; }
+function mediaKindInfo(kind){
+  if(kind==='image') return {path:'/v1/images', promptKey:'prompt', payload:{prompt:'替换为用户最终生图提示词',size:'替换为用户需要的图片尺寸，例如 1024x768',extra_body:{response_format:'url'}}};
+  if(kind==='video') return {path:'/v1/videos', promptKey:'prompt', payload:{prompt:'替换为用户最终视频提示词',height:768,width:1152,num_frames:121,frame_rate:24}};
+  if(kind==='audio') return {path:'/v1/audio', promptKey:'file'};
+  if(kind==='tts') return {path:'/v1/tts', promptKey:'text'};
+  return {path:'/v1/images', payload:{prompt:'用户提示词'}};
+}
+function mediaEndpointValue(p,kind){ return (p && (p[kind+'_endpoint'] || p[kind+'_base_url']) || '').trim(); }
+function mediaModelMatches(kind,model){
+  const lower=String(model || '').toLowerCase();
+  const words=kind==='image' ? ['image','imagen','flux','sdxl','dall-e','gpt-image','agnes-image'] : kind==='video' ? ['video','veo','sora','kling','runway','agnes-video'] : kind==='tts' ? ['tts','voice','neural','zh-','en-'] : ['audio','speech','whisper','transcrib'];
+  return words.some(word=>lower.includes(word));
+}
+function isMediaModel(model){ return mediaModelMatches('image',model) || mediaModelMatches('video',model) || mediaModelMatches('audio',model) || mediaModelMatches('tts',model); }
+function chatProbeModels(p){ return unique((p && p.models) || []).filter(model=>!isMediaModel(model)); }
+function mediaModelsForKind(cfg,kind){
+  const out=[];
+  ((cfg && cfg.providers) || []).forEach(p=>{
+    if(!p || !p.enabled || !mediaEndpointValue(p,kind)) return;
+    selectedModels(p).filter(model=>mediaModelMatches(kind,model)).forEach(model=>out.push({provider:p.id,name:p.name || p.id,model,full:p.id+'/'+model}));
+  });
+  return out;
+}
+function renderMediaCurlMenus(cfg){
+  ['image','video','audio','tts'].forEach(kind=>{
+    const root=document.getElementById('mediaMenu_'+kind); if(!root) return;
+    const models=mediaModelsForKind(cfg,kind);
+    root.innerHTML=models.length ? models.map(item=>'<button class="small secondary" title="'+esc(item.full)+'" data-kind="'+esc(kind)+'" data-provider="'+esc(item.provider)+'" data-model="'+esc(item.model)+'" onclick="copyMediaCurl(this)" type="button">'+esc(item.full)+'</button>').join('') : '<span class="muted">暂无已配置的媒体模型</span>';
+  });
+}
+function toggleMediaCurlMenu(kind){
+  const root=document.getElementById('mediaMenu_'+kind); if(!root) return;
+  root.classList.toggle('active');
+}
+function providerByID(cfg,id){ return ((cfg && cfg.providers) || []).find(p=>p && p.id===id) || null; }
+function shellSingleQuote(value){ return '\''+String(value || '').replaceAll('\'','\'"\'"\'')+'\''; }
+function mediaJSONCurl(endpoint,key,body){
+  return 'curl -X POST "'+endpoint+'" \\\n  -H "Content-Type: application/json" \\\n  -H "Authorization: Bearer '+key+'" \\\n  -d '+shellSingleQuote(JSON.stringify(body,null,2));
+}
+function providerDataValue(p,key){ return (p && p.provider_specific_data && p.provider_specific_data[key]) || ''; }
+function templateFieldValue(id,key){
+  const el=document.getElementById(key+'_'+id);
+  return el ? el.value.trim() : '';
+}
+function replaceAllTemplate(value, vars){
+  let out=String(value || '');
+  Object.keys(vars).forEach(key=>{ out=out.replaceAll('{{'+key+'}}', vars[key]); });
+  return out;
+}
+function renderCurlTemplate(template, vars){ return replaceAllTemplate(template, vars); }
+function isAgnesImage(endpoint,model){
+  return String(endpoint || '').toLowerCase().includes('agnes-ai.com') || String(model || '').toLowerCase().includes('agnes-image');
+}
+function transparentBackgroundModel(model){
+  const lower=String(model || '').toLowerCase();
+  if(lower==='gpt-image-1' || lower==='gpt-image-2') return 'gpt-image-1';
+  if(lower==='codex-gpt-image-1' || lower==='codex-gpt-image-2') return 'codex-gpt-image-1';
+  return '';
+}
+function mediaImageCurl(endpoint,key,model,editEndpoint){
+  const body=isAgnesImage(endpoint,model)
+    ? {model:model,prompt:'替换为用户最终生图提示词',size:'替换为用户需要的图片尺寸，例如 1024x768',extra_body:{response_format:'url'}}
+    : {model:model,prompt:'替换为用户最终生图提示词',n:1};
+  let out='# 文生图\n'+mediaJSONCurl(endpoint,key,body);
+  const transparentModel=transparentBackgroundModel(model);
+  if(!isAgnesImage(endpoint,model) && transparentModel){
+    const transparentBody={model:transparentModel,prompt:'替换为用户最终透明背景生图提示词',n:1,background:'transparent',output_format:'png'};
+    out += '\n\n# 透明背景 PNG 生图\n'+mediaJSONCurl(endpoint,key,transparentBody);
+  }
+  if(editEndpoint){
+    const editBody={model:model,prompt:'替换为用户最终图片编辑提示词',images:[{image_url:'https://example.com/input.png'}]};
+    out += '\n\n# 图片编辑：上传本地图片文件\n'
+      +'curl -X POST "'+editEndpoint+'" \\\n'
+      +'  -H "Authorization: Bearer '+key+'" \\\n'
+      +'  -F "model='+model+'" \\\n'
+      +'  -F "prompt=替换为用户最终图片编辑提示词" \\\n'
+      +'  -F "n=1" \\\n'
+      +'  -F "image=@替换为本地图片路径，例如 input.png"';
+    out += '\n\n# 图片编辑：使用图片 URL\n'+mediaJSONCurl(editEndpoint,key,editBody);
+  }
+  return out;
+}
+function mediaAudioCurl(endpoint,key,model){
+  return 'curl -X POST "'+endpoint+'" \\\n  -H "Authorization: Bearer '+key+'" \\\n  -F "file=@替换为本地音频文件路径，例如 audio.mp3" \\\n  -F "model='+model+'" \\\n  -F "response_format=json" \\\n  -F "language=替换为音频语言代码，例如 zh 或 en"';
+}
+function mediaVideoQueryCurl(endpoint,key){
+  const queryEndpoint=videoQueryEndpoint(endpoint);
+  return 'curl -X GET "'+queryEndpoint+'" \\\n  -H "Authorization: Bearer '+key+'"';
+}
+function videoQueryEndpoint(endpoint){
+  let queryEndpoint='https://apihub.agnes-ai.com/agnesapi?video_id=替换为创建任务返回的 video_id';
+  try{
+    const url=new URL(endpoint);
+    if(url.hostname.includes('agnes-ai.com')) queryEndpoint=url.origin+'/agnesapi?video_id=替换为创建任务返回的 video_id';
+  }catch(e){}
+  return queryEndpoint;
+}
+function customCurlTemplate(p,kind){
+  const key=kind==='image'?'curlTemplateImage':kind==='video'?'curlTemplateVideo':'curlTemplateAudio';
+  return providerDataValue(p,key).trim();
+}
+function mediaCurl(kind,providerID,model){
+  const cfg=parseConfig() || {};
+  const p=providerByID(cfg,providerID);
+  if(!p) throw new Error('provider not found: '+providerID);
+  const endpoint=mediaEndpointValue(p,kind);
+  if(!endpoint) throw new Error('该 provider 没有配置 '+kind+' Endpoint');
+  const key=providerAPIKeys(p)[0] || 'YOUR_UPSTREAM_API_KEY';
+  const customTemplate=customCurlTemplate(p,kind);
+  if(customTemplate){
+    return renderCurlTemplate(customTemplate,{
+      endpoint:endpoint,
+      image_edit_endpoint:mediaEndpointValue(p,'image_edit'),
+      key:key,
+      model:model,
+      transparent_model:transparentBackgroundModel(model) || model,
+      prompt:'替换为用户最终提示词',
+      image_prompt:'替换为用户最终生图提示词',
+      transparent_prompt:'替换为用户最终透明背景生图提示词',
+      edit_prompt:'替换为用户最终图片编辑提示词',
+      video_prompt:'替换为用户最终视频提示词',
+      audio_file:'替换为本地音频文件路径，例如 audio.mp3',
+      image_file:'替换为本地图片路径，例如 input.png',
+      tts_text:'你好世界',
+      video_query_endpoint:videoQueryEndpoint(endpoint)
+    });
+  }
+  if(kind==='image') return mediaImageCurl(endpoint,key,model,mediaEndpointValue(p,'image_edit'));
+  if(kind==='audio') return mediaAudioCurl(endpoint,key,model);
+  if(kind==='tts') return renderCurlTemplate(defaultCurlTemplate('tts'),{endpoint:endpoint,key:key,model:model,tts_text:'你好世界'});
+  const body={model:model,...mediaKindInfo(kind).payload};
+  if(kind==='video') return '# 创建视频任务，响应里的 video_id 用于查询结果\n'+mediaJSONCurl(endpoint,key,body)+'\n\n# 建议每 5 秒轮询一次，直到 status 为 completed\n'+mediaVideoQueryCurl(endpoint,key);
+  return mediaJSONCurl(endpoint,key,body);
+}
+async function copyMediaCurl(button){
+  try{
+    const kind=button.getAttribute('data-kind');
+    const provider=button.getAttribute('data-provider');
+    const model=button.getAttribute('data-model');
+    await copyTextValue(mediaCurl(kind,provider,model));
+    setText('status','ok',provider+'/'+model+' 调用格式已复制');
+    const root=document.getElementById('mediaMenu_'+kind); if(root) root.classList.remove('active');
+  }catch(e){ setText('status','err','复制失败：'+e.message); }
+}
 function selectedModels(p){ if(manualOverride(p) && (!p.enabled_models || !p.enabled_models.length)) return []; return unique((p && p.enabled_models && p.enabled_models.length) ? p.enabled_models : (p && p.models) || []); }
 function availableModels(p){ return unique((p && p.available_models) || []); }
 function apiModelsLoaded(p){ return !!(p && p.provider_specific_data && p.provider_specific_data.apiModelsFetched==='true' && Array.isArray(p.models) && p.models.length); }
@@ -240,6 +419,8 @@ function visibleModels(p){
   const set=new Set(available);
   return selected.filter(x=>set.has(x));
 }
+function lockedModels(p){ return unique((p && p.locked_models) || []); }
+function isLockedModel(p,model){ return lockedModels(p).includes(model); }
 function autoModels(cfg){ return unique((cfg && cfg.auto_model && cfg.auto_model.models) || []); }
 function renderAutoModels(cfg){
   const root=document.getElementById('autoModelList'); if(!root) return;
@@ -328,6 +509,17 @@ function fetchOAuthModelsButton(p){
   if(!canFetchOAuthModels(p.id)) return '';
   return '<button class="small secondary" onclick="fetchOAuthProviderModels(\''+p.id+'\')" '+(!providerConnected(p)?'disabled':'')+'>拉取模型</button>';
 }
+function providerCategory(p){
+  if(!p) return 'Provider';
+  if(isCustomProvider(p)) return 'Custom';
+  if(['kilo','cline','gemini'].includes(p.id)) return 'OAuth';
+  if(['oc','mmf','qoder'].includes(p.id) || String(p.type || '').includes('free')) return 'Free';
+  if(p.type==='openai') return 'API Key';
+  return p.type || 'Provider';
+}
+function providerTitleHTML(p,dotClass){
+  return '<div class="card-title-row"><h3><span class="'+dotClass+'"></span>'+esc(p.name)+'</h3><span class="provider-badge">'+esc(providerCategory(p))+'</span></div>';
+}
 function modelRows(p){
   const selected=new Set(selectedModels(p));
   const available=new Set(availableModels(p));
@@ -339,7 +531,9 @@ function modelRows(p){
     const note=usable ? '' : modelStateText(p, model);
     const toggle='<input type="checkbox" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" '+(checked?'checked':'')+'>';
     const addAuto='<button class="add-auto-model secondary" type="button" title="Add to Auto" data-model="'+esc(p.id+'/'+model)+'" onclick="addAutoModelValue(this)">+</button>';
-    return '<div class="model-item '+(usable?'':'off')+'">'+toggle+addAuto+'<span class="model-name">'+esc(model)+note+latencyHTML(p,model)+(usable?'':modelErrorHTML(p,model))+'</span></div>';
+    const locked=isLockedModel(p,model);
+    const lock='<button class="model-lock secondary '+(locked?'locked':'')+'" type="button" title="'+(locked?'已上锁：一键/定时探测会跳过':'未上锁：一键/定时探测会包含')+'" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" onclick="toggleModelLock(this)">'+(locked?'🔒':'🔓')+'</button>';
+    return '<div class="model-item '+(usable?'':'off')+'">'+toggle+addAuto+lock+'<span class="model-name">'+esc(model)+note+latencyHTML(p,model)+(usable?'':modelErrorHTML(p,model))+'</span></div>';
   }).join('');
 }
 function renderProviderStatus(){
@@ -351,12 +545,26 @@ function renderProviderStatus(){
     const loaded=unique(p.models || []); const available=availableModels(p); const published=visibleModels(p);
     const availableCount=p.availability_checked_at?available.length:loaded.length;
     const auth=authStatus(p); const authText=auth==='needs_login' ? '<div class="err">登录失效，需要重新登录。'+esc(authError(p))+'</div>' : '<div class="muted">已连接</div>';
-    return '<div class="card"><h3><span class="green-dot"></span>'+esc(p.name)+'</h3>'+authText+'<div class="muted">已加载 '+loaded.length+' 个模型，可用 '+availableCount+' 个，已发布 '+published.length+' 个</div></div>';
+    return '<div class="card">'+providerTitleHTML(p,'green-dot')+authText+'<div class="muted">已加载 '+loaded.length+' 个模型，可用 '+availableCount+' 个，已发布 '+published.length+' 个</div></div>';
   });
   root.innerHTML=items.join('') || '<div class="muted">当前没有已连接的 provider。</div>';
 }
-function apiKeyRowHTML(id, value){
-  return '<div class="inline-field grow key-row"><input data-api-key-provider="'+esc(id)+'" value="'+esc(value || '')+'" placeholder="sk-..."><button class="small secondary" data-key-remove="1" onclick="removeAPIKeyInput(this,\''+id+'\')" type="button">删除</button></div>';
+function csvIndexSet(value){
+  const out=new Set();
+  String(value || '').split(',').map(x=>x.trim()).filter(Boolean).forEach(x=>{ const n=parseInt(x,10); if(!Number.isNaN(n)) out.add(n); });
+  return out;
+}
+function apiKeyStatusClass(p,index,total){
+  if(!p || total<=1) return 'empty';
+  const failed=csvIndexSet(providerDataValue(p,'failed_key_indexes'));
+  if(failed.has(index)) return 'failed';
+  const activeRaw=providerDataValue(p,'active_key_index');
+  const active=activeRaw==='' ? 0 : parseInt(activeRaw,10);
+  return active===index ? 'active' : 'empty';
+}
+function apiKeyRowHTML(id, value, statusClass){
+  statusClass=statusClass || 'empty';
+  return '<div class="inline-field grow key-row"><span class="key-status-dot '+esc(statusClass)+'"></span><input data-api-key-provider="'+esc(id)+'" value="'+esc(value || '')+'" placeholder="sk-..."><button class="small secondary" data-key-remove="1" onclick="removeAPIKeyInput(this,\''+id+'\')" type="button">删除</button></div>';
 }
 function refreshAPIKeyRemoveButtons(id){
   const root=document.getElementById('keyList_'+id); if(!root) return;
@@ -365,23 +573,22 @@ function refreshAPIKeyRemoveButtons(id){
 }
 function addAPIKeyInput(id){
   const root=document.getElementById('keyList_'+id); if(!root) return;
-  root.insertAdjacentHTML('beforeend', apiKeyRowHTML(id,''));
+  root.insertAdjacentHTML('beforeend', apiKeyRowHTML(id,'','empty'));
   refreshAPIKeyRemoveButtons(id);
 }
 function removeAPIKeyInput(button,id){
   const row=button && button.closest ? button.closest('.key-row') : null;
   if(row) row.remove();
   const root=document.getElementById('keyList_'+id);
-  if(root && !root.querySelector('.key-row')) root.insertAdjacentHTML('beforeend', apiKeyRowHTML(id,''));
+  if(root && !root.querySelector('.key-row')) root.insertAdjacentHTML('beforeend', apiKeyRowHTML(id,'','empty'));
   refreshAPIKeyRemoveButtons(id);
 }
 function apiKeyValues(id){
   return unique([...document.querySelectorAll('input[data-api-key-provider="'+id+'"]')].map(node=>node.value.trim()).filter(Boolean));
 }
-function apiKeyEditor(id,p,isCustom){
-  if(!isCustom) return '<div class="field"><label>API Key</label><input id="key_'+id+'" value="'+esc(p.api_key || '')+'" placeholder="sk-..."></div>';
+function apiKeyEditor(id,p){
   const keys=providerAPIKeys(p); if(!keys.length) keys.push('');
-  return '<div class="field"><label>API Keys</label><div id="keyList_'+id+'" class="key-list">'+keys.map(key=>apiKeyRowHTML(id,key)).join('')+'</div><div class="bar"><button class="small secondary" onclick="addAPIKeyInput(\''+id+'\')" type="button">新增 API Key</button><span class="muted">按顺序尝试；额度不足时自动切到下一个。</span></div></div>';
+  return '<div class="field"><label>API Keys</label><div id="keyList_'+id+'" class="key-list">'+keys.map((key,index)=>apiKeyRowHTML(id,key,apiKeyStatusClass(p,index,keys.length))).join('')+'</div><div class="bar"><button class="small secondary" onclick="addAPIKeyInput(\''+id+'\')" type="button">新增 API Key</button><span class="muted">按顺序尝试；额度不足时自动切到下一个。</span></div></div>';
 }
 function hydrateCustomKeyEditors(cfg){
   (cfg.providers || []).forEach(p=>{
@@ -389,7 +596,7 @@ function hydrateCustomKeyEditors(cfg){
     if(!input) return;
     const field=input.closest('.field');
     if(!field) return;
-    field.outerHTML=apiKeyEditor(p.id,p,isCustomProvider(p));
+    field.outerHTML=apiKeyEditor(p.id,p);
     const base=document.getElementById('base_'+p.id);
     const baseField=base && base.closest ? base.closest('.field') : null;
     if(baseField && !document.getElementById('mediaBase_'+p.id)){
@@ -400,11 +607,12 @@ function hydrateCustomKeyEditors(cfg){
 }
 function mediaBaseValue(p, kind){ return (p && (p[kind+'_endpoint'] || p[kind+'_base_url'])) || ''; }
 function mediaBaseEditor(id,p){
-  const kinds=[['image','图片'],['video','视频'],['audio','音频']];
-  return '<div id="mediaBase_'+id+'" class="field"><label>媒体完整 Endpoint</label><div class="bar">'+kinds.map(([kind,label])=>'<button class="small secondary" type="button" onclick="showMediaBaseInput(\''+id+'\',\''+kind+'\')">新增'+label+' Endpoint</button>').join('')+'</div><div class="key-list">'+kinds.map(([kind,label])=>mediaBaseInputHTML(id,kind,label,mediaBaseValue(p,kind))).join('')+'</div><div class="muted">填写上游文档里的完整请求地址，例如 https://apihub.agnes-ai.com/v1/videos。</div></div>';
+  const kinds=[['image','图片'],['image_edit','图片编辑'],['video','视频'],['audio','音频'],['tts','TTS']];
+  return '<div id="mediaBase_'+id+'" class="field"><label>媒体完整 Endpoint</label><div class="bar">'+kinds.map(([kind,label])=>'<button class="small secondary" type="button" onclick="showMediaBaseInput(\''+id+'\',\''+kind+'\')">新增'+label+' Endpoint</button>').join('')+'</div><div class="key-list">'+kinds.map(([kind,label])=>mediaBaseInputHTML(id,kind,label,mediaBaseValue(p,kind))).join('')+'</div><div class="muted">填写上游文档里的完整请求地址，例如 https://apihub.agnes-ai.com/v1/videos。</div>'+mediaTemplateEditor(id,p)+'</div>';
 }
 function mediaBaseInputHTML(id,kind,label,value){
-  return '<div id="'+kind+'BaseRow_'+id+'" class="field" style="'+(value?'':'display:none')+'"><label>'+label+' Endpoint</label><input id="'+kind+'Base_'+id+'" value="'+esc(value || '')+'" placeholder="https://example.com/v1/'+(kind==='image'?'images':kind==='video'?'videos':'audio')+'"></div>';
+  const example=kind==='image'?'images/generations':kind==='image_edit'?'images/edits':kind==='video'?'videos':kind==='tts'?'tts':'audio';
+  return '<div id="'+kind+'BaseRow_'+id+'" class="field" style="'+(value?'':'display:none')+'"><label>'+label+' Endpoint</label><div class="inline-field grow"><input id="'+kind+'Base_'+id+'" value="'+esc(value || '')+'" placeholder="https://example.com/v1/'+example+'"><button class="small secondary" type="button" onclick="clearMediaBaseInput(\''+id+'\',\''+kind+'\')">删除</button></div></div>';
 }
 function showMediaBaseInput(id,kind){
   const row=document.getElementById(kind+'BaseRow_'+id);
@@ -412,9 +620,33 @@ function showMediaBaseInput(id,kind){
   const input=document.getElementById(kind+'Base_'+id);
   if(input) input.focus();
 }
+function clearMediaBaseInput(id,kind){
+  const input=document.getElementById(kind+'Base_'+id);
+  if(input) input.value='';
+  const row=document.getElementById(kind+'BaseRow_'+id);
+  if(row) row.style.display='none';
+}
 function mediaBaseInputValue(id,kind){
   const input=document.getElementById(kind+'Base_'+id);
   return input ? input.value.trim() : '';
+}
+function mediaTemplateEditor(id,p){
+  return '<details><summary>自定义 curl 模板</summary>'
+    +templateTextArea(id,'curlTemplateImage','图片 curl 模板',providerDataValue(p,'curlTemplateImage') || defaultCurlTemplate('image'))
+    +templateTextArea(id,'curlTemplateVideo','视频 curl 模板',providerDataValue(p,'curlTemplateVideo') || defaultCurlTemplate('video'))
+    +templateTextArea(id,'curlTemplateAudio','音频 curl 模板',providerDataValue(p,'curlTemplateAudio') || defaultCurlTemplate('audio'))
+    +templateTextArea(id,'curlTemplateTTS','TTS curl 模板',providerDataValue(p,'curlTemplateTTS') || defaultCurlTemplate('tts'))
+    +'</details>';
+}
+function templateTextArea(id,key,label,value){
+  return '<div class="field"><label>'+label+'</label><textarea id="'+key+'_'+id+'" spellcheck="false">'+esc(value || '')+'</textarea></div>';
+}
+function defaultCurlTemplate(kind){
+  if(kind==='image') return '# 文生图\ncurl -X POST "{{endpoint}}" \\\n  -H "Content-Type: application/json" \\\n  -H "Authorization: Bearer {{key}}" \\\n  -d \'{\n  "model": "{{model}}",\n  "prompt": "{{image_prompt}}",\n  "n": 1\n}\'\n\n# 透明背景 PNG 生图\ncurl -X POST "{{endpoint}}" \\\n  -H "Content-Type: application/json" \\\n  -H "Authorization: Bearer {{key}}" \\\n  -d \'{\n  "model": "{{transparent_model}}",\n  "prompt": "{{transparent_prompt}}",\n  "n": 1,\n  "background": "transparent",\n  "output_format": "png"\n}\'\n\n# 图片编辑：使用图片 URL\ncurl -X POST "{{image_edit_endpoint}}" \\\n  -H "Content-Type: application/json" \\\n  -H "Authorization: Bearer {{key}}" \\\n  -d \'{\n  "model": "{{model}}",\n  "prompt": "{{edit_prompt}}",\n  "images": [\n    {"image_url": "https://example.com/input.png"}\n  ]\n}\'';
+  if(kind==='video') return '# 创建视频任务\ncurl -X POST "{{endpoint}}" \\\n  -H "Content-Type: application/json" \\\n  -H "Authorization: Bearer {{key}}" \\\n  -d \'{\n  "model": "{{model}}",\n  "prompt": "{{video_prompt}}",\n  "height": 768,\n  "width": 1152,\n  "num_frames": 121,\n  "frame_rate": 24\n}\'\n\n# 查询视频结果\ncurl -X GET "{{video_query_endpoint}}" \\\n  -H "Authorization: Bearer {{key}}"';
+  if(kind==='audio') return 'curl -X POST "{{endpoint}}" \\\n  -H "Authorization: Bearer {{key}}" \\\n  -F "file=@{{audio_file}}" \\\n  -F "model={{model}}" \\\n  -F "response_format=json" \\\n  -F "language=zh"';
+  if(kind==='tts') return 'curl -G "{{endpoint}}" \\\n  --data-urlencode "text={{tts_text}}" \\\n  --data-urlencode "voice={{model}}" \\\n  --output output.mp3';
+  return '';
 }
 function renderAPIProviders(){
   const root=document.getElementById('apiProviders'); const cfg=parseConfig();
@@ -426,7 +658,8 @@ function renderAPIProviders(){
     const rows=apiModelsLoaded(p) ? '<div class="model-list">'+modelRows(p)+'</div>' : '';
     const count=apiModelsLoaded(p) ? '<div class="muted">已拉取 '+p.models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div>' : '';
     const deleteButton='<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="deleteAPIProvider(\''+id+'\')">删除卡片</button></div>';
-    return '<div class="api-card"><div class="api-head"><strong>'+esc(p.name)+'</strong><span class="api-meta">'+esc(p.id)+'</span></div>'+(isCustom?'<div class="field"><label>名称</label><input id="name_'+id+'" value="'+esc(p.name || '')+'" placeholder="自定义源"></div>':'')+'<label class="toggle"><input type="checkbox" id="enabled_'+id+'" onchange="saveAPIProvider(\''+id+'\')" '+(p.enabled?'checked':'')+'> 启用</label><div class="field"><label>Base URL</label><input id="base_'+id+'" value="'+esc(p.base_url || '')+'" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="key_'+id+'" value="'+esc(p.api_key || '')+'" placeholder="sk-..."></div><div class="bar"><button onclick="saveAPIProvider(\''+id+'\')">保存</button><button class="secondary" onclick="fetchAPIProviderModels(\''+id+'\')">保存并拉取模型</button><span id="apiStatus_'+id+'" class="muted"></span></div><div class="field"><label>手动添加模型</label><div class="inline-field grow"><input id="manualModel_'+id+'" placeholder="model-id"><button class="secondary" onclick="addAPIModel(\''+id+'\')" type="button">添加</button></div></div><div class="bar"><button class="small" onclick="probeProvider(\''+id+'\',\'apiStatus_'+id+'\')" '+(!providerConnected(p) || !apiModelsLoaded(p)?'disabled':'')+'>探测可用</button><button class="small secondary" onclick="saveModelSelection(\''+id+'\',\'apiStatus_'+id+'\')" '+(!apiModelsLoaded(p)?'disabled':'')+'>保存发布</button></div><div id="probeProgress_'+id+'" class="progress-wrap"><progress value="0" max="'+(p.models||[]).length+'"></progress><span class="muted">0/'+(p.models||[]).length+'</span></div>'+count+listControls+rows+deleteButton+'</div>';
+    const probeCount=chatProbeModels(p).length;
+    return '<div class="api-card"><div class="api-head"><strong>'+esc(p.name)+'</strong><span class="api-meta">'+esc(p.id)+'</span></div>'+(isCustom?'<div class="field"><label>名称</label><input id="name_'+id+'" value="'+esc(p.name || '')+'" placeholder="自定义源"></div>':'')+'<label class="toggle"><input type="checkbox" id="enabled_'+id+'" onchange="saveAPIProvider(\''+id+'\')" '+(p.enabled?'checked':'')+'> 启用</label><div class="field"><label>Base URL</label><input id="base_'+id+'" value="'+esc(p.base_url || '')+'" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="key_'+id+'" value="'+esc(p.api_key || '')+'" placeholder="sk-..."></div><div class="bar"><button onclick="saveAPIProvider(\''+id+'\')">保存</button><button class="secondary" onclick="fetchAPIProviderModels(\''+id+'\')">保存并拉取模型</button><span id="apiStatus_'+id+'" class="muted"></span></div><div class="field"><label>手动添加模型</label><div class="inline-field grow"><input id="manualModel_'+id+'" placeholder="model-id"><button class="secondary" onclick="addAPIModel(\''+id+'\')" type="button">添加</button></div></div><div class="bar"><button class="small" onclick="probeProvider(\''+id+'\',\'apiStatus_'+id+'\')" '+(!providerConnected(p) || !apiModelsLoaded(p) || !probeCount?'disabled':'')+'>探测可用</button><button class="small secondary" onclick="saveModelSelection(\''+id+'\',\'apiStatus_'+id+'\')" '+(!apiModelsLoaded(p)?'disabled':'')+'>保存发布</button></div><div id="probeProgress_'+id+'" class="progress-wrap"><progress value="0" max="'+probeCount+'"></progress><span class="muted">0/'+probeCount+'</span></div>'+count+listControls+rows+deleteButton+'</div>';
   }).join('');
   hydrateCustomKeyEditors(cfg);
 }
@@ -441,7 +674,8 @@ function renderPublishProviders(){
     const authText=auth==='needs_login' ? '<div class="err">登录失效，需要重新登录。'+esc(authError(p))+'</div>' : '';
     const listControls=models.length ? '<div class="bar"><button class="small secondary" onclick="selectProviderModels(\''+p.id+'\',true)">全选</button><button class="small secondary" onclick="selectProviderModels(\''+p.id+'\',false)">取消所有选择</button></div>' : '';
     const rows=models.length ? '<div class="model-list">'+modelRows(p)+'</div>' : '<div class="muted">登录或拉取后会显示模型。</div>';
-    return '<div class="card"><h3><span class="'+(connected?'green-dot':'gray-dot')+'"></span>'+esc(p.name)+'</h3>'+oauthControls(p.id)+authText+'<div class="muted">已加载 '+models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div><div class="bar">'+fetchOAuthModelsButton(p)+'<button class="small" onclick="probeProvider(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!connected || !models.length?'disabled':'')+'>探测可用</button><button class="small secondary" onclick="saveModelSelection(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!models.length?'disabled':'')+'>保存发布列表</button><span id="publishStatus_'+p.id+'" class="muted"></span></div><div id="probeProgress_'+p.id+'" class="progress-wrap"><progress value="0" max="'+models.length+'"></progress><span class="muted">0/'+models.length+'</span></div>'+listControls+rows+'<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="disableProvider(\''+p.id+'\')">停用</button></div></div>';
+    const probeCount=chatProbeModels(p).length;
+    return '<div class="card">'+providerTitleHTML(p,connected?'green-dot':'gray-dot')+oauthControls(p.id)+authText+'<div class="muted">已加载 '+models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div><div class="bar">'+fetchOAuthModelsButton(p)+'<button class="small" onclick="probeProvider(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!connected || !probeCount?'disabled':'')+'>探测可用</button><button class="small secondary" onclick="saveModelSelection(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!models.length?'disabled':'')+'>保存发布列表</button><span id="publishStatus_'+p.id+'" class="muted"></span></div><div id="probeProgress_'+p.id+'" class="progress-wrap"><progress value="0" max="'+probeCount+'"></progress><span class="muted">0/'+probeCount+'</span></div>'+listControls+rows+'<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="disableProvider(\''+p.id+'\')">停用</button></div></div>';
   });
   root.innerHTML=items.join('') || '<div class="muted">还没有可发布的模型。</div>';
 }
@@ -450,20 +684,32 @@ function buildAPIProvider(id){
   const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid');
   const prev=cfg.providers.find(x=>x.id===id); if(!prev) throw new Error('provider not found: '+id);
   const custom=isCustomProvider(prev);
-  const keys=custom?apiKeyValues(id):[];
-  const next={ ...prev, name:custom?(document.getElementById('name_'+id).value.trim() || prev.name || 'Custom OpenAI Compatible'):prev.name, enabled:!!document.getElementById('enabled_'+id).checked, base_url:document.getElementById('base_'+id).value.trim(), api_key:custom?(keys[0] || ''):document.getElementById('key_'+id).value.trim() };
+  const keys=apiKeyValues(id);
+  const next={ ...prev, name:custom?(document.getElementById('name_'+id).value.trim() || prev.name || 'Custom OpenAI Compatible'):prev.name, enabled:!!document.getElementById('enabled_'+id).checked, base_url:document.getElementById('base_'+id).value.trim(), api_key:keys[0] || '' };
   next.image_endpoint=mediaBaseInputValue(id,'image');
+  next.image_edit_endpoint=mediaBaseInputValue(id,'image_edit');
   next.video_endpoint=mediaBaseInputValue(id,'video');
   next.audio_endpoint=mediaBaseInputValue(id,'audio');
+  next.tts_endpoint=mediaBaseInputValue(id,'tts');
   delete next.image_base_url;
   delete next.video_base_url;
   delete next.audio_base_url;
-  if(custom){
+  if(keys.length>1){
     next.api_keys=keys;
-    next.provider_specific_data={...(next.provider_specific_data || {}), customProvider:'true'};
   }else{
     delete next.api_keys;
   }
+  const psd={...(next.provider_specific_data || {})};
+  delete psd.active_key_index;
+  delete psd.failed_key_indexes;
+  [['curlTemplateImage','image'],['curlTemplateVideo','video'],['curlTemplateAudio','audio'],['curlTemplateTTS','tts']].forEach(([key,kind])=>{
+    const value=templateFieldValue(id,key);
+    if(value && value!==defaultCurlTemplate(kind)) psd[key]=value; else delete psd[key];
+  });
+  if(custom){
+    psd.customProvider='true';
+  }
+  next.provider_specific_data=psd;
   return next;
 }
 async function saveConfigObject(cfg){ const res=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(cfg)}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); return data; }
@@ -596,6 +842,26 @@ async function addAPIModel(id){
 function selectProviderModels(id, checked){
   document.querySelectorAll('input[data-provider="'+id+'"][data-model]').forEach(node=>{ node.checked=!!checked; });
 }
+async function toggleModelLock(button){
+  try{
+    const id=button.getAttribute('data-provider');
+    const model=button.getAttribute('data-model');
+    const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid');
+    applyGatewaySettings(cfg);
+    cfg.providers=cfg.providers.map(p=>{
+      if(p.id!==id) return p;
+      p={...p};
+      const locked=new Set(lockedModels(p));
+      if(locked.has(model)) locked.delete(model); else locked.add(model);
+      p.locked_models=[...locked];
+      return p;
+    });
+    ensureBlankCustomProvider(cfg);
+    await saveConfigObject(cfg);
+    await reloadConfig();
+    setText('status','ok','模型锁定状态已保存');
+  }catch(e){ setText('status','err','锁定失败：'+e.message); }
+}
 function stopProbe(){
   probeStopRequested=true;
   setText('probeAllStatus','muted','正在停止，当前请求完成后不再继续。');
@@ -604,7 +870,9 @@ async function probeOneModel(id, model, autoPublish, dropUnavailable){ if(dropUn
 async function probeProvider(id, statusID){
   probeStopRequested=false;
   const cfg=parseConfig(); const p=cfg.providers.find(x=>x.id===id); if(!p) return;
-  const models=unique(p.models || []); let ok=0; let failed=0; statusID=statusID || 'publishStatus_'+id; setProgress('probeProgress_'+id,0,models.length); setText(statusID,'muted','正在探测...');
+  const models=chatProbeModels(p); let ok=0; let failed=0; statusID=statusID || 'publishStatus_'+id; setProgress('probeProgress_'+id,0,models.length);
+  if(!models.length){ setText(statusID,'muted','没有可探测的文本模型，多媒体模型已跳过。'); return; }
+  setText(statusID,'muted','正在探测...');
   let done=0;
   for(let i=0;i<models.length;i++){
     if(probeStopRequested) break;
@@ -623,8 +891,12 @@ async function probeProvider(id, statusID){
 async function probeAllProviders(){
   probeStopRequested=false;
   const cfg=parseConfig(); const providers=cfg.providers.filter(p=>providerConnected(p) && visibleModels(p).length);
-  const jobs=[]; providers.forEach(p=>visibleModels(p).forEach(model=>jobs.push({id:p.id,model})));
+  const jobs=[]; providers.forEach(p=>{
+    const locked=new Set(lockedModels(p));
+    visibleModels(p).filter(model=>!locked.has(model) && !isMediaModel(model)).forEach(model=>jobs.push({id:p.id,model}));
+  });
   let ok=0; let failed=0; setProgress('probeAllProgress',0,jobs.length); setText('probeAllStatus','muted','正在探测...');
+  if(!jobs.length){ setText('probeAllStatus','muted','没有可探测的文本模型，或模型都已上锁。'); return; }
   let done=0;
   for(let i=0;i<jobs.length;i++){
     if(probeStopRequested) break;

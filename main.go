@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -58,8 +59,10 @@ type ProviderConfig struct {
 	Enabled               bool              `json:"enabled"`
 	BaseURL               string            `json:"base_url,omitempty"`
 	ImageEndpoint         string            `json:"image_endpoint,omitempty"`
+	ImageEditEndpoint     string            `json:"image_edit_endpoint,omitempty"`
 	VideoEndpoint         string            `json:"video_endpoint,omitempty"`
 	AudioEndpoint         string            `json:"audio_endpoint,omitempty"`
+	TTSEndpoint           string            `json:"tts_endpoint,omitempty"`
 	ImageBaseURL          string            `json:"image_base_url,omitempty"`
 	VideoBaseURL          string            `json:"video_base_url,omitempty"`
 	AudioBaseURL          string            `json:"audio_base_url,omitempty"`
@@ -73,6 +76,7 @@ type ProviderConfig struct {
 	ProviderSpecificData  map[string]string `json:"provider_specific_data,omitempty"`
 	Models                []string          `json:"models,omitempty"`
 	EnabledModels         []string          `json:"enabled_models,omitempty"`
+	LockedModels          []string          `json:"locked_models,omitempty"`
 	AvailableModels       []string          `json:"available_models,omitempty"`
 	ModelLatencyMS        map[string]int64  `json:"model_latency_ms,omitempty"`
 	ModelErrors           map[string]string `json:"model_errors,omitempty"`
@@ -81,13 +85,14 @@ type ProviderConfig struct {
 }
 
 type HealthStatus struct {
-	OK              bool             `json:"ok"`
-	Service         string           `json:"service"`
-	Providers       int              `json:"providers"`
-	Connected       []HealthProvider `json:"connected"`
-	ConnectedCount  int              `json:"connected_count"`
-	PublishedModels int              `json:"published_models"`
-	AutoModel       HealthAutoModel  `json:"auto_model"`
+	OK              bool                  `json:"ok"`
+	Service         string                `json:"service"`
+	Providers       int                   `json:"providers"`
+	Connected       []HealthProvider      `json:"connected"`
+	ConnectedCount  int                   `json:"connected_count"`
+	PublishedModels int                   `json:"published_models"`
+	AutoModel       HealthAutoModel       `json:"auto_model"`
+	MediaTemplates  []HealthMediaTemplate `json:"media_templates,omitempty"`
 }
 
 type HealthProvider struct {
@@ -105,6 +110,31 @@ type HealthAutoModel struct {
 	Models  int    `json:"models"`
 	Active  string `json:"active"`
 	OK      bool   `json:"ok"`
+}
+
+type HealthMediaTemplate struct {
+	Type           string                    `json:"type"`
+	ProviderID     string                    `json:"provider_id"`
+	ProviderName   string                    `json:"provider_name"`
+	Model          string                    `json:"model"`
+	UpstreamModel  string                    `json:"upstream_model"`
+	Method         string                    `json:"method"`
+	Endpoint       string                    `json:"endpoint"`
+	RequestBody    map[string]any            `json:"request_body,omitempty"`
+	Form           map[string]string         `json:"form,omitempty"`
+	Curl           string                    `json:"curl"`
+	ExtraTemplates []HealthMediaCurlTemplate `json:"extra_templates,omitempty"`
+	Note           string                    `json:"note,omitempty"`
+}
+
+type HealthMediaCurlTemplate struct {
+	Name        string            `json:"name"`
+	Method      string            `json:"method"`
+	Endpoint    string            `json:"endpoint"`
+	RequestBody map[string]any    `json:"request_body,omitempty"`
+	Form        map[string]string `json:"form,omitempty"`
+	Curl        string            `json:"curl"`
+	Note        string            `json:"note,omitempty"`
 }
 
 type Server struct {
@@ -176,6 +206,7 @@ func main() {
 	mux.HandleFunc("/v1/videos/models", srv.handleMediaModels("video"))
 	mux.HandleFunc("/v1/audio", srv.handleMedia("audio"))
 	mux.HandleFunc("/v1/audio/models", srv.handleMediaModels("audio"))
+	mux.HandleFunc("/v1/tts/models", srv.handleMediaModels("tts"))
 
 	go srv.autoProbeLoop()
 
@@ -427,6 +458,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	cfg := s.currentConfig()
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
+	revealSecrets := s.requestHasAccessKey(r)
 	var connected []HealthProvider
 	totalPublished := 0
 	for _, p := range cfg.Providers {
@@ -461,6 +493,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			Active:  autoTarget,
 			OK:      autoOK,
 		},
+		MediaTemplates: s.healthMediaTemplates(revealSecrets),
 	}
 	if wantsHTML(r) && !wantsJSON(r) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -632,7 +665,12 @@ func (s *Server) handleProviderProbe(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider has no loaded models"})
 		return
 	}
-	available, failures, latencies := s.probeProviderModels(r.Context(), p, p.Models)
+	probeModels := chatModelIDs(p.Models)
+	if len(probeModels) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider has no text chat models to probe"})
+		return
+	}
+	available, failures, latencies := s.probeProviderModels(r.Context(), p, probeModels)
 	p.AvailableModels = uniqueStrings(available)
 	p.ModelLatencyMS = latencies
 	p.ModelErrors = failures
@@ -681,6 +719,10 @@ func (s *Server) handleProviderProbeModel(w http.ResponseWriter, r *http.Request
 	model := strings.TrimSpace(body.Model)
 	if model == "" || !sliceSet(p.Models)[model] {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "model is not loaded by provider"})
+		return
+	}
+	if isMediaModel(model) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "media models are not probed by chat probe"})
 		return
 	}
 
@@ -772,7 +814,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	var models []map[string]any
 	grouped := map[string][]string{}
 	for _, p := range s.enabledProviders() {
-		ids := s.visibleModelsForProvider(ctx, p)
+		ids := s.chatModelsForProvider(ctx, p)
 		if len(ids) > 0 {
 			grouped[p.Name] = append([]string(nil), ids...)
 		}
@@ -786,13 +828,15 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if target, ok := s.resolveAutoModel(ctx); ok {
-		grouped["Auto"] = []string{target}
-		models = append(models, map[string]any{
-			"id":       "auto",
-			"object":   "model",
-			"created":  0,
-			"owned_by": "auto",
-		})
+		if !isMediaModel(target) {
+			grouped["Auto"] = []string{target}
+			models = append(models, map[string]any{
+				"id":       "auto",
+				"object":   "model",
+				"created":  0,
+				"owned_by": "auto",
+			})
+		}
 	}
 	sort.Slice(models, func(i, j int) bool {
 		return fmt.Sprint(models[i]["id"]) < fmt.Sprint(models[j]["id"])
@@ -850,7 +894,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider is not enabled: " + providerID})
 		return
 	}
-	if bypass, _ := r.Context().Value(internalBypassKey{}).(bool); !bypass && !sliceSet(s.visibleModelsForProvider(r.Context(), p))[upstreamModel] {
+	if bypass, _ := r.Context().Value(internalBypassKey{}).(bool); !bypass && !sliceSet(s.chatModelsForProvider(r.Context(), p))[upstreamModel] {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "model is not published or not available: " + req.Model})
 		return
 	}
@@ -894,7 +938,7 @@ func (s *Server) handleMediaModels(kind string) http.HandlerFunc {
 			if mediaEndpoint(p, kind) == "" {
 				continue
 			}
-			for _, id := range mediaModelsForKind(p.Models, kind) {
+			for _, id := range mediaModelsForKind(s.publishedModelsForProvider(p), kind) {
 				grouped[p.Name] = append(grouped[p.Name], id)
 				models = append(models, map[string]any{
 					"id":       p.ID + "/" + id,
@@ -928,7 +972,7 @@ func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
 	base := requestBaseURL(r)
 	key := strings.TrimSpace(r.URL.Query().Get("key"))
 	tools := []map[string]any{}
-	for _, kind := range []string{"image", "video", "audio"} {
+	for _, kind := range []string{"image", "video", "audio", "tts"} {
 		tool := s.mediaToolDefinition(kind, base, key)
 		if tool != nil {
 			tools = append(tools, tool)
@@ -992,7 +1036,7 @@ func (s *Server) handleMedia(kind string) http.HandlerFunc {
 			"User-Agent":    "9router-lite/0.1",
 		}
 		if len(keys) > 1 {
-			s.proxyPostRotating(w, r, target, body, keys, headers)
+			s.proxyPostRotating(w, r, target, body, p, keys, headers)
 			return
 		}
 		s.proxyRaw(w, r, target, body, headers)
@@ -1072,7 +1116,7 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, p ProviderC
 		return
 	}
 
-	if isCustomOpenAIProvider(p) && len(keys) > 1 {
+	if len(keys) > 1 {
 		s.proxyOpenAIRotating(w, r, p, req, upstreamModel, body, keys)
 		return
 	}
@@ -1093,15 +1137,17 @@ func (s *Server) proxyOpenAIRotating(w http.ResponseWriter, r *http.Request, p P
 		"Accept":       acceptHeader(req.Stream),
 		"User-Agent":   "9router-lite/0.1",
 	}
-	s.proxyPostRotating(w, r, target, body, keys, headers)
+	s.proxyPostRotating(w, r, target, body, p, keys, headers)
 }
 
-func (s *Server) proxyPostRotating(w http.ResponseWriter, r *http.Request, target string, body []byte, keys []string, baseHeaders map[string]string) {
+func (s *Server) proxyPostRotating(w http.ResponseWriter, r *http.Request, target string, body []byte, p ProviderConfig, keys []string, baseHeaders map[string]string) {
 	var lastStatus int
 	var lastHeader http.Header
 	var lastBody []byte
 	var lastErr error
-	for i, key := range keys {
+	order := rotatingKeyOrder(p, len(keys))
+	for orderIndex, keyIndex := range order {
+		key := keys[keyIndex]
 		headers := make(map[string]string, len(baseHeaders)+1)
 		for k, v := range baseHeaders {
 			headers[k] = v
@@ -1113,10 +1159,15 @@ func (s *Server) proxyPostRotating(w http.ResponseWriter, r *http.Request, targe
 			break
 		}
 		if status >= 200 && status <= 299 {
+			s.markProviderKeyActive(p.ID, keyIndex)
 			writeBufferedUpstream(w, status, header, respBody)
 			return
 		}
-		if i == len(keys)-1 || !isQuotaKeyError(status, respBody) {
+		if !isQuotaKeyError(status, respBody) {
+			break
+		}
+		s.markProviderKeyFailed(p.ID, keyIndex)
+		if orderIndex == len(order)-1 {
 			break
 		}
 	}
@@ -1543,6 +1594,21 @@ func (s *Server) requireAccessKey(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+func (s *Server) requestHasAccessKey(r *http.Request) bool {
+	key := strings.TrimSpace(s.currentConfig().AccessKey)
+	if key == "" {
+		return false
+	}
+	token := strings.TrimSpace(r.Header.Get("x-api-key"))
+	if token == "" {
+		token = extractBearerToken(r.Header.Get("Authorization"))
+	}
+	if token == "" {
+		token = strings.TrimSpace(r.URL.Query().Get("key"))
+	}
+	return token == key
+}
+
 func (s *Server) adminPassword() string {
 	if v := strings.TrimSpace(os.Getenv("ADMIN_PASSWORD")); v != "" {
 		return v
@@ -1620,8 +1686,126 @@ func providerAPIKeys(p ProviderConfig) []string {
 	return keys
 }
 
+func rotatingKeyOrder(p ProviderConfig, count int) []int {
+	if count <= 0 {
+		return nil
+	}
+	failed := intSetFromCSV(providerDataValueGo(p, "failed_key_indexes"))
+	active := parseProviderInt(providerDataValueGo(p, "active_key_index"), -1)
+	var order []int
+	used := map[int]bool{}
+	add := func(i int) {
+		if i >= 0 && i < count && !used[i] && !failed[i] {
+			used[i] = true
+			order = append(order, i)
+		}
+	}
+	add(active)
+	for i := 0; i < count; i++ {
+		add(i)
+	}
+	if len(order) == 0 {
+		for i := 0; i < count; i++ {
+			order = append(order, i)
+		}
+	}
+	return order
+}
+
+func providerDataValueGo(p ProviderConfig, key string) string {
+	if p.ProviderSpecificData == nil {
+		return ""
+	}
+	return strings.TrimSpace(p.ProviderSpecificData[key])
+}
+
+func parseProviderInt(value string, fallback int) int {
+	i, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return fallback
+	}
+	return i
+}
+
+func intSetFromCSV(value string) map[int]bool {
+	out := map[int]bool{}
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		i, err := strconv.Atoi(part)
+		if err == nil && i >= 0 {
+			out[i] = true
+		}
+	}
+	return out
+}
+
+func csvFromIntSet(items map[int]bool) string {
+	var values []int
+	for item, ok := range items {
+		if ok {
+			values = append(values, item)
+		}
+	}
+	sort.Ints(values)
+	var parts []string
+	for _, item := range values {
+		parts = append(parts, strconv.Itoa(item))
+	}
+	return strings.Join(parts, ",")
+}
+
+func (s *Server) markProviderKeyActive(id string, index int) {
+	s.updateProviderKeyStatus(id, index, false)
+}
+
+func (s *Server) markProviderKeyFailed(id string, index int) {
+	s.updateProviderKeyStatus(id, index, true)
+}
+
+func (s *Server) updateProviderKeyStatus(id string, index int, failed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, p := range s.config.Providers {
+		if p.ID != id {
+			continue
+		}
+		if p.ProviderSpecificData == nil {
+			p.ProviderSpecificData = map[string]string{}
+		}
+		failedSet := intSetFromCSV(p.ProviderSpecificData["failed_key_indexes"])
+		if failed {
+			failedSet[index] = true
+			if parseProviderInt(p.ProviderSpecificData["active_key_index"], -1) == index {
+				delete(p.ProviderSpecificData, "active_key_index")
+			}
+		} else {
+			p.ProviderSpecificData["active_key_index"] = strconv.Itoa(index)
+			delete(failedSet, index)
+		}
+		if csv := csvFromIntSet(failedSet); csv != "" {
+			p.ProviderSpecificData["failed_key_indexes"] = csv
+		} else {
+			delete(p.ProviderSpecificData, "failed_key_indexes")
+		}
+		s.config.Providers[i] = p
+		_ = saveConfig(s.dataDir, s.config)
+		return
+	}
+}
+
 func (s *Server) visibleModelsForProvider(ctx context.Context, p ProviderConfig) []string {
 	_ = ctx
+	selected := s.publishedModelsForProvider(p)
+	if p.AvailabilityCheckedAt == 0 && len(p.AvailableModels) == 0 {
+		return selected
+	}
+	return orderedIntersection(selected, uniqueStrings(p.AvailableModels))
+}
+
+func (s *Server) publishedModelsForProvider(p ProviderConfig) []string {
 	base := p.Models
 	base = uniqueStrings(base)
 	if providerManualPublishOverride(p) {
@@ -1631,11 +1815,32 @@ func (s *Server) visibleModelsForProvider(ctx context.Context, p ProviderConfig)
 	if len(selected) == 0 {
 		selected = base
 	}
-	selected = orderedIntersection(base, uniqueStrings(selected))
-	if p.AvailabilityCheckedAt == 0 && len(p.AvailableModels) == 0 {
-		return selected
+	return orderedIntersection(base, uniqueStrings(selected))
+}
+
+func (s *Server) chatModelsForProvider(ctx context.Context, p ProviderConfig) []string {
+	return chatModelIDs(s.visibleModelsForProvider(ctx, p))
+}
+
+func chatModelIDs(models []string) []string {
+	var out []string
+	for _, model := range uniqueStrings(models) {
+		if !isMediaModel(model) {
+			out = append(out, model)
+		}
 	}
-	return orderedIntersection(selected, uniqueStrings(p.AvailableModels))
+	return out
+}
+
+func unlockedModelIDs(models, locked []string) []string {
+	lockedSet := sliceSet(locked)
+	var out []string
+	for _, model := range uniqueStrings(models) {
+		if !lockedSet[model] {
+			out = append(out, model)
+		}
+	}
+	return out
 }
 
 func (s *Server) resolveAutoModel(ctx context.Context) (string, bool) {
@@ -1649,6 +1854,9 @@ func (s *Server) resolveAutoModel(ctx context.Context) (string, bool) {
 		}
 		providerID, model, ok := strings.Cut(candidate, "/")
 		if !ok || providerID == "" || model == "" {
+			continue
+		}
+		if isMediaModel(model) {
 			continue
 		}
 		p, ok := s.providerByID(providerID)
@@ -1788,6 +1996,8 @@ func (s *Server) probeAllProviders(ctx context.Context, autoPublish bool) {
 	defer s.probeMu.Unlock()
 	for _, p := range s.enabledProviders() {
 		models := s.visibleModelsForProvider(ctx, p)
+		models = unlockedModelIDs(models, p.LockedModels)
+		models = chatModelIDs(models)
 		if len(models) == 0 {
 			continue
 		}
@@ -1833,6 +2043,9 @@ func (s *Server) autoProbeLoop() {
 }
 
 func wantsHTML(r *http.Request) bool {
+	if wantsJSON(r) {
+		return false
+	}
 	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("view")), "html") {
 		return true
 	}
@@ -1971,6 +2184,8 @@ func mediaEndpoint(p ProviderConfig, kind string) string {
 			return strings.TrimSpace(p.AudioEndpoint)
 		}
 		return strings.TrimSpace(p.AudioBaseURL)
+	case "tts":
+		return strings.TrimSpace(p.TTSEndpoint)
 	default:
 		return ""
 	}
@@ -1984,7 +2199,9 @@ func mediaModelsForKind(models []string, kind string) []string {
 	case "video":
 		needles = []string{"video", "veo", "sora", "kling", "runway", "agnes-video"}
 	case "audio":
-		needles = []string{"audio", "tts", "speech", "voice", "music", "lyria", "whisper"}
+		needles = []string{"audio", "speech", "whisper", "transcrib"}
+	case "tts":
+		needles = []string{"tts", "voice", "neural", "zh-", "en-"}
 	default:
 		return nil
 	}
@@ -1999,6 +2216,288 @@ func mediaModelsForKind(models []string, kind string) []string {
 		}
 	}
 	return out
+}
+
+func isMediaModel(model string) bool {
+	if _, raw, ok := strings.Cut(model, "/"); ok {
+		model = raw
+	}
+	return len(mediaModelsForKind([]string{model}, "image")) > 0 ||
+		len(mediaModelsForKind([]string{model}, "video")) > 0 ||
+		len(mediaModelsForKind([]string{model}, "audio")) > 0 ||
+		len(mediaModelsForKind([]string{model}, "tts")) > 0
+}
+
+func (s *Server) healthMediaTemplates(revealSecrets bool) []HealthMediaTemplate {
+	var out []HealthMediaTemplate
+	for _, p := range s.enabledProviders() {
+		models := s.publishedModelsForProvider(p)
+		for _, kind := range []string{"image", "video", "audio", "tts"} {
+			endpoint := mediaEndpoint(p, kind)
+			if endpoint == "" {
+				continue
+			}
+			for _, model := range mediaModelsForKind(models, kind) {
+				out = append(out, healthMediaTemplateForProvider(p, kind, endpoint, model, revealSecrets))
+			}
+		}
+	}
+	return out
+}
+
+func healthMediaTemplateForProvider(p ProviderConfig, kind, endpoint, model string, revealSecrets bool) HealthMediaTemplate {
+	key := "<upstream-api-key>"
+	if revealSecrets {
+		if keys := providerAPIKeys(p); len(keys) > 0 {
+			key = keys[0]
+		}
+	}
+	t := HealthMediaTemplate{
+		Type:          kind,
+		ProviderID:    p.ID,
+		ProviderName:  p.Name,
+		Model:         p.ID + "/" + model,
+		UpstreamModel: model,
+		Method:        http.MethodPost,
+		Endpoint:      endpoint,
+	}
+	switch kind {
+	case "image":
+		body := imageTemplateBody(endpoint, model)
+		t.RequestBody = body
+		t.Curl = jsonCurl(endpoint, key, body)
+		if transparentModel := transparentBackgroundModel(model); transparentModel != "" && !isAgnesImageEndpoint(endpoint, model) {
+			transparent := map[string]any{
+				"model":         transparentModel,
+				"prompt":        "替换为用户最终透明背景生图提示词",
+				"n":             1,
+				"background":    "transparent",
+				"output_format": "png",
+			}
+			t.ExtraTemplates = append(t.ExtraTemplates, HealthMediaCurlTemplate{
+				Name:        "透明背景 PNG 生图",
+				Method:      http.MethodPost,
+				Endpoint:    endpoint,
+				RequestBody: transparent,
+				Curl:        jsonCurl(endpoint, key, transparent),
+			})
+		}
+		if editEndpoint := strings.TrimSpace(p.ImageEditEndpoint); editEndpoint != "" {
+			editForm := map[string]string{
+				"model":  model,
+				"prompt": "替换为用户最终图片编辑提示词",
+				"n":      "1",
+				"image":  "@替换为本地图片路径，例如 input.png",
+			}
+			t.ExtraTemplates = append(t.ExtraTemplates, HealthMediaCurlTemplate{
+				Name:     "图片编辑：上传本地图片文件",
+				Method:   http.MethodPost,
+				Endpoint: editEndpoint,
+				Form:     editForm,
+				Curl:     formCurl(editEndpoint, key, editForm),
+			})
+			editBody := map[string]any{
+				"model":  model,
+				"prompt": "替换为用户最终图片编辑提示词",
+				"images": []map[string]string{{"image_url": "https://example.com/input.png"}},
+			}
+			t.ExtraTemplates = append(t.ExtraTemplates, HealthMediaCurlTemplate{
+				Name:        "图片编辑：使用图片 URL",
+				Method:      http.MethodPost,
+				Endpoint:    editEndpoint,
+				RequestBody: editBody,
+				Curl:        jsonCurl(editEndpoint, key, editBody),
+			})
+		}
+	case "video":
+		body := map[string]any{
+			"model":      model,
+			"prompt":     "替换为用户最终视频提示词",
+			"height":     768,
+			"width":      1152,
+			"num_frames": 121,
+			"frame_rate": 24,
+		}
+		t.RequestBody = body
+		t.Curl = jsonCurl(endpoint, key, body)
+		queryEndpoint := videoQueryEndpoint(endpoint)
+		t.ExtraTemplates = append(t.ExtraTemplates, HealthMediaCurlTemplate{
+			Name:     "查询视频结果",
+			Method:   http.MethodGet,
+			Endpoint: queryEndpoint,
+			Curl:     bearerGetCurl(queryEndpoint, key),
+			Note:     "创建任务响应里的 video_id 用于查询；建议每 5 秒轮询一次，直到 status 为 completed。",
+		})
+	case "audio":
+		form := map[string]string{
+			"file":            "@替换为本地音频文件路径，例如 audio.mp3",
+			"model":           model,
+			"response_format": "json",
+			"language":        "替换为音频语言代码，例如 zh 或 en",
+		}
+		t.Form = form
+		t.Curl = formCurl(endpoint, key, form)
+		t.Note = "Groq Audio Transcriptions 这类接口使用 multipart/form-data。"
+	case "tts":
+		t.RequestBody = map[string]any{
+			"text":  "你好世界",
+			"voice": model,
+		}
+		t.Curl = "curl -G " + shellQuoteDouble(endpoint) + " \\\n" +
+			"  --data-urlencode " + shellQuoteDouble("text=你好世界") + " \\\n" +
+			"  --data-urlencode " + shellQuoteDouble("voice="+model) + " \\\n" +
+			"  --output output.mp3"
+		t.Note = "Edge TTS server 默认是 GET /tts?text=...&voice=...，响应为 mp3。"
+	}
+	if custom := providerCurlTemplate(p, kind); custom != "" {
+		t.Curl = renderCurlTemplate(custom, mediaTemplateVars(p, kind, endpoint, model, key))
+		if t.Note == "" {
+			t.Note = "使用 provider 自定义 curl 模板。"
+		}
+	}
+	return t
+}
+
+func providerCurlTemplate(p ProviderConfig, kind string) string {
+	if p.ProviderSpecificData == nil {
+		return ""
+	}
+	switch kind {
+	case "image":
+		return strings.TrimSpace(p.ProviderSpecificData["curlTemplateImage"])
+	case "video":
+		return strings.TrimSpace(p.ProviderSpecificData["curlTemplateVideo"])
+	case "audio":
+		return strings.TrimSpace(p.ProviderSpecificData["curlTemplateAudio"])
+	case "tts":
+		return strings.TrimSpace(p.ProviderSpecificData["curlTemplateTTS"])
+	default:
+		return ""
+	}
+}
+
+func mediaTemplateVars(p ProviderConfig, kind, endpoint, model, key string) map[string]string {
+	return map[string]string{
+		"endpoint":             endpoint,
+		"image_edit_endpoint":  strings.TrimSpace(p.ImageEditEndpoint),
+		"key":                  key,
+		"model":                model,
+		"transparent_model":    firstNonEmpty(transparentBackgroundModel(model), model),
+		"prompt":               "替换为用户最终提示词",
+		"image_prompt":         "替换为用户最终生图提示词",
+		"transparent_prompt":   "替换为用户最终透明背景生图提示词",
+		"edit_prompt":          "替换为用户最终图片编辑提示词",
+		"video_prompt":         "替换为用户最终视频提示词",
+		"audio_file":           "替换为本地音频文件路径，例如 audio.mp3",
+		"image_file":           "替换为本地图片路径，例如 input.png",
+		"tts_text":             "你好世界",
+		"video_query_endpoint": videoQueryEndpoint(endpoint),
+	}
+}
+
+func renderCurlTemplate(template string, vars map[string]string) string {
+	out := template
+	for key, value := range vars {
+		out = strings.ReplaceAll(out, "{{"+key+"}}", value)
+	}
+	return out
+}
+
+func imageTemplateBody(endpoint, model string) map[string]any {
+	if isAgnesImageEndpoint(endpoint, model) {
+		return map[string]any{
+			"model":  model,
+			"prompt": "替换为用户最终生图提示词",
+			"size":   "替换为用户需要的图片尺寸，例如 1024x768",
+			"extra_body": map[string]any{
+				"response_format": "url",
+			},
+		}
+	}
+	return map[string]any{
+		"model":  model,
+		"prompt": "替换为用户最终生图提示词",
+		"n":      1,
+	}
+}
+
+func isAgnesImageEndpoint(endpoint, model string) bool {
+	return strings.Contains(strings.ToLower(endpoint), "agnes-ai.com") || strings.Contains(strings.ToLower(model), "agnes-image")
+}
+
+func transparentBackgroundModel(model string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	switch model {
+	case "gpt-image-1", "gpt-image-2":
+		return "gpt-image-1"
+	case "codex-gpt-image-1", "codex-gpt-image-2":
+		return "codex-gpt-image-1"
+	default:
+		return ""
+	}
+}
+
+func jsonCurl(endpoint, key string, body map[string]any) string {
+	return "curl -X POST " + shellQuoteDouble(endpoint) + " \\\n" +
+		"  -H " + shellQuoteDouble("Content-Type: application/json") + " \\\n" +
+		"  -H " + shellQuoteDouble("Authorization: Bearer "+key) + " \\\n" +
+		"  -d " + shellQuoteSingle(mustJSONString(body))
+}
+
+func formCurl(endpoint, key string, fields map[string]string) string {
+	var b strings.Builder
+	b.WriteString("curl -X POST ")
+	b.WriteString(shellQuoteDouble(endpoint))
+	b.WriteString(" \\\n  -H ")
+	b.WriteString(shellQuoteDouble("Authorization: Bearer " + key))
+	keys := keysFromStringMap(fields)
+	for _, k := range keys {
+		b.WriteString(" \\\n  -F ")
+		b.WriteString(shellQuoteDouble(k + "=" + fields[k]))
+	}
+	return b.String()
+}
+
+func bearerGetCurl(endpoint, key string) string {
+	return "curl -X GET " + shellQuoteDouble(endpoint) + " \\\n" +
+		"  -H " + shellQuoteDouble("Authorization: Bearer "+key)
+}
+
+func videoQueryEndpoint(endpoint string) string {
+	fallback := "https://apihub.agnes-ai.com/agnesapi?video_id=替换为创建任务返回的 video_id"
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fallback
+	}
+	if strings.Contains(strings.ToLower(u.Host), "agnes-ai.com") {
+		return u.Scheme + "://" + u.Host + "/agnesapi?video_id=替换为创建任务返回的 video_id"
+	}
+	return fallback
+}
+
+func mustJSONString(v any) string {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+func shellQuoteSingle(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func shellQuoteDouble(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `\"`) + `"`
+}
+
+func keysFromStringMap(in map[string]string) []string {
+	var keys []string
+	for k := range in {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func (s *Server) mediaToolDefinition(kind, base, key string) map[string]any {
@@ -2046,6 +2545,18 @@ func (s *Server) mediaToolDefinition(kind, base, key string) map[string]any {
 			"input": "Hello, this is an audio generation test.",
 			"voice": "alloy",
 		}
+	case "tts":
+		name = "text_to_speech"
+		path = "/v1/tts"
+		description = "Text-to-speech via the configured upstream TTS endpoint, for example edge-tts-server."
+		schema = map[string]any{
+			"voice": "voice name, for example zh-CN-XiaoxiaoNeural",
+			"text":  "text to synthesize",
+		}
+		example = map[string]any{
+			"voice": firstMediaModel(s.enabledProviders(), kind),
+			"text":  "你好世界",
+		}
 	default:
 		return nil
 	}
@@ -2055,7 +2566,7 @@ func (s *Server) mediaToolDefinition(kind, base, key string) map[string]any {
 		if mediaEndpoint(p, kind) == "" {
 			continue
 		}
-		for _, model := range mediaModelsForKind(p.Models, kind) {
+		for _, model := range mediaModelsForKind(s.publishedModelsForProvider(p), kind) {
 			models = append(models, p.ID+"/"+model)
 		}
 	}
@@ -2091,7 +2602,10 @@ func firstMediaModel(providers []ProviderConfig, kind string) string {
 		if mediaEndpoint(p, kind) == "" {
 			continue
 		}
-		models := mediaModelsForKind(p.Models, kind)
+		models := mediaModelsForKind(uniqueStrings(p.EnabledModels), kind)
+		if len(models) == 0 && !providerManualPublishOverride(p) {
+			models = mediaModelsForKind(p.Models, kind)
+		}
 		if len(models) > 0 {
 			return p.ID + "/" + models[0]
 		}
