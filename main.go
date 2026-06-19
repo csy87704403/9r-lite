@@ -43,6 +43,7 @@ type Config struct {
 	AutoProbeEnabled         bool             `json:"auto_probe_enabled,omitempty"`
 	AutoProbeIntervalMinutes int64            `json:"auto_probe_interval_minutes,omitempty"`
 	AutoModel                AutoModelConfig  `json:"auto_model,omitempty"`
+	ModelGroups              []ModelGroup     `json:"model_groups,omitempty"`
 	DeletedProviderIDs       []string         `json:"deleted_provider_ids,omitempty"`
 	Providers                []ProviderConfig `json:"providers"`
 }
@@ -50,6 +51,19 @@ type Config struct {
 type AutoModelConfig struct {
 	Enabled bool     `json:"enabled,omitempty"`
 	Models  []string `json:"models,omitempty"`
+}
+
+type ModelGroup struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	APIKey  string   `json:"api_key"`
+	Enabled bool     `json:"enabled"`
+	Models  []string `json:"models,omitempty"`
+}
+
+type accessScope struct {
+	Full  bool
+	Group *ModelGroup
 }
 
 type ProviderConfig struct {
@@ -186,7 +200,9 @@ func main() {
 	mux.HandleFunc("/api/provider/models", srv.handleProviderModels)
 	mux.HandleFunc("/api/provider/probe", srv.handleProviderProbe)
 	mux.HandleFunc("/api/provider/probe-model", srv.handleProviderProbeModel)
+	mux.HandleFunc("/api/provider/probe-key", srv.handleProviderProbeKey)
 	mux.HandleFunc("/api/provider/selection", srv.handleProviderSelection)
+	mux.HandleFunc("/api/provider/model/delete", srv.handleProviderModelDelete)
 	mux.HandleFunc("/api/oauth/qoder/device-code", srv.handleQoderDeviceCode)
 	mux.HandleFunc("/api/oauth/qoder/poll", srv.handleQoderPoll)
 	mux.HandleFunc("/api/oauth/gemini/authorize", srv.handleGeminiAuthorize)
@@ -447,7 +463,36 @@ func mergeDefaultConfig(cfg Config) Config {
 	}
 	cfg.DeletedProviderIDs = keysFromSet(deleted)
 	cfg.Providers = merged
+	normalizeConfigModelRefs(&cfg)
 	return cfg
+}
+
+func normalizeConfigModelRefs(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	normalize := func(ref string) string {
+		providerID, model, ok := strings.Cut(strings.TrimSpace(ref), "/")
+		if !ok || providerID == "" || model == "" {
+			return strings.TrimSpace(ref)
+		}
+		for _, p := range cfg.Providers {
+			if providerID == p.ID || providerID == providerPublicID(p) {
+				return providerModelRef(p, model)
+			}
+		}
+		return strings.TrimSpace(ref)
+	}
+	for i, ref := range cfg.AutoModel.Models {
+		cfg.AutoModel.Models[i] = normalize(ref)
+	}
+	cfg.AutoModel.Models = uniqueStrings(cfg.AutoModel.Models)
+	for i := range cfg.ModelGroups {
+		for j, ref := range cfg.ModelGroups[i].Models {
+			cfg.ModelGroups[i].Models[j] = normalize(ref)
+		}
+		cfg.ModelGroups[i].Models = uniqueStrings(cfg.ModelGroups[i].Models)
+	}
 }
 
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
@@ -759,6 +804,75 @@ func (s *Server) handleProviderProbeModel(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (s *Server) handleProviderProbeKey(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		ID       string `json:"id"`
+		Model    string `json:"model"`
+		KeyIndex int    `json:"key_index"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<18)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	p, ok := s.providerByID(strings.TrimSpace(body.ID))
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider not found"})
+		return
+	}
+	if p.Type != "openai" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "key probe only supports API key providers"})
+		return
+	}
+	if !p.Enabled {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider is not enabled"})
+		return
+	}
+	model := strings.TrimSpace(body.Model)
+	if model == "" || !sliceSet(p.Models)[model] {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "model is not loaded by provider"})
+		return
+	}
+	if isMediaModel(model) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "media models are not probed by chat probe"})
+		return
+	}
+	keys := providerAPIKeys(p)
+	if body.KeyIndex < 0 || body.KeyIndex >= len(keys) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "key index is out of range"})
+		return
+	}
+
+	start := time.Now()
+	probeCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	status, respBody, err := s.probeSingleOpenAIModelWithKey(probeCtx, p, model, keys[body.KeyIndex])
+	cancel()
+	latency := time.Since(start).Milliseconds()
+	if err == nil {
+		s.markProviderKeyActive(p.ID, body.KeyIndex, model)
+		p, _ = s.providerByID(p.ID)
+		p = updateProbeResult(p, model, nil, latency, false)
+		_ = s.updateProvider(p)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": p.ID, "model": model, "key_index": body.KeyIndex, "latency_ms": latency, "provider": p})
+		return
+	}
+	if isCredentialKeyError(status, respBody) {
+		s.markProviderKeyFailed(p.ID, body.KeyIndex, "", true)
+	} else if isQuotaKeyError(status, respBody) {
+		s.markProviderKeyFailed(p.ID, body.KeyIndex, model, false)
+	}
+	p, _ = s.providerByID(p.ID)
+	p = updateProbeResult(p, model, err, latency, false)
+	_ = s.updateProvider(p)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": false, "id": p.ID, "model": model, "key_index": body.KeyIndex, "latency_ms": latency, "error": err.Error(), "provider": p})
+}
+
 func (s *Server) handleProviderSelection(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
@@ -799,6 +913,30 @@ func (s *Server) handleProviderSelection(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": p.ID, "enabled_models": p.EnabledModels})
 }
 
+func (s *Server) handleProviderModelDelete(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		ID    string `json:"id"`
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	p, err := s.deleteProviderModel(body.ID, body.Model)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "provider": p})
+}
+
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -807,6 +945,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAccessKey(w, r) {
 		return
 	}
+	scope, _ := s.accessScopeForRequest(r)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
@@ -816,19 +955,30 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	for _, p := range s.enabledProviders() {
 		ids := s.chatModelsForProvider(ctx, p)
 		if len(ids) > 0 {
-			grouped[p.Name] = append([]string(nil), ids...)
+			var visible []string
+			for _, id := range ids {
+				if scopeAllowsProviderModel(scope, p, id) {
+					visible = append(visible, id)
+				}
+			}
+			if len(visible) > 0 {
+				grouped[p.Name] = visible
+			}
 		}
 		for _, id := range ids {
+			if !scopeAllowsProviderModel(scope, p, id) {
+				continue
+			}
 			models = append(models, map[string]any{
-				"id":       p.ID + "/" + id,
+				"id":       providerModelRef(p, id),
 				"object":   "model",
 				"created":  0,
-				"owned_by": p.ID,
+				"owned_by": providerPublicID(p),
 			})
 		}
 	}
 	if target, ok := s.resolveAutoModel(ctx); ok {
-		if !isMediaModel(target) {
+		if !isMediaModel(target) && scopeAllowsModel(scope, "auto") {
 			grouped["Auto"] = []string{target}
 			models = append(models, map[string]any{
 				"id":       "auto",
@@ -857,6 +1007,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAccessKey(w, r) {
 		return
 	}
+	scope, _ := s.accessScopeForRequest(r)
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 20<<20))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -868,8 +1019,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Raw = raw
+	requestedModel := strings.TrimSpace(req.Model)
 
-	if strings.TrimSpace(req.Model) == "auto" {
+	if requestedModel == "auto" {
+		if !scopeAllowsModel(scope, requestedModel) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "model is not allowed by this access key: " + requestedModel})
+			return
+		}
 		target, ok := s.resolveAutoModel(r.Context())
 		if !ok {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "auto model has no available target"})
@@ -889,9 +1045,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p, ok := s.providerByID(providerID)
+	p, ok := s.providerByRouteID(providerID)
 	if !ok || !p.Enabled {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider is not enabled: " + providerID})
+		return
+	}
+	if requestedModel != "auto" && !scopeAllowsProviderModel(scope, p, upstreamModel) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "model is not allowed by this access key: " + requestedModel})
 		return
 	}
 	if bypass, _ := r.Context().Value(internalBypassKey{}).(bool); !bypass && !sliceSet(s.chatModelsForProvider(r.Context(), p))[upstreamModel] {
@@ -932,6 +1092,7 @@ func (s *Server) handleMediaModels(kind string) http.HandlerFunc {
 		if !s.requireAccessKey(w, r) {
 			return
 		}
+		scope, _ := s.accessScopeForRequest(r)
 		var models []map[string]any
 		grouped := map[string][]string{}
 		for _, p := range s.enabledProviders() {
@@ -939,12 +1100,15 @@ func (s *Server) handleMediaModels(kind string) http.HandlerFunc {
 				continue
 			}
 			for _, id := range mediaModelsForKind(s.publishedModelsForProvider(p), kind) {
+				if !scopeAllowsProviderModel(scope, p, id) {
+					continue
+				}
 				grouped[p.Name] = append(grouped[p.Name], id)
 				models = append(models, map[string]any{
-					"id":       p.ID + "/" + id,
+					"id":       providerModelRef(p, id),
 					"object":   "model",
 					"created":  0,
-					"owned_by": p.ID,
+					"owned_by": providerPublicID(p),
 					"type":     kind,
 				})
 			}
@@ -967,6 +1131,11 @@ func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.requireAccessKey(w, r) {
+		return
+	}
+	scope, _ := s.accessScopeForRequest(r)
+	if !scope.Full {
+		writeJSON(w, http.StatusOK, map[string]any{"object": "tool_list", "base_url": requestBaseURL(r) + "/v1", "tools": []map[string]any{}})
 		return
 	}
 	base := requestBaseURL(r)
@@ -994,6 +1163,7 @@ func (s *Server) handleMedia(kind string) http.HandlerFunc {
 		if !s.requireAccessKey(w, r) {
 			return
 		}
+		scope, _ := s.accessScopeForRequest(r)
 		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<20))
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -1009,9 +1179,13 @@ func (s *Server) handleMedia(kind string) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "model must be provider/model"})
 			return
 		}
-		p, ok := s.providerByID(providerID)
+		p, ok := s.providerByRouteID(providerID)
 		if !ok || !p.Enabled {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider is not enabled: " + providerID})
+			return
+		}
+		if !scopeAllowsProviderModel(scope, p, upstreamModel) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "model is not allowed by this access key: " + providerID + "/" + upstreamModel})
 			return
 		}
 		target := mediaEndpoint(p, kind)
@@ -1036,7 +1210,7 @@ func (s *Server) handleMedia(kind string) http.HandlerFunc {
 			"User-Agent":    "9router-lite/0.1",
 		}
 		if len(keys) > 1 {
-			s.proxyPostRotating(w, r, target, body, p, keys, headers)
+			s.proxyPostRotating(w, r, target, body, p, keys, headers, upstreamModel)
 			return
 		}
 		s.proxyRaw(w, r, target, body, headers)
@@ -1137,15 +1311,15 @@ func (s *Server) proxyOpenAIRotating(w http.ResponseWriter, r *http.Request, p P
 		"Accept":       acceptHeader(req.Stream),
 		"User-Agent":   "9router-lite/0.1",
 	}
-	s.proxyPostRotating(w, r, target, body, p, keys, headers)
+	s.proxyPostRotating(w, r, target, body, p, keys, headers, upstreamModel)
 }
 
-func (s *Server) proxyPostRotating(w http.ResponseWriter, r *http.Request, target string, body []byte, p ProviderConfig, keys []string, baseHeaders map[string]string) {
+func (s *Server) proxyPostRotating(w http.ResponseWriter, r *http.Request, target string, body []byte, p ProviderConfig, keys []string, baseHeaders map[string]string, upstreamModel string) {
 	var lastStatus int
 	var lastHeader http.Header
 	var lastBody []byte
 	var lastErr error
-	order := rotatingKeyOrder(p, len(keys))
+	order := rotatingKeyOrder(p, len(keys), upstreamModel)
 	for orderIndex, keyIndex := range order {
 		key := keys[keyIndex]
 		headers := make(map[string]string, len(baseHeaders)+1)
@@ -1159,14 +1333,17 @@ func (s *Server) proxyPostRotating(w http.ResponseWriter, r *http.Request, targe
 			break
 		}
 		if status >= 200 && status <= 299 {
-			s.markProviderKeyActive(p.ID, keyIndex)
+			s.markProviderKeyActive(p.ID, keyIndex, upstreamModel)
 			writeBufferedUpstream(w, status, header, respBody)
 			return
 		}
-		if !isQuotaKeyError(status, respBody) {
+		if isCredentialKeyError(status, respBody) {
+			s.markProviderKeyFailed(p.ID, keyIndex, "", true)
+		} else if isQuotaKeyError(status, respBody) {
+			s.markProviderKeyFailed(p.ID, keyIndex, upstreamModel, false)
+		} else {
 			break
 		}
-		s.markProviderKeyFailed(p.ID, keyIndex)
 		if orderIndex == len(order)-1 {
 			break
 		}
@@ -1358,6 +1535,55 @@ func (s *Server) updateProvider(next ProviderConfig) error {
 		s.config.Providers = append(s.config.Providers, next)
 	}
 	return saveConfig(s.dataDir, s.config)
+}
+
+func (s *Server) deleteProviderModel(providerID, model string) (ProviderConfig, error) {
+	providerID = strings.TrimSpace(providerID)
+	model = strings.TrimSpace(model)
+	if providerID == "" || model == "" {
+		return ProviderConfig{}, errors.New("provider id and model are required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, p := range s.config.Providers {
+		if p.ID != providerID {
+			continue
+		}
+		if !sliceSet(p.Models)[model] {
+			return ProviderConfig{}, errors.New("model is not loaded by provider")
+		}
+
+		remaining := removeString(p.Models, model)
+		if !providerManualPublishOverride(p) {
+			p.EnabledModels = append([]string(nil), remaining...)
+		} else {
+			p.EnabledModels = removeString(p.EnabledModels, model)
+		}
+		p.Models = remaining
+		p.AvailableModels = removeString(p.AvailableModels, model)
+		p.LockedModels = removeString(p.LockedModels, model)
+		delete(p.ModelLatencyMS, model)
+		delete(p.ModelErrors, model)
+		if p.ProviderSpecificData == nil {
+			p.ProviderSpecificData = map[string]string{}
+		}
+		p.ProviderSpecificData["manualPublishOverride"] = "true"
+		delete(p.ProviderSpecificData, modelFailedKeyIndexesDataKey(model))
+		s.config.Providers[i] = p
+
+		fullModel := providerModelRef(p, model)
+		legacyModel := providerID + "/" + model
+		s.config.AutoModel.Models = removeString(removeString(s.config.AutoModel.Models, fullModel), legacyModel)
+		for groupIndex := range s.config.ModelGroups {
+			s.config.ModelGroups[groupIndex].Models = removeString(removeString(s.config.ModelGroups[groupIndex].Models, fullModel), legacyModel)
+		}
+		if err := saveConfig(s.dataDir, s.config); err != nil {
+			return ProviderConfig{}, err
+		}
+		return p, nil
+	}
+	return ProviderConfig{}, errors.New("provider not found")
 }
 
 func (s *Server) markProviderAuthState(id, status, message string) {
@@ -1575,19 +1801,12 @@ func (s *Server) requireAccessKey(w http.ResponseWriter, r *http.Request) bool {
 	if bypass, _ := r.Context().Value(internalBypassKey{}).(bool); bypass {
 		return true
 	}
-	key := strings.TrimSpace(s.currentConfig().AccessKey)
-	if key == "" {
+	cfg := s.currentConfig()
+	if strings.TrimSpace(cfg.AccessKey) == "" && len(cfg.ModelGroups) == 0 {
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": "gateway access_key is not configured"})
 		return false
 	}
-	token := strings.TrimSpace(r.Header.Get("x-api-key"))
-	if token == "" {
-		token = extractBearerToken(r.Header.Get("Authorization"))
-	}
-	if token == "" {
-		token = strings.TrimSpace(r.URL.Query().Get("key"))
-	}
-	if token != key {
+	if _, ok := s.accessScopeForRequest(r); !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid access_key"})
 		return false
 	}
@@ -1595,10 +1814,11 @@ func (s *Server) requireAccessKey(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (s *Server) requestHasAccessKey(r *http.Request) bool {
-	key := strings.TrimSpace(s.currentConfig().AccessKey)
-	if key == "" {
-		return false
-	}
+	scope, ok := s.accessScopeForRequest(r)
+	return ok && scope.Full
+}
+
+func requestAccessToken(r *http.Request) string {
 	token := strings.TrimSpace(r.Header.Get("x-api-key"))
 	if token == "" {
 		token = extractBearerToken(r.Header.Get("Authorization"))
@@ -1606,7 +1826,38 @@ func (s *Server) requestHasAccessKey(r *http.Request) bool {
 	if token == "" {
 		token = strings.TrimSpace(r.URL.Query().Get("key"))
 	}
-	return token == key
+	return token
+}
+
+func (s *Server) accessScopeForRequest(r *http.Request) (accessScope, bool) {
+	if bypass, _ := r.Context().Value(internalBypassKey{}).(bool); bypass {
+		return accessScope{Full: true}, true
+	}
+	token := requestAccessToken(r)
+	if token == "" {
+		return accessScope{}, false
+	}
+	cfg := s.currentConfig()
+	if key := strings.TrimSpace(cfg.AccessKey); key != "" && token == key {
+		return accessScope{Full: true}, true
+	}
+	for i := range cfg.ModelGroups {
+		group := cfg.ModelGroups[i]
+		if group.Enabled && strings.TrimSpace(group.APIKey) != "" && token == strings.TrimSpace(group.APIKey) {
+			return accessScope{Group: &group}, true
+		}
+	}
+	return accessScope{}, false
+}
+
+func scopeAllowsModel(scope accessScope, model string) bool {
+	if scope.Full {
+		return true
+	}
+	if scope.Group == nil {
+		return false
+	}
+	return sliceSet(scope.Group.Models)[strings.TrimSpace(model)]
 }
 
 func (s *Server) adminPassword() string {
@@ -1665,6 +1916,39 @@ func (s *Server) providerByID(id string) (ProviderConfig, bool) {
 	return ProviderConfig{}, false
 }
 
+func (s *Server) providerByRouteID(id string) (ProviderConfig, bool) {
+	if p, ok := s.providerByID(id); ok {
+		return p, true
+	}
+	cfg := s.currentConfig()
+	for _, p := range cfg.Providers {
+		if providerPublicID(p) == id {
+			return p, true
+		}
+	}
+	return ProviderConfig{}, false
+}
+
+func providerPublicID(p ProviderConfig) string {
+	if isCustomOpenAIProvider(p) {
+		if name := strings.TrimSpace(p.Name); name != "" && !strings.Contains(name, "/") {
+			return name
+		}
+	}
+	return p.ID
+}
+
+func providerModelRef(p ProviderConfig, model string) string {
+	return providerPublicID(p) + "/" + strings.TrimSpace(model)
+}
+
+func scopeAllowsProviderModel(scope accessScope, p ProviderConfig, model string) bool {
+	if scopeAllowsModel(scope, providerModelRef(p, model)) {
+		return true
+	}
+	return providerPublicID(p) != p.ID && scopeAllowsModel(scope, p.ID+"/"+strings.TrimSpace(model))
+}
+
 func providerHasCredential(p ProviderConfig) bool {
 	if len(providerAPIKeys(p)) > 0 || p.AccessToken != "" || p.Type == "opencode-free" || p.Type == "mimo-free" {
 		return true
@@ -1686,11 +1970,11 @@ func providerAPIKeys(p ProviderConfig) []string {
 	return keys
 }
 
-func rotatingKeyOrder(p ProviderConfig, count int) []int {
+func rotatingKeyOrder(p ProviderConfig, count int, model string) []int {
 	if count <= 0 {
 		return nil
 	}
-	failed := intSetFromCSV(providerDataValueGo(p, "failed_key_indexes"))
+	failed := failedKeyIndexesForModel(p, model)
 	active := parseProviderInt(providerDataValueGo(p, "active_key_index"), -1)
 	var order []int
 	used := map[int]bool{}
@@ -1710,6 +1994,25 @@ func rotatingKeyOrder(p ProviderConfig, count int) []int {
 		}
 	}
 	return order
+}
+
+func failedKeyIndexesForModel(p ProviderConfig, model string) map[int]bool {
+	out := intSetFromCSV(providerDataValueGo(p, "failed_key_indexes"))
+	if key := modelFailedKeyIndexesDataKey(model); key != "" {
+		for index := range intSetFromCSV(providerDataValueGo(p, key)) {
+			out[index] = true
+		}
+	}
+	return out
+}
+
+func modelFailedKeyIndexesDataKey(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(model))
+	return "failed_key_indexes_model_" + hex.EncodeToString(sum[:])[:16]
 }
 
 func providerDataValueGo(p ProviderConfig, key string) string {
@@ -1757,15 +2060,15 @@ func csvFromIntSet(items map[int]bool) string {
 	return strings.Join(parts, ",")
 }
 
-func (s *Server) markProviderKeyActive(id string, index int) {
-	s.updateProviderKeyStatus(id, index, false)
+func (s *Server) markProviderKeyActive(id string, index int, model string) {
+	s.updateProviderKeyStatus(id, index, model, false, false)
 }
 
-func (s *Server) markProviderKeyFailed(id string, index int) {
-	s.updateProviderKeyStatus(id, index, true)
+func (s *Server) markProviderKeyFailed(id string, index int, model string, global bool) {
+	s.updateProviderKeyStatus(id, index, model, true, global)
 }
 
-func (s *Server) updateProviderKeyStatus(id string, index int, failed bool) {
+func (s *Server) updateProviderKeyStatus(id string, index int, model string, failed bool, global bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i, p := range s.config.Providers {
@@ -1775,20 +2078,42 @@ func (s *Server) updateProviderKeyStatus(id string, index int, failed bool) {
 		if p.ProviderSpecificData == nil {
 			p.ProviderSpecificData = map[string]string{}
 		}
-		failedSet := intSetFromCSV(p.ProviderSpecificData["failed_key_indexes"])
 		if failed {
+			key := "failed_key_indexes"
+			if !global {
+				key = modelFailedKeyIndexesDataKey(model)
+			}
+			if key == "" {
+				key = "failed_key_indexes"
+			}
+			failedSet := intSetFromCSV(p.ProviderSpecificData[key])
 			failedSet[index] = true
-			if parseProviderInt(p.ProviderSpecificData["active_key_index"], -1) == index {
+			if global && parseProviderInt(p.ProviderSpecificData["active_key_index"], -1) == index {
 				delete(p.ProviderSpecificData, "active_key_index")
+			}
+			if csv := csvFromIntSet(failedSet); csv != "" {
+				p.ProviderSpecificData[key] = csv
+			} else {
+				delete(p.ProviderSpecificData, key)
 			}
 		} else {
 			p.ProviderSpecificData["active_key_index"] = strconv.Itoa(index)
+			failedSet := intSetFromCSV(p.ProviderSpecificData["failed_key_indexes"])
 			delete(failedSet, index)
-		}
-		if csv := csvFromIntSet(failedSet); csv != "" {
-			p.ProviderSpecificData["failed_key_indexes"] = csv
-		} else {
-			delete(p.ProviderSpecificData, "failed_key_indexes")
+			if csv := csvFromIntSet(failedSet); csv != "" {
+				p.ProviderSpecificData["failed_key_indexes"] = csv
+			} else {
+				delete(p.ProviderSpecificData, "failed_key_indexes")
+			}
+			if key := modelFailedKeyIndexesDataKey(model); key != "" {
+				failedSet = intSetFromCSV(p.ProviderSpecificData[key])
+				delete(failedSet, index)
+				if csv := csvFromIntSet(failedSet); csv != "" {
+					p.ProviderSpecificData[key] = csv
+				} else {
+					delete(p.ProviderSpecificData, key)
+				}
+			}
 		}
 		s.config.Providers[i] = p
 		_ = saveConfig(s.dataDir, s.config)
@@ -1859,12 +2184,12 @@ func (s *Server) resolveAutoModel(ctx context.Context) (string, bool) {
 		if isMediaModel(model) {
 			continue
 		}
-		p, ok := s.providerByID(providerID)
+		p, ok := s.providerByRouteID(providerID)
 		if !ok || !p.Enabled {
 			continue
 		}
 		if sliceSet(s.visibleModelsForProvider(ctx, p))[model] {
-			return providerID + "/" + model, true
+			return providerModelRef(p, model), true
 		}
 	}
 	return "", false
@@ -1912,6 +2237,32 @@ func (s *Server) probeSingleModel(ctx context.Context, providerID, model string)
 		return nil
 	}
 	return errors.New(formatProbeFailure(rr.Code, rr.Body.String()))
+}
+
+func (s *Server) probeSingleOpenAIModelWithKey(ctx context.Context, p ProviderConfig, model, key string) (int, []byte, error) {
+	body := map[string]any{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "user", "content": "Reply with OK."},
+		},
+		"stream":     false,
+		"max_tokens": 4,
+	}
+	raw, _ := json.Marshal(body)
+	headers := map[string]string{
+		"Content-Type":  "application/json",
+		"Authorization": "Bearer " + key,
+		"Accept":        "application/json",
+		"User-Agent":    "9router-lite/0.1",
+	}
+	status, _, respBody, err := s.postUpstreamBuffered(ctx, joinURL(p.BaseURL, "/chat/completions"), raw, headers)
+	if err != nil {
+		return status, respBody, err
+	}
+	if status >= 200 && status <= 299 {
+		return status, respBody, nil
+	}
+	return status, respBody, errors.New(formatProbeFailure(status, string(respBody)))
 }
 
 func updateProbeResult(p ProviderConfig, model string, probeErr error, latency int64, autoPublish bool) ProviderConfig {
@@ -1991,6 +2342,28 @@ func isQuotaKeyError(status int, body []byte) bool {
 	return status == http.StatusPaymentRequired && (strings.Contains(lower, "credit") || strings.Contains(lower, "quota"))
 }
 
+func isCredentialKeyError(status int, body []byte) bool {
+	lower := strings.ToLower(string(body))
+	if strings.Contains(lower, "invalid api key") ||
+		strings.Contains(lower, "api key is invalid") ||
+		strings.Contains(lower, "invalid authorization") ||
+		strings.Contains(lower, "invalid bearer") ||
+		strings.Contains(lower, "invalid token") ||
+		strings.Contains(lower, "authentication failed") ||
+		strings.Contains(lower, "no auth credentials") ||
+		strings.Contains(lower, "incorrect api key") {
+		return true
+	}
+	if status == http.StatusUnauthorized && !isQuotaKeyError(status, body) {
+		return strings.Contains(lower, "api key") ||
+			strings.Contains(lower, "auth") ||
+			strings.Contains(lower, "token") ||
+			strings.Contains(lower, "credential") ||
+			strings.Contains(lower, "unauthorized")
+	}
+	return false
+}
+
 func (s *Server) probeAllProviders(ctx context.Context, autoPublish bool) {
 	s.probeMu.Lock()
 	defer s.probeMu.Unlock()
@@ -2064,6 +2437,7 @@ func wantsJSON(r *http.Request) bool {
 
 func validateConfig(cfg Config) error {
 	seen := map[string]bool{}
+	routeIDs := map[string]bool{}
 	for _, p := range cfg.Providers {
 		if p.ID == "" {
 			return errors.New("provider id is required")
@@ -2075,6 +2449,60 @@ func validateConfig(cfg Config) error {
 			return fmt.Errorf("duplicate provider id: %s", p.ID)
 		}
 		seen[p.ID] = true
+		routeIDs[p.ID] = true
+	}
+	for _, p := range cfg.Providers {
+		if !isCustomOpenAIProvider(p) {
+			continue
+		}
+		name := strings.TrimSpace(p.Name)
+		if strings.Contains(name, "/") {
+			return fmt.Errorf("custom provider name cannot contain '/': %s", name)
+		}
+		if !p.Enabled {
+			continue
+		}
+		if name == "" {
+			return fmt.Errorf("custom provider name is required: %s", p.ID)
+		}
+		publicID := providerPublicID(p)
+		if publicID != p.ID && routeIDs[publicID] {
+			return fmt.Errorf("custom provider name conflicts with another provider route: %s", publicID)
+		}
+		routeIDs[publicID] = true
+	}
+	groupIDs := map[string]bool{}
+	groupKeys := map[string]bool{}
+	mainKey := strings.TrimSpace(cfg.AccessKey)
+	for _, group := range cfg.ModelGroups {
+		id := strings.TrimSpace(group.ID)
+		if id == "" {
+			return errors.New("model group id is required")
+		}
+		if strings.ContainsAny(id, " /\\\t\r\n") {
+			return fmt.Errorf("invalid model group id: %s", id)
+		}
+		if groupIDs[id] {
+			return fmt.Errorf("duplicate model group id: %s", id)
+		}
+		groupIDs[id] = true
+		if !group.Enabled {
+			continue
+		}
+		if strings.TrimSpace(group.Name) == "" {
+			return fmt.Errorf("model group name is required: %s", id)
+		}
+		key := strings.TrimSpace(group.APIKey)
+		if key == "" {
+			return fmt.Errorf("model group api_key is required: %s", group.Name)
+		}
+		if key == mainKey {
+			return fmt.Errorf("model group api_key must differ from gateway access_key: %s", group.Name)
+		}
+		if groupKeys[key] {
+			return fmt.Errorf("duplicate model group api_key: %s", group.Name)
+		}
+		groupKeys[key] = true
 	}
 	return nil
 }
@@ -2256,7 +2684,7 @@ func healthMediaTemplateForProvider(p ProviderConfig, kind, endpoint, model stri
 		Type:          kind,
 		ProviderID:    p.ID,
 		ProviderName:  p.Name,
-		Model:         p.ID + "/" + model,
+		Model:         providerModelRef(p, model),
 		UpstreamModel: model,
 		Method:        http.MethodPost,
 		Endpoint:      endpoint,
@@ -2266,6 +2694,10 @@ func healthMediaTemplateForProvider(p ProviderConfig, kind, endpoint, model stri
 		body := imageTemplateBody(endpoint, model)
 		t.RequestBody = body
 		t.Curl = jsonCurl(endpoint, key, body)
+		if isAgnesImageEndpoint(endpoint, model) {
+			t.Note = "文生图 URL 位于 data[0].url。"
+			t.ExtraTemplates = append(t.ExtraTemplates, agnesImageExtraTemplates(endpoint, model, key)...)
+		}
 		if transparentModel := transparentBackgroundModel(model); transparentModel != "" && !isAgnesImageEndpoint(endpoint, model) {
 			transparent := map[string]any{
 				"model":         transparentModel,
@@ -2320,6 +2752,9 @@ func healthMediaTemplateForProvider(p ProviderConfig, kind, endpoint, model stri
 		}
 		t.RequestBody = body
 		t.Curl = jsonCurl(endpoint, key, body)
+		if isAgnesVideoEndpoint(endpoint, model) {
+			t.ExtraTemplates = append(t.ExtraTemplates, agnesVideoExtraTemplates(endpoint, model, key)...)
+		}
 		queryEndpoint := videoQueryEndpoint(endpoint)
 		t.ExtraTemplates = append(t.ExtraTemplates, HealthMediaCurlTemplate{
 			Name:     "查询视频结果",
@@ -2421,8 +2856,129 @@ func imageTemplateBody(endpoint, model string) map[string]any {
 	}
 }
 
+func agnesImageExtraTemplates(endpoint, model, key string) []HealthMediaCurlTemplate {
+	imageToImageURL := map[string]any{
+		"model":  model,
+		"prompt": "替换为用户最终图片编辑提示词",
+		"size":   "替换为用户需要的图片尺寸，例如 1024x768",
+		"extra_body": map[string]any{
+			"image":           []string{"https://example.com/input-image.png"},
+			"response_format": "url",
+		},
+	}
+	imageToImageBase64 := map[string]any{
+		"model":  model,
+		"prompt": "替换为用户最终图片编辑提示词",
+		"size":   "替换为用户需要的图片尺寸，例如 1024x768",
+		"extra_body": map[string]any{
+			"image":           []string{"data:image/png;base64,BASE64_HERE"},
+			"response_format": "b64_json",
+		},
+	}
+	multiImage := map[string]any{
+		"model":  model,
+		"prompt": "替换为用户最终多图合成提示词",
+		"size":   "替换为用户需要的图片尺寸，例如 1024x768",
+		"extra_body": map[string]any{
+			"image": []string{
+				"https://example.com/input-image-1.png",
+				"https://example.com/input-image-2.png",
+			},
+			"response_format": "url",
+		},
+	}
+	return []HealthMediaCurlTemplate{
+		{
+			Name:        "图生图 / 图片编辑：URL 输入，URL 输出",
+			Method:      http.MethodPost,
+			Endpoint:    endpoint,
+			RequestBody: imageToImageURL,
+			Curl:        jsonCurl(endpoint, key, imageToImageURL),
+			Note:        "生成图片 URL 位于 data[0].url。",
+		},
+		{
+			Name:        "图生图 / 图片编辑：Data URI Base64 输入，Base64 输出",
+			Method:      http.MethodPost,
+			Endpoint:    endpoint,
+			RequestBody: imageToImageBase64,
+			Curl:        jsonCurl(endpoint, key, imageToImageBase64),
+			Note:        "生成图片 Base64 位于 data[0].b64_json。",
+		},
+		{
+			Name:        "多图合成：多个 URL 输入，URL 输出",
+			Method:      http.MethodPost,
+			Endpoint:    endpoint,
+			RequestBody: multiImage,
+			Curl:        jsonCurl(endpoint, key, multiImage),
+			Note:        "生成图片 URL 位于 data[0].url。",
+		},
+	}
+}
+
 func isAgnesImageEndpoint(endpoint, model string) bool {
 	return strings.Contains(strings.ToLower(endpoint), "agnes-ai.com") || strings.Contains(strings.ToLower(model), "agnes-image")
+}
+
+func isAgnesVideoEndpoint(endpoint, model string) bool {
+	return strings.Contains(strings.ToLower(endpoint), "agnes-ai.com") || strings.Contains(strings.ToLower(model), "agnes-video")
+}
+
+func agnesVideoExtraTemplates(endpoint, model, key string) []HealthMediaCurlTemplate {
+	singleImage := map[string]any{
+		"model":      model,
+		"prompt":     "替换为用户最终图生视频提示词",
+		"image":      "https://example.com/input-image.png",
+		"num_frames": 121,
+		"frame_rate": 24,
+	}
+	multiImage := map[string]any{
+		"model":  model,
+		"prompt": "替换为用户最终多图视频提示词",
+		"extra_body": map[string]any{
+			"image": []string{
+				"https://example.com/input-image-1.png",
+				"https://example.com/input-image-2.png",
+			},
+		},
+		"num_frames": 121,
+		"frame_rate": 24,
+	}
+	keyframes := map[string]any{
+		"model":  model,
+		"prompt": "替换为用户最终关键帧动画提示词",
+		"extra_body": map[string]any{
+			"image": []string{
+				"https://example.com/keyframe-1.png",
+				"https://example.com/keyframe-2.png",
+			},
+			"mode": "keyframes",
+		},
+		"num_frames": 121,
+		"frame_rate": 24,
+	}
+	return []HealthMediaCurlTemplate{
+		{
+			Name:        "单图生视频",
+			Method:      http.MethodPost,
+			Endpoint:    endpoint,
+			RequestBody: singleImage,
+			Curl:        jsonCurl(endpoint, key, singleImage),
+		},
+		{
+			Name:        "多图视频生成",
+			Method:      http.MethodPost,
+			Endpoint:    endpoint,
+			RequestBody: multiImage,
+			Curl:        jsonCurl(endpoint, key, multiImage),
+		},
+		{
+			Name:        "关键帧动画",
+			Method:      http.MethodPost,
+			Endpoint:    endpoint,
+			RequestBody: keyframes,
+			Curl:        jsonCurl(endpoint, key, keyframes),
+		},
+	}
 }
 
 func transparentBackgroundModel(model string) string {
@@ -2567,7 +3123,7 @@ func (s *Server) mediaToolDefinition(kind, base, key string) map[string]any {
 			continue
 		}
 		for _, model := range mediaModelsForKind(s.publishedModelsForProvider(p), kind) {
-			models = append(models, p.ID+"/"+model)
+			models = append(models, providerModelRef(p, model))
 		}
 	}
 	models = uniqueStrings(models)
@@ -2607,7 +3163,7 @@ func firstMediaModel(providers []ProviderConfig, kind string) string {
 			models = mediaModelsForKind(p.Models, kind)
 		}
 		if len(models) > 0 {
-			return p.ID + "/" + models[0]
+			return providerModelRef(p, models[0])
 		}
 	}
 	return "provider/model"

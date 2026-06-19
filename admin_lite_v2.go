@@ -20,7 +20,7 @@ a,button{font:inherit}
 button{background:#111;color:#fff;border:0;border-radius:6px;padding:9px 14px;cursor:pointer}
 button.secondary{background:#fff;color:#111;border:1px solid #ddd}
 button.small{padding:7px 10px;font-size:13px}
-button.add-auto-model{width:17px;height:17px;padding:0;border-radius:3px;font-size:12px;line-height:1;display:inline-flex;align-items:center;justify-content:center;flex:0 0 17px;margin-top:1px}
+button.add-auto-model,button.delete-model{width:17px;height:17px;padding:0;border-radius:3px;font-size:12px;line-height:1;display:inline-flex;align-items:center;justify-content:center;flex:0 0 17px;margin-top:1px}
 button.model-lock{width:17px;height:17px;padding:0;border-radius:3px;font-size:12px;line-height:1;display:inline-flex;align-items:center;justify-content:center;flex:0 0 17px;margin-top:1px}
 button.model-lock.locked{background:#111;color:#fff;border-color:#111}
 button:disabled{opacity:.55;cursor:not-allowed}
@@ -49,14 +49,17 @@ code{background:#eee;padding:2px 5px;border-radius:4px}
 .inline-field.grow input{flex:1 1 240px}
 .inline-field input[type=number]{width:110px}
 .key-list{display:grid;gap:8px}
-.key-row input{flex:1 1 260px}
+.key-row{display:grid;grid-template-columns:10px minmax(150px,1fr) auto auto;gap:8px;align-items:center}
+.key-row input{min-width:0;width:100%;box-sizing:border-box}
+.key-row button{white-space:nowrap}
 .key-status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 auto}
 .key-status-dot.active{background:#16a34a}
 .key-status-dot.failed{background:#dc2626}
 .key-status-dot.empty{background:transparent}
 .endpoint-grid{display:grid;grid-template-columns:140px minmax(260px,1fr) auto;gap:8px;align-items:center;margin:8px 0}
 .endpoint-grid input{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid #ddd;border-radius:6px;background:#f3f4f6;color:#374151;font:13px/1.3 ui-monospace,SFMono-Regular,Consolas,monospace}
-.media-tool-row{grid-template-columns:140px auto minmax(260px,1fr)}
+.media-tool-row{grid-template-columns:140px auto auto minmax(220px,1fr)}
+.media-count{white-space:nowrap;color:#047857;font-size:13px}
 .media-menu{display:none;gap:8px;align-items:center;flex-wrap:wrap}
 .media-menu.active{display:flex}
 .media-menu button{max-width:100%;overflow:hidden;text-overflow:ellipsis}
@@ -107,10 +110,10 @@ details{margin-top:22px}
 <div class="endpoint-grid"><span class="muted">Base URL</span><input id="programBaseUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programBaseUrl','Base URL')" type="button">复制</button></div>
 <div class="endpoint-grid"><span class="muted">模型列表</span><input id="programModelsUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programModelsUrl','模型列表地址')" type="button">复制</button></div>
 <div class="endpoint-grid"><span class="muted">健康检查</span><input id="programHealthUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programHealthUrl','健康检查地址')" type="button">复制</button></div>
-<div class="endpoint-grid media-tool-row"><span class="muted">图片接口</span><button class="secondary" onclick="toggleMediaCurlMenu('image')" type="button">选择模型复制 curl</button><div id="mediaMenu_image" class="media-menu"></div></div>
-<div class="endpoint-grid media-tool-row"><span class="muted">视频接口</span><button class="secondary" onclick="toggleMediaCurlMenu('video')" type="button">选择模型复制 curl</button><div id="mediaMenu_video" class="media-menu"></div></div>
-<div class="endpoint-grid media-tool-row"><span class="muted">音频接口</span><button class="secondary" onclick="toggleMediaCurlMenu('audio')" type="button">选择模型复制 curl</button><div id="mediaMenu_audio" class="media-menu"></div></div>
-<div class="endpoint-grid media-tool-row"><span class="muted">TTS 接口</span><button class="secondary" onclick="toggleMediaCurlMenu('tts')" type="button">选择声音复制 curl</button><div id="mediaMenu_tts" class="media-menu"></div></div>
+<div class="endpoint-grid media-tool-row"><span class="muted">图片接口</span><button class="secondary" onclick="toggleMediaCurlMenu('image')" type="button">选择模型复制 curl</button><span id="mediaCount_image" class="media-count"></span><div id="mediaMenu_image" class="media-menu"></div></div>
+<div class="endpoint-grid media-tool-row"><span class="muted">视频接口</span><button class="secondary" onclick="toggleMediaCurlMenu('video')" type="button">选择模型复制 curl</button><span id="mediaCount_video" class="media-count"></span><div id="mediaMenu_video" class="media-menu"></div></div>
+<div class="endpoint-grid media-tool-row"><span class="muted">音频接口</span><button class="secondary" onclick="toggleMediaCurlMenu('audio')" type="button">选择模型复制 curl</button><span id="mediaCount_audio" class="media-count"></span><div id="mediaMenu_audio" class="media-menu"></div></div>
+<div class="endpoint-grid media-tool-row"><span class="muted">TTS 接口</span><button class="secondary" onclick="toggleMediaCurlMenu('tts')" type="button">选择声音复制 curl</button><span id="mediaCount_tts" class="media-count"></span><div id="mediaMenu_tts" class="media-menu"></div></div>
 <div class="muted">第三方 Agent 的 Base URL 填 <code>/v1</code>，API Key 填上面的访问密钥；程序健康检查建议使用 JSON 地址。</div>
 </div>
 
@@ -151,6 +154,7 @@ details{margin-top:22px}
 <button id="tab_api" class="tab-button active" onclick="showMainTab('api')" type="button">API 密钥提供商</button>
 <button id="tab_oauth" class="tab-button" onclick="showMainTab('oauth')" type="button">OAuth 提供商</button>
 <button id="tab_auto" class="tab-button" onclick="showMainTab('auto')" type="button">Auto 模型</button>
+<button id="tab_groups" class="tab-button" onclick="showMainTab('groups')" type="button">模型分组</button>
 </div>
 
 <section id="panel_auto" class="tab-panel">
@@ -182,6 +186,16 @@ details{margin-top:22px}
 <div id="publishProviders" class="panel-grid"></div>
 </section>
 
+<section id="panel_groups" class="tab-panel">
+<div class="bar">
+<h2 style="margin:0">模型分组</h2>
+<button class="secondary" onclick="addModelGroup()" type="button">新建分组</button>
+<span id="modelGroupStatus" class="muted"></span>
+</div>
+<div class="muted section-note">每个分组使用独立 API Key；Base URL 仍然使用上面的 <code>/v1</code>。分组 Key 只能看到并调用已勾选的模型。</div>
+<div id="modelGroups" class="panel-grid"></div>
+</section>
+
 <details>
 <summary>原始配置</summary>
 <div class="bar"><button class="secondary" onclick="save()">保存原始配置</button></div>
@@ -195,7 +209,7 @@ const statusProviderIDs=['oc','mmf','qoder','gemini','kilo','cline','glm','groq'
 let probeStopRequested=false;
 function parseConfig(){ try { return JSON.parse(document.getElementById('cfg').value); } catch { return null; } }
 function showMainTab(name){
-  ['api','oauth','auto'].forEach(id=>{
+  ['api','oauth','auto','groups'].forEach(id=>{
     const panel=document.getElementById('panel_'+id); if(panel) panel.classList.toggle('active',id===name);
     const tab=document.getElementById('tab_'+id); if(tab) tab.classList.toggle('active',id===name);
   });
@@ -218,6 +232,7 @@ function pathWithKey(path,cfg){
 function setConfig(cfg){
   ensureBlankCustomProvider(cfg);
   if(!cfg.auto_model) cfg.auto_model={enabled:false,models:[]};
+  if(!Array.isArray(cfg.model_groups)) cfg.model_groups=[];
   document.getElementById('cfg').value=JSON.stringify(cfg,null,2);
   document.getElementById('accessKey').value=cfg.access_key || '';
   document.getElementById('baseUrl').value=location.origin+'/v1';
@@ -229,6 +244,7 @@ function setConfig(cfg){
   document.getElementById('autoModelEnabled').checked=!!cfg.auto_model.enabled;
   renderAutoModels(cfg);
   renderMediaCurlMenus(cfg);
+  renderModelGroups(cfg);
 }
 function providerConnected(p){
   if(!p || !p.enabled) return false;
@@ -239,6 +255,7 @@ function authStatus(p){ return (p && p.provider_specific_data && p.provider_spec
 function authError(p){ return (p && p.provider_specific_data && p.provider_specific_data.lastAuthError) || ''; }
 function manualOverride(p){ return !!(p && p.provider_specific_data && p.provider_specific_data.manualPublishOverride==='true'); }
 function isCustomProvider(p){ return !!(p && p.type==='openai' && /^custom/.test(p.id || '')); }
+function providerRouteID(p){ return isCustomProvider(p) && String(p.name || '').trim() ? String(p.name).trim() : String((p && p.id) || ''); }
 function providerAPIKeys(p){ return unique([((p && p.api_key) || ''), ...((p && Array.isArray(p.api_keys)) ? p.api_keys : [])].map(x=>String(x || '').trim()).filter(Boolean)); }
 function hasMediaEndpoint(p){ return !!(p && ((p.image_endpoint || p.image_base_url || '').trim() || (p.image_edit_endpoint || '').trim() || (p.video_endpoint || p.video_base_url || '').trim() || (p.audio_endpoint || p.audio_base_url || '').trim() || (p.tts_endpoint || '').trim())); }
 function customHasContent(p){ return !!(p && (providerAPIKeys(p).length || hasMediaEndpoint(p) || ((p.base_url || '').trim() && p.base_url !== 'https://example.com/v1') || (p.provider_specific_data && p.provider_specific_data.apiModelsFetched==='true'))); }
@@ -283,7 +300,8 @@ function mediaModelsForKind(cfg,kind){
   const out=[];
   ((cfg && cfg.providers) || []).forEach(p=>{
     if(!p || !p.enabled || !mediaEndpointValue(p,kind)) return;
-    selectedModels(p).filter(model=>mediaModelMatches(kind,model)).forEach(model=>out.push({provider:p.id,name:p.name || p.id,model,full:p.id+'/'+model}));
+    const route=providerRouteID(p);
+    selectedModels(p).filter(model=>mediaModelMatches(kind,model)).forEach(model=>out.push({provider:p.id,name:p.name || p.id,model,full:route+'/'+model}));
   });
   return out;
 }
@@ -291,6 +309,11 @@ function renderMediaCurlMenus(cfg){
   ['image','video','audio','tts'].forEach(kind=>{
     const root=document.getElementById('mediaMenu_'+kind); if(!root) return;
     const models=mediaModelsForKind(cfg,kind);
+    const count=document.getElementById('mediaCount_'+kind);
+    if(count){
+      const label=kind==='image' ? '图片模型' : kind==='video' ? '视频模型' : kind==='audio' ? '音频模型' : 'TTS 声音';
+      count.textContent=models.length ? models.length+' 个可用'+label : '';
+    }
     root.innerHTML=models.length ? models.map(item=>'<button class="small secondary" title="'+esc(item.full)+'" data-kind="'+esc(kind)+'" data-provider="'+esc(item.provider)+'" data-model="'+esc(item.model)+'" onclick="copyMediaCurl(this)" type="button">'+esc(item.full)+'</button>').join('') : '<span class="muted">暂无已配置的媒体模型</span>';
   });
 }
@@ -324,12 +347,22 @@ function transparentBackgroundModel(model){
   return '';
 }
 function mediaImageCurl(endpoint,key,model,editEndpoint){
-  const body=isAgnesImage(endpoint,model)
+  const agnes=isAgnesImage(endpoint,model);
+  const body=agnes
     ? {model:model,prompt:'替换为用户最终生图提示词',size:'替换为用户需要的图片尺寸，例如 1024x768',extra_body:{response_format:'url'}}
     : {model:model,prompt:'替换为用户最终生图提示词',n:1};
   let out='# 文生图\n'+mediaJSONCurl(endpoint,key,body);
+  if(agnes){
+    out += '\n# 生成图片 URL 位于 data[0].url';
+    const imageToImageURL={model:model,prompt:'替换为用户最终图片编辑提示词',size:'替换为用户需要的图片尺寸，例如 1024x768',extra_body:{image:['https://example.com/input-image.png'],response_format:'url'}};
+    out += '\n\n# 图生图 / 图片编辑：URL 输入，URL 输出\n'+mediaJSONCurl(endpoint,key,imageToImageURL)+'\n# 生成图片 URL 位于 data[0].url';
+    const imageToImageBase64={model:model,prompt:'替换为用户最终图片编辑提示词',size:'替换为用户需要的图片尺寸，例如 1024x768',extra_body:{image:['data:image/png;base64,BASE64_HERE'],response_format:'b64_json'}};
+    out += '\n\n# 图生图 / 图片编辑：Data URI Base64 输入，Base64 输出\n'+mediaJSONCurl(endpoint,key,imageToImageBase64)+'\n# 生成图片 Base64 位于 data[0].b64_json';
+    const multiImage={model:model,prompt:'替换为用户最终多图合成提示词',size:'替换为用户需要的图片尺寸，例如 1024x768',extra_body:{image:['https://example.com/input-image-1.png','https://example.com/input-image-2.png'],response_format:'url'}};
+    out += '\n\n# 多图合成：多个 URL 输入，URL 输出\n'+mediaJSONCurl(endpoint,key,multiImage)+'\n# 生成图片 URL 位于 data[0].url';
+  }
   const transparentModel=transparentBackgroundModel(model);
-  if(!isAgnesImage(endpoint,model) && transparentModel){
+  if(!agnes && transparentModel){
     const transparentBody={model:transparentModel,prompt:'替换为用户最终透明背景生图提示词',n:1,background:'transparent',output_format:'png'};
     out += '\n\n# 透明背景 PNG 生图\n'+mediaJSONCurl(endpoint,key,transparentBody);
   }
@@ -352,6 +385,22 @@ function mediaAudioCurl(endpoint,key,model){
 function mediaVideoQueryCurl(endpoint,key){
   const queryEndpoint=videoQueryEndpoint(endpoint);
   return 'curl -X GET "'+queryEndpoint+'" \\\n  -H "Authorization: Bearer '+key+'"';
+}
+function isAgnesVideo(endpoint,model){
+  return String(endpoint || '').toLowerCase().includes('agnes-ai.com') || String(model || '').toLowerCase().includes('agnes-video');
+}
+function mediaVideoCurl(endpoint,key,model){
+  const textBody={model:model,prompt:'替换为用户最终文生视频提示词',height:768,width:1152,num_frames:121,frame_rate:24};
+  let out='# 文生视频：响应里的 video_id 用于查询结果\n'+mediaJSONCurl(endpoint,key,textBody);
+  if(isAgnesVideo(endpoint,model)){
+    const singleImage={model:model,prompt:'替换为用户最终图生视频提示词',image:'https://example.com/input-image.png',num_frames:121,frame_rate:24};
+    out += '\n\n# 单图生视频\n'+mediaJSONCurl(endpoint,key,singleImage);
+    const multiImage={model:model,prompt:'替换为用户最终多图视频提示词',extra_body:{image:['https://example.com/input-image-1.png','https://example.com/input-image-2.png']},num_frames:121,frame_rate:24};
+    out += '\n\n# 多图视频生成\n'+mediaJSONCurl(endpoint,key,multiImage);
+    const keyframes={model:model,prompt:'替换为用户最终关键帧动画提示词',extra_body:{image:['https://example.com/keyframe-1.png','https://example.com/keyframe-2.png'],mode:'keyframes'},num_frames:121,frame_rate:24};
+    out += '\n\n# 关键帧动画\n'+mediaJSONCurl(endpoint,key,keyframes);
+  }
+  return out+'\n\n# 建议每 5 秒轮询一次，直到 status 为 completed\n'+mediaVideoQueryCurl(endpoint,key);
 }
 function videoQueryEndpoint(endpoint){
   let queryEndpoint='https://apihub.agnes-ai.com/agnesapi?video_id=替换为创建任务返回的 video_id';
@@ -395,7 +444,7 @@ function mediaCurl(kind,providerID,model){
   if(kind==='audio') return mediaAudioCurl(endpoint,key,model);
   if(kind==='tts') return renderCurlTemplate(defaultCurlTemplate('tts'),{endpoint:endpoint,key:key,model:model,tts_text:'你好世界'});
   const body={model:model,...mediaKindInfo(kind).payload};
-  if(kind==='video') return '# 创建视频任务，响应里的 video_id 用于查询结果\n'+mediaJSONCurl(endpoint,key,body)+'\n\n# 建议每 5 秒轮询一次，直到 status 为 completed\n'+mediaVideoQueryCurl(endpoint,key);
+  if(kind==='video') return mediaVideoCurl(endpoint,key,model);
   return mediaJSONCurl(endpoint,key,body);
 }
 async function copyMediaCurl(button){
@@ -457,6 +506,83 @@ function moveAutoModel(index, delta){
     const item=models[index]; models.splice(index,1); models.splice(next,0,item);
   });
   setText('autoModelStatus','ok','已调整顺序，记得保存');
+}
+function publishedGroupModels(cfg){
+  const out=[];
+  ((cfg && cfg.providers) || []).filter(p=>p && p.enabled).forEach(p=>{
+    visibleModels(p).filter(model=>!isMediaModel(model)).forEach(model=>out.push(providerRouteID(p)+'/'+model));
+  });
+  if(cfg && cfg.auto_model && cfg.auto_model.enabled) out.push('auto');
+  return unique(out).sort();
+}
+function newGroupKey(){
+  const bytes=new Uint8Array(18);
+  crypto.getRandomValues(bytes);
+  return '9r_'+[...bytes].map(x=>x.toString(16).padStart(2,'0')).join('');
+}
+function renderModelGroups(cfg){
+  const root=document.getElementById('modelGroups'); if(!root) return;
+  const groups=(cfg && Array.isArray(cfg.model_groups)) ? cfg.model_groups : [];
+  const models=publishedGroupModels(cfg);
+  root.innerHTML=groups.length ? groups.map(group=>{
+    const id=group.id;
+    const selected=new Set(group.models || []);
+    const rows=models.length ? models.map(model=>'<label class="model-item"><input type="checkbox" data-group-model="'+esc(id)+'" value="'+esc(model)+'" '+(selected.has(model)?'checked':'')+'><span class="model-name">'+esc(model)+'</span></label>').join('') : '<div class="muted">当前没有已发布的文本模型。</div>';
+    return '<div class="card"><div class="card-title-row"><h3>'+esc(group.name || '未命名分组')+'</h3><span class="provider-badge">Model Group</span></div>'
+      +'<label class="toggle"><input id="groupEnabled_'+esc(id)+'" type="checkbox" '+(group.enabled?'checked':'')+'> 启用</label>'
+      +'<div class="field"><label>分组名称</label><input id="groupName_'+esc(id)+'" value="'+esc(group.name || '')+'" placeholder="例如：免费模型组"></div>'
+      +'<div class="field"><label>独立 API Key</label><div class="inline-field grow"><input id="groupKey_'+esc(id)+'" value="'+esc(group.api_key || '')+'"><button class="small secondary" onclick="copyModelGroupKey(\''+esc(id)+'\')" type="button">复制</button></div></div>'
+      +'<div class="bar"><button class="small secondary" onclick="selectModelGroupModels(\''+esc(id)+'\',true)" type="button">全选</button><button class="small secondary" onclick="selectModelGroupModels(\''+esc(id)+'\',false)" type="button">取消所有选择</button><span class="muted">已选择 '+selected.size+' 个</span></div>'
+      +'<div class="model-list">'+rows+'</div>'
+      +'<div class="bar"><button onclick="saveModelGroup(\''+esc(id)+'\')" type="button">保存分组</button><button class="secondary" onclick="deleteModelGroup(\''+esc(id)+'\')" type="button">删除分组</button><span id="groupStatus_'+esc(id)+'" class="muted"></span></div></div>';
+  }).join('') : '<div class="muted">还没有模型分组。</div>';
+}
+function addModelGroup(){
+  const cfg=parseConfig(); if(!cfg) return;
+  if(!Array.isArray(cfg.model_groups)) cfg.model_groups=[];
+  const id='group_'+Date.now().toString(36);
+  cfg.model_groups.push({id,name:'新模型分组',api_key:newGroupKey(),enabled:true,models:[]});
+  setConfig(cfg);
+  setText('modelGroupStatus','ok','已新建分组，请选择模型后保存');
+}
+function selectModelGroupModels(id,checked){
+  document.querySelectorAll('input[data-group-model="'+id+'"]').forEach(node=>{ node.checked=!!checked; });
+}
+async function copyModelGroupKey(id){
+  try{
+    const input=document.getElementById('groupKey_'+id);
+    await copyTextValue(input ? input.value : '');
+    setText('groupStatus_'+id,'ok','API Key 已复制');
+  }catch(e){ setText('groupStatus_'+id,'err','复制失败：'+e.message); }
+}
+async function saveModelGroup(id){
+  try{
+    const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.model_groups)) throw new Error('config is invalid');
+    applyGatewaySettings(cfg);
+    cfg.model_groups=cfg.model_groups.map(group=>{
+      if(group.id!==id) return group;
+      return {...group,
+        name:(document.getElementById('groupName_'+id).value || '').trim(),
+        api_key:(document.getElementById('groupKey_'+id).value || '').trim(),
+        enabled:!!document.getElementById('groupEnabled_'+id).checked,
+        models:[...document.querySelectorAll('input[data-group-model="'+id+'"]:checked')].map(node=>node.value)
+      };
+    });
+    ensureBlankCustomProvider(cfg);
+    await saveConfigObject(cfg);
+    await reloadConfig();
+    setText('groupStatus_'+id,'ok','分组已保存');
+  }catch(e){ setText('groupStatus_'+id,'err',e.message); }
+}
+async function deleteModelGroup(id){
+  try{
+    if(!confirm('确定删除这个模型分组？')) return;
+    const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.model_groups)) throw new Error('config is invalid');
+    cfg.model_groups=cfg.model_groups.filter(group=>group.id!==id);
+    await saveConfigObject(cfg);
+    await reloadConfig();
+    setText('modelGroupStatus','ok','分组已删除');
+  }catch(e){ setText('modelGroupStatus','err',e.message); }
 }
 function latencyClass(ms){ if(!ms) return ''; if(ms<=1200) return 'good'; if(ms<=4000) return 'warn'; return 'bad'; }
 function latencyHTML(p, model){ const ms=p && p.model_latency_ms ? p.model_latency_ms[model] : 0; return ms ? '<span class="latency '+latencyClass(ms)+'">'+ms+'ms</span>' : ''; }
@@ -530,10 +656,11 @@ function modelRows(p){
     const checked=selected.has(model);
     const note=usable ? '' : modelStateText(p, model);
     const toggle='<input type="checkbox" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" '+(checked?'checked':'')+'>';
-    const addAuto='<button class="add-auto-model secondary" type="button" title="Add to Auto" data-model="'+esc(p.id+'/'+model)+'" onclick="addAutoModelValue(this)">+</button>';
+    const remove='<button class="delete-model secondary" type="button" title="删除模型" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" onclick="deleteProviderModel(this)">−</button>';
+    const addAuto='<button class="add-auto-model secondary" type="button" title="Add to Auto" data-model="'+esc(providerRouteID(p)+'/'+model)+'" onclick="addAutoModelValue(this)">+</button>';
     const locked=isLockedModel(p,model);
     const lock='<button class="model-lock secondary '+(locked?'locked':'')+'" type="button" title="'+(locked?'已上锁：一键/定时探测会跳过':'未上锁：一键/定时探测会包含')+'" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" onclick="toggleModelLock(this)">'+(locked?'🔒':'🔓')+'</button>';
-    return '<div class="model-item '+(usable?'':'off')+'">'+toggle+addAuto+lock+'<span class="model-name">'+esc(model)+note+latencyHTML(p,model)+(usable?'':modelErrorHTML(p,model))+'</span></div>';
+    return '<div class="model-item '+(usable?'':'off')+'">'+toggle+remove+addAuto+lock+'<span class="model-name">'+esc(model)+note+latencyHTML(p,model)+(usable?'':modelErrorHTML(p,model))+'</span></div>';
   }).join('');
 }
 function renderProviderStatus(){
@@ -564,7 +691,7 @@ function apiKeyStatusClass(p,index,total){
 }
 function apiKeyRowHTML(id, value, statusClass){
   statusClass=statusClass || 'empty';
-  return '<div class="inline-field grow key-row"><span class="key-status-dot '+esc(statusClass)+'"></span><input data-api-key-provider="'+esc(id)+'" value="'+esc(value || '')+'" placeholder="sk-..."><button class="small secondary" data-key-remove="1" onclick="removeAPIKeyInput(this,\''+id+'\')" type="button">删除</button></div>';
+  return '<div class="inline-field grow key-row"><span class="key-status-dot '+esc(statusClass)+'"></span><input data-api-key-provider="'+esc(id)+'" value="'+esc(value || '')+'" placeholder="sk-..."><button class="small secondary" onclick="probeAPIKey(this,\''+id+'\')" type="button">测试</button><button class="small secondary" data-key-remove="1" onclick="removeAPIKeyInput(this,\''+id+'\')" type="button">删除</button></div>';
 }
 function refreshAPIKeyRemoveButtons(id){
   const root=document.getElementById('keyList_'+id); if(!root) return;
@@ -588,7 +715,8 @@ function apiKeyValues(id){
 }
 function apiKeyEditor(id,p){
   const keys=providerAPIKeys(p); if(!keys.length) keys.push('');
-  return '<div class="field"><label>API Keys</label><div id="keyList_'+id+'" class="key-list">'+keys.map((key,index)=>apiKeyRowHTML(id,key,apiKeyStatusClass(p,index,keys.length))).join('')+'</div><div class="bar"><button class="small secondary" onclick="addAPIKeyInput(\''+id+'\')" type="button">新增 API Key</button><span class="muted">按顺序尝试；额度不足时自动切到下一个。</span></div></div>';
+  const probeModel=(chatProbeModels(p)[0] || '');
+  return '<div class="field"><label>API Keys</label><div id="keyList_'+id+'" class="key-list">'+keys.map((key,index)=>apiKeyRowHTML(id,key,apiKeyStatusClass(p,index,keys.length))).join('')+'</div><div class="bar"><button class="small secondary" onclick="addAPIKeyInput(\''+id+'\')" type="button">新增 API Key</button><span class="muted">按顺序尝试；额度不足只会跳过当前模型的这个 key。</span></div><div class="field"><label>Key 测试模型</label><input id="keyProbeModel_'+id+'" value="'+esc(probeModel)+'" placeholder="填写要用这个 key 测试的文本模型"></div></div>';
 }
 function hydrateCustomKeyEditors(cfg){
   (cfg.providers || []).forEach(p=>{
@@ -686,6 +814,7 @@ function buildAPIProvider(id){
   const custom=isCustomProvider(prev);
   const keys=apiKeyValues(id);
   const next={ ...prev, name:custom?(document.getElementById('name_'+id).value.trim() || prev.name || 'Custom OpenAI Compatible'):prev.name, enabled:!!document.getElementById('enabled_'+id).checked, base_url:document.getElementById('base_'+id).value.trim(), api_key:keys[0] || '' };
+  if(custom && next.name.includes('/')) throw new Error('自定义渠道名称不能包含 /');
   next.image_endpoint=mediaBaseInputValue(id,'image');
   next.image_edit_endpoint=mediaBaseInputValue(id,'image_edit');
   next.video_endpoint=mediaBaseInputValue(id,'video');
@@ -702,6 +831,7 @@ function buildAPIProvider(id){
   const psd={...(next.provider_specific_data || {})};
   delete psd.active_key_index;
   delete psd.failed_key_indexes;
+  Object.keys(psd).forEach(key=>{ if(key.startsWith('failed_key_indexes_model_')) delete psd[key]; });
   [['curlTemplateImage','image'],['curlTemplateVideo','video'],['curlTemplateAudio','audio'],['curlTemplateTTS','tts']].forEach(([key,kind])=>{
     const value=templateFieldValue(id,key);
     if(value && value!==defaultCurlTemplate(kind)) psd[key]=value; else delete psd[key];
@@ -711,6 +841,13 @@ function buildAPIProvider(id){
   }
   next.provider_specific_data=psd;
   return next;
+}
+function remapProviderRouteRefs(cfg,prev,next){
+  const oldRoute=providerRouteID(prev); const newRoute=providerRouteID(next);
+  if(!oldRoute || !newRoute || oldRoute===newRoute) return;
+  const remap=value=>String(value || '').startsWith(oldRoute+'/') ? newRoute+String(value).slice(oldRoute.length) : value;
+  if(cfg.auto_model && Array.isArray(cfg.auto_model.models)) cfg.auto_model.models=unique(cfg.auto_model.models.map(remap));
+  (cfg.model_groups || []).forEach(group=>{ group.models=unique((group.models || []).map(remap)); });
 }
 async function saveConfigObject(cfg){ const res=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(cfg)}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); return data; }
 async function loadImportConfigFile(){
@@ -787,7 +924,40 @@ async function copyTextValue(value){
 async function copyBaseURL(){ try{ await copyTextValue(document.getElementById('baseUrl').value); setText('status','ok','Base URL 已复制'); }catch(e){ setText('status','err','复制失败：'+e.message); } }
 async function copyEndpoint(id, label){ try{ await copyTextValue(document.getElementById(id).value); setText('status','ok',(label || '地址')+'已复制'); }catch(e){ setText('status','err','复制失败：'+e.message); } }
 function openModelsPage(){ const key=document.getElementById('accessKey').value.trim(); if(!key){ setText('status','err','请先设置访问密钥'); return; } window.open('/v1/models?view=html&key='+encodeURIComponent(key),'_blank','noopener,noreferrer'); }
-async function saveAPIProvider(id){ try{ const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid'); applyGatewaySettings(cfg); const next=buildAPIProvider(id); cfg.providers=cfg.providers.map(p=>p.id===id?next:p); ensureBlankCustomProvider(cfg); await saveConfigObject(cfg); await reloadConfig(); setText('apiStatus_'+id,'ok','已保存'); }catch(e){ setText('apiStatus_'+id,'err',e.message); } }
+async function saveAPIProvider(id){ try{ const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid'); applyGatewaySettings(cfg); const prev=cfg.providers.find(p=>p.id===id); const next=buildAPIProvider(id); remapProviderRouteRefs(cfg,prev,next); cfg.providers=cfg.providers.map(p=>p.id===id?next:p); ensureBlankCustomProvider(cfg); await saveConfigObject(cfg); await reloadConfig(); setText('apiStatus_'+id,'ok','已保存'); }catch(e){ setText('apiStatus_'+id,'err',e.message); } }
+async function probeAPIKey(button,id){
+  let statusID='apiStatus_'+id;
+  try{
+    const row=button && button.closest ? button.closest('.key-row') : null;
+    const rows=[...document.querySelectorAll('#keyList_'+id+' .key-row')];
+    const keyIndex=rows.indexOf(row);
+    if(keyIndex<0) throw new Error('找不到要测试的 key 行');
+    const modelInput=document.getElementById('keyProbeModel_'+id);
+    const model=(modelInput && modelInput.value || '').trim();
+    if(!model) throw new Error('请先填写 Key 测试模型');
+    setText(statusID,'muted','正在保存当前卡片...');
+    const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid');
+    applyGatewaySettings(cfg);
+    const next=buildAPIProvider(id);
+    const keys=providerAPIKeys(next);
+    if(!keys[keyIndex]) throw new Error('这一行 key 为空');
+    cfg.providers=cfg.providers.map(p=>p.id===id?next:p);
+    ensureBlankCustomProvider(cfg);
+    await saveConfigObject(cfg);
+    setText(statusID,'muted','正在测试第 '+(keyIndex+1)+' 个 key：'+model);
+    const res=await fetch('/api/provider/probe-key',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id, model, key_index:keyIndex})});
+    const data=await res.json();
+    if(!res.ok) throw new Error(data.error || res.statusText);
+    await reloadConfig();
+    if(data.ok){
+      setText(statusID,'ok','第 '+(keyIndex+1)+' 个 key 可用，延迟 '+data.latency_ms+'ms');
+    }else{
+      setText(statusID,'err','第 '+(keyIndex+1)+' 个 key 不可用：'+(data.error || '探测失败'));
+    }
+  }catch(e){
+    setText(statusID,'err',e.message);
+  }
+}
 async function disableProvider(id){
   try{
     const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid');
@@ -817,7 +987,7 @@ async function deleteAPIProvider(id){
     setText('status','ok','已删除卡片');
   }catch(e){ setText('apiStatus_'+id,'err',e.message); }
 }
-async function fetchAPIProviderModels(id){ try{ setText('apiStatus_'+id,'muted','正在保存...'); const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid'); applyGatewaySettings(cfg); const next=buildAPIProvider(id); cfg.providers=cfg.providers.map(p=>p.id===id?next:p); ensureBlankCustomProvider(cfg); await saveConfigObject(cfg); setText('apiStatus_'+id,'muted','正在拉取模型...'); const res=await fetch('/api/provider/models',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id})}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); await reloadConfig(); setText('apiStatus_'+id,'ok','已拉取 '+(data.count || 0)+' 个模型'); }catch(e){ setText('apiStatus_'+id,'err',e.message); } }
+async function fetchAPIProviderModels(id){ try{ setText('apiStatus_'+id,'muted','正在保存...'); const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid'); applyGatewaySettings(cfg); const prev=cfg.providers.find(p=>p.id===id); const next=buildAPIProvider(id); remapProviderRouteRefs(cfg,prev,next); cfg.providers=cfg.providers.map(p=>p.id===id?next:p); ensureBlankCustomProvider(cfg); await saveConfigObject(cfg); setText('apiStatus_'+id,'muted','正在拉取模型...'); const res=await fetch('/api/provider/models',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id})}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); await reloadConfig(); setText('apiStatus_'+id,'ok','已拉取 '+(data.count || 0)+' 个模型'); }catch(e){ setText('apiStatus_'+id,'err',e.message); } }
 async function fetchOAuthProviderModels(id){ try{ const statusID='publishStatus_'+id; setText(statusID,'muted','正在拉取模型...'); const res=await fetch('/api/provider/models',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id})}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); await reloadConfig(); setText(statusID,'ok','已拉取 '+(data.count || 0)+' 个模型'); }catch(e){ setText('publishStatus_'+id,'err',e.message); } }
 async function addAPIModel(id){
   try{
@@ -913,6 +1083,23 @@ async function probeAllProviders(){
   await reloadConfig(); setText('probeAllStatus',probeStopRequested?'muted':(failed?'err':'ok'),probeStopRequested?'已停止，已探测 '+done+'/'+jobs.length+'，可用 '+ok+' 个模型':'探测完成，可用 '+ok+' 个模型'+(failed?'，失败 '+failed+' 个':'，已自动发布'));
 }
 async function saveModelSelection(id,statusID){ try{ statusID=statusID || 'publishStatus_'+id; const nodes=[...document.querySelectorAll('input[data-provider="'+id+'"]:checked')]; const enabled_models=nodes.map(node=>node.getAttribute('data-model')); const res=await fetch('/api/provider/selection',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id, enabled_models})}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); await reloadConfig(); setText(statusID,'ok','已保存发布列表'); }catch(e){ setText(statusID || 'status','err',e.message); } }
+async function deleteProviderModel(button){
+  const id=button.getAttribute('data-provider');
+  const model=button.getAttribute('data-model');
+  const statusID=document.getElementById('publishStatus_'+id)?'publishStatus_'+id:'apiStatus_'+id;
+  try{
+    button.disabled=true;
+    setText(statusID,'muted','正在删除 '+model+'...');
+    const res=await fetch('/api/provider/model/delete',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id,model})});
+    const data=await res.json();
+    if(!res.ok) throw new Error(data.error || res.statusText);
+    await reloadConfig();
+    setText(statusID,'ok','已删除模型 '+model);
+  }catch(e){
+    button.disabled=false;
+    setText(statusID,'err',e.message);
+  }
+}
 async function save(){ try{ const body=JSON.parse(document.getElementById('cfg').value); applyGatewaySettings(body); ensureBlankCustomProvider(body); const res=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); setText('status','ok','已保存'); renderProviderStatus(); renderAPIProviders(); renderPublishProviders(); }catch(e){ setText('status','err',e.message); } }
 async function startQoder(){ try{ const data=await (await fetch('/api/oauth/qoder/device-code')).json(); localStorage.setItem('qoder_flow', JSON.stringify(data)); window.open(data.verification_uri_complete, '_blank', 'noopener,noreferrer'); setText('qoderStatus','ok','已打开 Qoder 登录页，完成登录后点击轮询令牌。'); }catch(e){ setText('qoderStatus','err',e.message); } }
 async function pollQoder(){ try{ const flow=JSON.parse(localStorage.getItem('qoder_flow')||'{}'); if(!flow.device_code || !flow.codeVerifier) throw new Error('请先开始 Qoder 登录'); const res=await fetch('/api/oauth/qoder/poll',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({ deviceCode: flow.device_code, codeVerifier: flow.codeVerifier, extraData: {_qoderMachineId: flow._qoderMachineId, _qoderNonce: flow._qoderNonce, _qoderVerifier: flow.codeVerifier} })}); const data=await res.json(); if(data.pending){ setText('qoderStatus','muted','还在等待授权完成...'); return; } if(!res.ok || !data.success) throw new Error(data.errorDescription || data.error || 'poll failed'); localStorage.removeItem('qoder_flow'); await reloadConfig(); setText('qoderStatus','ok','Qoder 已连接。'); }catch(e){ setText('qoderStatus','err',e.message); } }
