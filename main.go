@@ -249,16 +249,16 @@ func NewServer(dataDir string) (*Server, error) {
 		return nil, err
 	}
 
-	client := &http.Client{
-		Timeout: defaultHTTPTimeout,
-		Transport: &http.Transport{
-			DisableKeepAlives:   true,
-			MaxIdleConns:        0,
-			MaxIdleConnsPerHost: 0,
-			IdleConnTimeout:     5 * time.Second,
-			DialContext:         preferIPv4DialContext(),
-			Proxy:               http.ProxyFromEnvironment,
-		},
+	client, err := newHTTPClient("")
+	if err != nil {
+		return nil, err
+	}
+	mimoClient := client
+	if proxyAddress := strings.TrimSpace(os.Getenv("MIMO_PROXY_URL")); proxyAddress != "" {
+		mimoClient, err = newHTTPClient(proxyAddress)
+		if err != nil {
+			return nil, fmt.Errorf("invalid MIMO_PROXY_URL")
+		}
 	}
 	srv := &Server{
 		dataDir:     dataDir,
@@ -267,7 +267,7 @@ func NewServer(dataDir string) (*Server, error) {
 		adminSecret: newSessionID(),
 		mimo: &MimoAuth{
 			sessionID: newSessionID(),
-			client:    client,
+			client:    mimoClient,
 		},
 	}
 	adminHash, err := loadAdminPasswordHash(dataDir)
@@ -276,6 +276,33 @@ func NewServer(dataDir string) (*Server, error) {
 	}
 	srv.adminHash = adminHash
 	return srv, nil
+}
+
+func newHTTPClient(proxyAddress string) (*http.Client, error) {
+	proxyFunc := http.ProxyFromEnvironment
+	if proxyAddress = strings.TrimSpace(proxyAddress); proxyAddress != "" {
+		proxyURL, err := url.Parse(proxyAddress)
+		if err != nil || proxyURL.Host == "" {
+			return nil, errors.New("invalid proxy URL")
+		}
+		switch strings.ToLower(proxyURL.Scheme) {
+		case "http", "https", "socks5", "socks5h":
+		default:
+			return nil, errors.New("unsupported proxy URL scheme")
+		}
+		proxyFunc = http.ProxyURL(proxyURL)
+	}
+	return &http.Client{
+		Timeout: defaultHTTPTimeout,
+		Transport: &http.Transport{
+			DisableKeepAlives:   true,
+			MaxIdleConns:        0,
+			MaxIdleConnsPerHost: 0,
+			IdleConnTimeout:     5 * time.Second,
+			DialContext:         preferIPv4DialContext(),
+			Proxy:               proxyFunc,
+		},
+	}, nil
 }
 
 func loadConfig(dataDir string) (Config, error) {
@@ -1344,7 +1371,7 @@ func (s *Server) proxyMimoFree(w http.ResponseWriter, r *http.Request, req chatR
 		"X-Accel-Buffering":   "no",
 		"X-9Router-Lite-Mode": "mimo-free",
 	}
-	status := s.proxyRaw(w, r, mimoFreeChatURL, body, headers)
+	status := s.proxyRawWithClient(w, r, s.mimo.client, mimoFreeChatURL, body, headers)
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		s.mimo.Reset()
 	}
@@ -1467,7 +1494,11 @@ func writeBufferedUpstream(w http.ResponseWriter, status int, header http.Header
 }
 
 func (s *Server) proxyRaw(w http.ResponseWriter, r *http.Request, target string, body []byte, headers map[string]string) int {
-	defer s.client.CloseIdleConnections()
+	return s.proxyRawWithClient(w, r, s.client, target, body, headers)
+}
+
+func (s *Server) proxyRawWithClient(w http.ResponseWriter, r *http.Request, client *http.Client, target string, body []byte, headers map[string]string) int {
+	defer client.CloseIdleConnections()
 	defer debug.FreeOSMemory()
 
 	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
@@ -1479,7 +1510,7 @@ func (s *Server) proxyRaw(w http.ResponseWriter, r *http.Request, target string,
 		upReq.Header.Set(k, v)
 	}
 
-	resp, err := s.client.Do(upReq)
+	resp, err := client.Do(upReq)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 		return http.StatusBadGateway
