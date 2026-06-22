@@ -63,3 +63,40 @@ func TestAgnesVideoTemplatesIncludeImageToVideoModes(t *testing.T) {
 		t.Fatalf("keyframe template extra_body = %#v", extra)
 	}
 }
+
+func TestExplicitModelKindOverridesNameDetection(t *testing.T) {
+	p := ProviderConfig{
+		ID:   "sensenova",
+		Name: "SenseNova",
+		ModelKinds: map[string]string{
+			"sensenova-u1-fast": "image",
+			"looks-like-image":  "text",
+		},
+	}
+	imageModels := mediaModelsForProviderKind(p, []string{"sensenova-u1-fast", "looks-like-image"}, "image")
+	if len(imageModels) != 1 || imageModels[0] != "sensenova-u1-fast" {
+		t.Fatalf("image models = %#v", imageModels)
+	}
+	chatModels := chatModelIDs(p, []string{"sensenova-u1-fast", "looks-like-image"})
+	if len(chatModels) != 1 || chatModels[0] != "looks-like-image" {
+		t.Fatalf("chat models = %#v", chatModels)
+	}
+}
+
+func TestExplicitImageModelAppearsInHealthTemplates(t *testing.T) {
+	p := ProviderConfig{
+		ID:            "custom-sensenova",
+		Name:          "SenseNova",
+		Type:          "openai",
+		Enabled:       true,
+		ImageEndpoint: "https://example.com/v1/images/generations",
+		Models:        []string{"sensenova-u1-fast"},
+		EnabledModels: []string{"sensenova-u1-fast"},
+		ModelKinds:    map[string]string{"sensenova-u1-fast": "image"},
+	}
+	s := &Server{config: Config{Providers: []ProviderConfig{p}}}
+	templates := s.healthMediaTemplates(false)
+	if len(templates) != 1 || templates[0].UpstreamModel != "sensenova-u1-fast" || templates[0].Type != "image" {
+		t.Fatalf("media templates = %#v", templates)
+	}
+}

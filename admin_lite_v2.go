@@ -29,8 +29,20 @@ textarea{width:100%;min-height:340px;box-sizing:border-box;font:13px/1.45 ui-mon
 .ok{color:#047857}
 .err{color:#b91c1c}
 code{background:#eee;padding:2px 5px;border-radius:4px}
-.panel-grid,.api-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin:12px 0 20px}
+.panel-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin:12px 0 20px}
+.api-grid{display:grid;grid-template-columns:minmax(300px,340px) minmax(0,700px);gap:12px;align-items:start;margin:12px 0 20px}
 .card,.api-card{background:#fff;border:1px solid #ddd;border-radius:8px;padding:14px}
+.api-provider-list{display:grid;gap:8px;position:sticky;top:12px;max-height:calc(100vh - 24px);overflow-y:auto;overflow-x:hidden;padding-right:2px;min-width:0}
+.api-provider-detail-pane{min-width:0}
+.api-provider-nav{width:100%;box-sizing:border-box;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 12px;background:#fff;color:#111;border:1px solid #ddd;border-radius:8px;text-align:left}
+.api-provider-nav:hover{background:#f7f7f7}
+.api-provider-nav.active{border-color:#111;background:#f3f4f6}
+.api-provider-nav-main,.api-provider-nav-state{display:flex;align-items:center;gap:8px;min-width:0}
+.api-provider-nav-main{flex:1 1 auto}
+.api-provider-nav-main strong{white-space:normal;overflow-wrap:anywhere}
+.api-provider-nav-state{color:#666;font-size:12px;white-space:nowrap}
+.api-provider-detail{display:none}
+.api-provider-detail.active{display:block}
 .card h3,.api-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin:0 0 8px}
 .card h3{justify-content:flex-start;font-size:17px}
 .api-head strong{font-size:17px}
@@ -42,7 +54,7 @@ code{background:#eee;padding:2px 5px;border-radius:4px}
 .green-dot{background:#16a34a}.gray-dot{background:#aaa}
 .field{display:grid;gap:6px;margin:10px 0}
 .field label{font-size:13px;color:#444}
-.field input{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid #ddd;border-radius:6px;background:#fff;font:13px/1.3 ui-monospace,SFMono-Regular,Consolas,monospace}
+.field input,.field select{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid #ddd;border-radius:6px;background:#fff;font:13px/1.3 ui-monospace,SFMono-Regular,Consolas,monospace}
 .field textarea{min-height:110px}
 .field input[readonly]{background:#f3f4f6;color:#374151}
 .inline-field{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -63,10 +75,12 @@ code{background:#eee;padding:2px 5px;border-radius:4px}
 .media-menu{display:none;gap:8px;align-items:center;flex-wrap:wrap}
 .media-menu.active{display:flex}
 .media-menu button{max-width:100%;overflow:hidden;text-overflow:ellipsis}
-@media(max-width:720px){.endpoint-grid{grid-template-columns:1fr}.endpoint-grid button{width:max-content}}
+@media(max-width:1050px){.api-grid{grid-template-columns:300px minmax(0,1fr)}}
+@media(max-width:720px){.endpoint-grid{grid-template-columns:1fr}.endpoint-grid button{width:max-content}.api-grid{grid-template-columns:1fr}.api-provider-list{position:static;max-height:none;overflow:visible;grid-template-columns:repeat(2,minmax(0,1fr))}}
 .toggle{display:flex;gap:8px;align-items:center;font-size:13px;margin:8px 0}
 .model-list{display:grid;gap:8px;margin-top:10px;max-height:280px;overflow:auto;padding-right:4px}
 .model-item{display:flex;gap:8px;align-items:flex-start;font-size:13px}
+.model-kind-select{width:72px;flex:0 0 72px;padding:2px 3px;border:1px solid #ddd;border-radius:4px;background:#fff;font:12px/1.2 system-ui,-apple-system,Segoe UI,sans-serif}
 .model-item.off{color:#999}
 .model-name{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;word-break:break-all}
 .latency{margin-left:6px;font-weight:700}
@@ -91,9 +105,23 @@ details{margin-top:22px}
 <div class="bar">
 <button onclick="saveGateway()">保存网关设置</button>
 <button class="secondary" onclick="openModelsPage()">打开模型页</button>
+<button class="secondary" onclick="window.location.href='/admin/help'" type="button">说明</button>
 <a href="/health" target="_blank">/health</a>
 <span id="status" class="muted"></span>
 </div>
+
+<details class="card">
+<summary><strong>修改登录密码</strong></summary>
+<div class="muted">修改后会立即退出所有已登录的管理页面，需要使用新密码重新登录。</div>
+<div class="field"><label>当前密码</label><input id="adminCurrentPassword" type="password" autocomplete="current-password"></div>
+<div class="field"><label>新密码</label><input id="adminNewPassword" type="password" autocomplete="new-password" placeholder="至少 8 个字符"></div>
+<div class="field"><label>确认新密码</label><input id="adminConfirmPassword" type="password" autocomplete="new-password"></div>
+<div class="bar">
+<button onclick="changeAdminPassword()" type="button">保存新密码</button>
+<button class="secondary" onclick="toggleAdminPasswordFields()" type="button">显示/隐藏</button>
+<span id="adminPasswordStatus" class="muted"></span>
+</div>
+</details>
 
 <div class="field">
 <label>访问密钥和 Base URL</label>
@@ -107,8 +135,10 @@ details{margin-top:22px}
 
 <div class="field">
 <label>程序请求地址</label>
-<div class="endpoint-grid"><span class="muted">Base URL</span><input id="programBaseUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programBaseUrl','Base URL')" type="button">复制</button></div>
+<div class="endpoint-grid"><span class="muted">OpenAI Base URL</span><input id="programBaseUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programBaseUrl','OpenAI Base URL')" type="button">复制</button></div>
+<div class="endpoint-grid"><span class="muted">Anthropic Base URL</span><input id="programAnthropicBaseUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programAnthropicBaseUrl','Anthropic Base URL')" type="button">复制</button></div>
 <div class="endpoint-grid"><span class="muted">模型列表</span><input id="programModelsUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programModelsUrl','模型列表地址')" type="button">复制</button></div>
+<div class="endpoint-grid"><span class="muted">Claude Code 模型</span><input id="programV2ModelsUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programV2ModelsUrl','Claude Code 模型列表')" type="button">复制</button></div>
 <div class="endpoint-grid"><span class="muted">健康检查</span><input id="programHealthUrl" type="text" readonly><button class="secondary" onclick="copyEndpoint('programHealthUrl','健康检查地址')" type="button">复制</button></div>
 <div class="endpoint-grid media-tool-row"><span class="muted">图片接口</span><button class="secondary" onclick="toggleMediaCurlMenu('image')" type="button">选择模型复制 curl</button><span id="mediaCount_image" class="media-count"></span><div id="mediaMenu_image" class="media-menu"></div></div>
 <div class="endpoint-grid media-tool-row"><span class="muted">视频接口</span><button class="secondary" onclick="toggleMediaCurlMenu('video')" type="button">选择模型复制 curl</button><span id="mediaCount_video" class="media-count"></span><div id="mediaMenu_video" class="media-menu"></div></div>
@@ -170,6 +200,15 @@ details{margin-top:22px}
 </div>
 <div class="muted">第三方 Agent 继续使用上面的 Base URL 和访问密钥，模型名填写 <code>auto</code>。</div>
 <div id="autoModelList" class="model-list"></div>
+<div class="field">
+<label>多模态候选模型</label>
+<div class="inline-field grow">
+<input id="autoVisionModelInput" placeholder="例如 Cline/google/gemini-3.1-pro-preview">
+<button class="secondary" onclick="addAutoVisionModel()" type="button">添加</button>
+</div>
+</div>
+<div class="muted">完整对话历史中存在图片时，由这里第一个可用模型接管；图片退出上下文后恢复普通候选。</div>
+<div id="autoVisionModelList" class="model-list"></div>
 <div class="bar"><button class="secondary" onclick="saveGateway()">保存 Auto 设置</button><span id="autoModelStatus" class="muted"></span></div>
 </div>
 </section>
@@ -204,9 +243,11 @@ details{margin-top:22px}
 
 <script>
 const fixedAPIProviderIDs=['glm','groq','deepseek','mimo'];
-const publishProviderIDs=['oc','mmf','qoder','gemini','kilo','cline'];
-const statusProviderIDs=['oc','mmf','qoder','gemini','kilo','cline','glm','groq','deepseek','mimo'];
+const publishProviderIDs=['oc','mmf','qoder','kilo','cline'];
+const statusProviderIDs=['oc','mmf','qoder','kilo','cline','glm','groq','deepseek','mimo'];
 let probeStopRequested=false;
+let expandedAPIProviderID='';
+const providerProbeControllers=new Map();
 function parseConfig(){ try { return JSON.parse(document.getElementById('cfg').value); } catch { return null; } }
 function showMainTab(name){
   ['api','oauth','auto','groups'].forEach(id=>{
@@ -231,13 +272,16 @@ function pathWithKey(path,cfg){
 }
 function setConfig(cfg){
   ensureBlankCustomProvider(cfg);
-  if(!cfg.auto_model) cfg.auto_model={enabled:false,models:[]};
+  if(!cfg.auto_model) cfg.auto_model={enabled:false,models:[],vision_models:[]};
+  if(!Array.isArray(cfg.auto_model.vision_models)) cfg.auto_model.vision_models=[];
   if(!Array.isArray(cfg.model_groups)) cfg.model_groups=[];
   document.getElementById('cfg').value=JSON.stringify(cfg,null,2);
   document.getElementById('accessKey').value=cfg.access_key || '';
   document.getElementById('baseUrl').value=location.origin+'/v1';
   document.getElementById('programBaseUrl').value=location.origin+'/v1';
+  document.getElementById('programAnthropicBaseUrl').value=location.origin+'/anthropic';
   document.getElementById('programModelsUrl').value=location.origin+'/v1/models';
+  document.getElementById('programV2ModelsUrl').value=location.origin+'/v2/models';
   document.getElementById('programHealthUrl').value=location.origin+'/health?format=json';
   document.getElementById('autoProbeEnabled').checked=!!cfg.auto_probe_enabled;
   document.getElementById('autoProbeInterval').value=cfg.auto_probe_interval_minutes || 60;
@@ -254,7 +298,9 @@ function providerConnected(p){
 function authStatus(p){ return (p && p.provider_specific_data && p.provider_specific_data.authStatus) || 'ok'; }
 function authError(p){ return (p && p.provider_specific_data && p.provider_specific_data.lastAuthError) || ''; }
 function manualOverride(p){ return !!(p && p.provider_specific_data && p.provider_specific_data.manualPublishOverride==='true'); }
-function isCustomProvider(p){ return !!(p && p.type==='openai' && /^custom/.test(p.id || '')); }
+function isCustomProvider(p){ return !!(p && ['openai','anthropic'].includes(p.type) && /^custom/.test(p.id || '')); }
+function isClaudeCodeProvider(p){ return !!(p && p.type==='anthropic' && providerDataValue(p,'anthropicRequestMode')==='claude-code'); }
+function isResponsesProvider(p){ return !!(p && p.type==='openai' && providerDataValue(p,'openaiRequestMode')==='responses'); }
 function providerRouteID(p){ return isCustomProvider(p) && String(p.name || '').trim() ? String(p.name).trim() : String((p && p.id) || ''); }
 function providerAPIKeys(p){ return unique([((p && p.api_key) || ''), ...((p && Array.isArray(p.api_keys)) ? p.api_keys : [])].map(x=>String(x || '').trim()).filter(Boolean)); }
 function hasMediaEndpoint(p){ return !!(p && ((p.image_endpoint || p.image_base_url || '').trim() || (p.image_edit_endpoint || '').trim() || (p.video_endpoint || p.video_base_url || '').trim() || (p.audio_endpoint || p.audio_base_url || '').trim() || (p.tts_endpoint || '').trim())); }
@@ -266,7 +312,7 @@ function ensureBlankCustomProvider(cfg){
   cfg.providers=cfg.providers.filter(p=>{
     if(!isCustomProvider(p) || customHasContent(p)) return true;
     if(blankKept) return false;
-    p.name=p.name || 'Custom OpenAI Compatible';
+    p.name=p.name || 'Custom Compatible';
     p.type='openai';
     p.enabled=false;
     p.base_url='';
@@ -295,13 +341,24 @@ function mediaModelMatches(kind,model){
   return words.some(word=>lower.includes(word));
 }
 function isMediaModel(model){ return mediaModelMatches('image',model) || mediaModelMatches('video',model) || mediaModelMatches('audio',model) || mediaModelMatches('tts',model); }
-function chatProbeModels(p){ return unique((p && p.models) || []).filter(model=>!isMediaModel(model)); }
+function providerModelKind(p,model){
+  const value=String((p && p.model_kinds && p.model_kinds[model]) || 'auto').toLowerCase();
+  return ['text','image','video','audio','tts'].includes(value) ? value : 'auto';
+}
+function providerModelMatchesKind(p,kind,model){
+  const explicit=providerModelKind(p,model);
+  if(explicit==='text') return false;
+  if(explicit!=='auto') return explicit===kind;
+  return mediaModelMatches(kind,model);
+}
+function providerIsMediaModel(p,model){ return ['image','video','audio','tts'].some(kind=>providerModelMatchesKind(p,kind,model)); }
+function chatProbeModels(p){ return unique((p && p.models) || []).filter(model=>!providerIsMediaModel(p,model)); }
 function mediaModelsForKind(cfg,kind){
   const out=[];
   ((cfg && cfg.providers) || []).forEach(p=>{
     if(!p || !p.enabled || !mediaEndpointValue(p,kind)) return;
     const route=providerRouteID(p);
-    selectedModels(p).filter(model=>mediaModelMatches(kind,model)).forEach(model=>out.push({provider:p.id,name:p.name || p.id,model,full:route+'/'+model}));
+    selectedModels(p).filter(model=>providerModelMatchesKind(p,kind,model)).forEach(model=>out.push({provider:p.id,name:p.name || p.id,model,full:route+'/'+model}));
   });
   return out;
 }
@@ -471,19 +528,26 @@ function visibleModels(p){
 function lockedModels(p){ return unique((p && p.locked_models) || []); }
 function isLockedModel(p,model){ return lockedModels(p).includes(model); }
 function autoModels(cfg){ return unique((cfg && cfg.auto_model && cfg.auto_model.models) || []); }
+function autoVisionModels(cfg){ return unique((cfg && cfg.auto_model && cfg.auto_model.vision_models) || []); }
 function renderAutoModels(cfg){
   const root=document.getElementById('autoModelList'); if(!root) return;
   const models=autoModels(cfg);
   root.innerHTML=models.length ? models.map((model,i)=>'<div class="model-item"><span class="model-name">'+esc(model)+'</span><button class="small secondary" onclick="moveAutoModel('+i+',-1)" '+(i===0?'disabled':'')+'>上移</button><button class="small secondary" onclick="moveAutoModel('+i+',1)" '+(i===models.length-1?'disabled':'')+'>下移</button><button class="small secondary" onclick="removeAutoModel('+i+')">删除</button></div>').join('') : '<div class="muted">还没有候选模型。</div>';
+  const visionRoot=document.getElementById('autoVisionModelList'); if(!visionRoot) return;
+  const visionModels=autoVisionModels(cfg);
+  visionRoot.innerHTML=visionModels.length ? visionModels.map((model,i)=>'<div class="model-item"><span class="model-name">'+esc(model)+'</span><button class="small secondary" onclick="moveAutoVisionModel('+i+',-1)" '+(i===0?'disabled':'')+'>上移</button><button class="small secondary" onclick="moveAutoVisionModel('+i+',1)" '+(i===visionModels.length-1?'disabled':'')+'>下移</button><button class="small secondary" onclick="removeAutoVisionModel('+i+')">删除</button></div>').join('') : '<div class="muted">还没有多模态候选模型。</div>';
 }
-function updateAutoModels(mutator){
+function updateAutoModelList(key,mutator){
   const cfg=parseConfig(); if(!cfg) return;
-  if(!cfg.auto_model) cfg.auto_model={enabled:false,models:[]};
+  if(!cfg.auto_model) cfg.auto_model={enabled:false,models:[],vision_models:[]};
   cfg.auto_model.enabled=!!document.getElementById('autoModelEnabled').checked;
   cfg.auto_model.models=autoModels(cfg);
-  mutator(cfg.auto_model.models);
+  cfg.auto_model.vision_models=autoVisionModels(cfg);
+  mutator(cfg.auto_model[key]);
   setConfig(cfg);
 }
+function updateAutoModels(mutator){ updateAutoModelList('models',mutator); }
+function updateAutoVisionModels(mutator){ updateAutoModelList('vision_models',mutator); }
 function addAutoModel(){
   const input=document.getElementById('autoModelInput'); const value=(input && input.value || '').trim();
   if(!value || value==='auto'){ setText('autoModelStatus','err','请输入真实模型 ID，例如 oc/big-pickle'); return; }
@@ -507,10 +571,29 @@ function moveAutoModel(index, delta){
   });
   setText('autoModelStatus','ok','已调整顺序，记得保存');
 }
+function addAutoVisionModel(){
+  const input=document.getElementById('autoVisionModelInput'); const value=(input && input.value || '').trim();
+  if(!value || value==='auto'){ setText('autoModelStatus','err','请输入支持图片理解的真实模型 ID'); return; }
+  if(!value.includes('/')){ setText('autoModelStatus','err','多模态候选需要使用 provider/model 格式'); return; }
+  updateAutoVisionModels(models=>{ models.push(value); });
+  if(input) input.value='';
+  setText('autoModelStatus','ok','已添加多模态候选，记得保存');
+}
+function addAutoVisionModelValue(source){
+  const value=(typeof source==='string' ? source : (source && source.getAttribute('data-model')) || '').trim();
+  if(!value || value==='auto' || !value.includes('/')){ setText('autoModelStatus','err','多模态候选需要使用 provider/model 格式'); return; }
+  updateAutoVisionModels(models=>{ models.push(value); });
+  setText('autoModelStatus','ok','已加入多模态候选，记得保存');
+}
+function removeAutoVisionModel(index){ updateAutoVisionModels(models=>{ models.splice(index,1); }); setText('autoModelStatus','ok','已移除多模态候选，记得保存'); }
+function moveAutoVisionModel(index,delta){
+  updateAutoVisionModels(models=>{ const next=index+delta; if(next<0 || next>=models.length) return; const item=models[index]; models.splice(index,1); models.splice(next,0,item); });
+  setText('autoModelStatus','ok','已调整多模态候选顺序，记得保存');
+}
 function publishedGroupModels(cfg){
   const out=[];
-  ((cfg && cfg.providers) || []).filter(p=>p && p.enabled).forEach(p=>{
-    visibleModels(p).filter(model=>!isMediaModel(model)).forEach(model=>out.push(providerRouteID(p)+'/'+model));
+  ((cfg && cfg.providers) || []).filter(p=>p && p.enabled && !isClaudeCodeProvider(p)).forEach(p=>{
+    visibleModels(p).filter(model=>!providerIsMediaModel(p,model)).forEach(model=>out.push(providerRouteID(p)+'/'+model));
   });
   if(cfg && cfg.auto_model && cfg.auto_model.enabled) out.push('auto');
   return unique(out).sort();
@@ -625,7 +708,6 @@ function modelRows(p){
 */
 function oauthControls(id){
   if(id==='qoder') return '<div class="bar"><button class="small" onclick="startQoder()">开始登录</button><button class="small secondary" onclick="pollQoder()">轮询令牌</button><span id="qoderStatus" class="muted"></span></div>';
-  if(id==='gemini') return '<div class="bar"><button class="small" onclick="startGemini()">开始登录</button><span id="geminiStatus" class="muted"></span></div>';
   if(id==='kilo') return '<div class="bar"><button class="small" onclick="startKilo()">开始登录</button><button class="small secondary" onclick="pollKilo()">轮询令牌</button><span id="kiloStatus" class="muted"></span></div>';
   if(id==='cline') return '<div class="bar"><button class="small" onclick="startCline()">开始登录</button><span id="clineStatus" class="muted"></span></div>';
   return '';
@@ -637,8 +719,8 @@ function fetchOAuthModelsButton(p){
 }
 function providerCategory(p){
   if(!p) return 'Provider';
-  if(isCustomProvider(p)) return 'Custom';
-  if(['kilo','cline','gemini'].includes(p.id)) return 'OAuth';
+  if(isCustomProvider(p)) return p.type==='anthropic' ? (providerDataValue(p,'anthropicRequestMode')==='claude-code' ? 'Custom Claude Code' : 'Custom Anthropic') : (isResponsesProvider(p) ? 'Custom Responses' : 'Custom OpenAI');
+  if(['kilo','cline'].includes(p.id)) return 'OAuth';
   if(['oc','mmf','qoder'].includes(p.id) || String(p.type || '').includes('free')) return 'Free';
   if(p.type==='openai') return 'API Key';
   return p.type || 'Provider';
@@ -658,9 +740,12 @@ function modelRows(p){
     const toggle='<input type="checkbox" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" '+(checked?'checked':'')+'>';
     const remove='<button class="delete-model secondary" type="button" title="删除模型" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" onclick="deleteProviderModel(this)">−</button>';
     const addAuto='<button class="add-auto-model secondary" type="button" title="Add to Auto" data-model="'+esc(providerRouteID(p)+'/'+model)+'" onclick="addAutoModelValue(this)">+</button>';
+    const addVision=providerIsMediaModel(p,model)?'':'<button class="add-auto-model secondary" type="button" title="加入多模态候选" data-model="'+esc(providerRouteID(p)+'/'+model)+'" onclick="addAutoVisionModelValue(this)">图</button>';
     const locked=isLockedModel(p,model);
     const lock='<button class="model-lock secondary '+(locked?'locked':'')+'" type="button" title="'+(locked?'已上锁：一键/定时探测会跳过':'未上锁：一键/定时探测会包含')+'" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" onclick="toggleModelLock(this)">'+(locked?'🔒':'🔓')+'</button>';
-    return '<div class="model-item '+(usable?'':'off')+'">'+toggle+remove+addAuto+lock+'<span class="model-name">'+esc(model)+note+latencyHTML(p,model)+(usable?'':modelErrorHTML(p,model))+'</span></div>';
+    const kind=providerModelKind(p,model);
+    const kindSelect='<select class="model-kind-select" title="模型类型" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" onchange="saveModelKind(this)">'+[['auto','自动'],['text','文本'],['image','图片'],['video','视频'],['audio','音频'],['tts','TTS']].map(item=>'<option value="'+item[0]+'" '+(kind===item[0]?'selected':'')+'>'+item[1]+'</option>').join('')+'</select>';
+    return '<div class="model-item '+(usable?'':'off')+'">'+toggle+remove+addAuto+addVision+lock+kindSelect+'<span class="model-name">'+esc(model)+note+latencyHTML(p,model)+(usable?'':modelErrorHTML(p,model))+'</span></div>';
   }).join('');
 }
 function renderProviderStatus(){
@@ -776,10 +861,24 @@ function defaultCurlTemplate(kind){
   if(kind==='tts') return 'curl -G "{{endpoint}}" \\\n  --data-urlencode "text={{tts_text}}" \\\n  --data-urlencode "voice={{model}}" \\\n  --output output.mp3';
   return '';
 }
+function customProtocolField(p,id){
+  if(!isCustomProvider(p)) return '';
+  const mode=providerDataValue(p,'anthropicRequestMode')==='claude-code' ? 'claude-code' : 'standard';
+  const protocol=p.type==='anthropic' ? 'anthropic' : (isResponsesProvider(p) ? 'responses' : 'openai');
+  return '<div class="field"><label>上游协议</label><select id="protocol_'+esc(id)+'" onchange="syncAnthropicRequestMode(\''+esc(id)+'\')"><option value="openai" '+(protocol==='openai'?'selected':'')+'>OpenAI Compatible</option><option value="responses" '+(protocol==='responses'?'selected':'')+'>OpenAI Responses</option><option value="anthropic" '+(protocol==='anthropic'?'selected':'')+'>Anthropic Compatible</option></select></div>'
+    +'<div class="field"><label>Anthropic 请求模式</label><select id="anthropicMode_'+esc(id)+'" '+(p.type==='anthropic'?'':'disabled')+'><option value="standard" '+(mode==='standard'?'selected':'')+'>标准 Anthropic</option><option value="claude-code" '+(mode==='claude-code'?'selected':'')+'>Claude Code 兼容</option></select><span class="muted">兼容模式保真转发 Claude Code；模型探测只校验上游模型列表。</span></div>';
+}
+function syncAnthropicRequestMode(id){
+  const protocol=document.getElementById('protocol_'+id); const mode=document.getElementById('anthropicMode_'+id);
+  if(mode) mode.disabled=!(protocol && protocol.value==='anthropic');
+}
 function renderAPIProviders(){
   const root=document.getElementById('apiProviders'); const cfg=parseConfig();
   if(!cfg || !Array.isArray(cfg.providers)){ root.innerHTML=''; return; }
-  root.innerHTML=apiProviderIDs(cfg).map(id=>{
+  const providerIDs=apiProviderIDs(cfg);
+  if(!expandedAPIProviderID || !providerIDs.includes(expandedAPIProviderID)) expandedAPIProviderID=providerIDs[0] || '';
+  const navItems=[]; const detailItems=[];
+  providerIDs.forEach(id=>{
     const p=cfg.providers.find(x=>x.id===id); if(!p) return '';
     const isCustom=isCustomProvider(p);
     const listControls=apiModelsLoaded(p) ? '<div class="bar"><button class="small secondary" onclick="selectProviderModels(\''+id+'\',true)">全选</button><button class="small secondary" onclick="selectProviderModels(\''+id+'\',false)">取消所有选择</button></div>' : '';
@@ -787,9 +886,26 @@ function renderAPIProviders(){
     const count=apiModelsLoaded(p) ? '<div class="muted">已拉取 '+p.models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div>' : '';
     const deleteButton='<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="deleteAPIProvider(\''+id+'\')">删除卡片</button></div>';
     const probeCount=chatProbeModels(p).length;
-    return '<div class="api-card"><div class="api-head"><strong>'+esc(p.name)+'</strong><span class="api-meta">'+esc(p.id)+'</span></div>'+(isCustom?'<div class="field"><label>名称</label><input id="name_'+id+'" value="'+esc(p.name || '')+'" placeholder="自定义源"></div>':'')+'<label class="toggle"><input type="checkbox" id="enabled_'+id+'" onchange="saveAPIProvider(\''+id+'\')" '+(p.enabled?'checked':'')+'> 启用</label><div class="field"><label>Base URL</label><input id="base_'+id+'" value="'+esc(p.base_url || '')+'" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="key_'+id+'" value="'+esc(p.api_key || '')+'" placeholder="sk-..."></div><div class="bar"><button onclick="saveAPIProvider(\''+id+'\')">保存</button><button class="secondary" onclick="fetchAPIProviderModels(\''+id+'\')">保存并拉取模型</button><span id="apiStatus_'+id+'" class="muted"></span></div><div class="field"><label>手动添加模型</label><div class="inline-field grow"><input id="manualModel_'+id+'" placeholder="model-id"><button class="secondary" onclick="addAPIModel(\''+id+'\')" type="button">添加</button></div></div><div class="bar"><button class="small" onclick="probeProvider(\''+id+'\',\'apiStatus_'+id+'\')" '+(!providerConnected(p) || !apiModelsLoaded(p) || !probeCount?'disabled':'')+'>探测可用</button><button class="small secondary" onclick="saveModelSelection(\''+id+'\',\'apiStatus_'+id+'\')" '+(!apiModelsLoaded(p)?'disabled':'')+'>保存发布</button></div><div id="probeProgress_'+id+'" class="progress-wrap"><progress value="0" max="'+probeCount+'"></progress><span class="muted">0/'+probeCount+'</span></div>'+count+listControls+rows+deleteButton+'</div>';
-  }).join('');
+    const selected=expandedAPIProviderID===id;
+    const stateDot=p.enabled?'green-dot':'gray-dot';
+    const stateText=p.enabled?'已启用':'未启用';
+    navItems.push('<button class="api-provider-nav'+(selected?' active':'')+'" type="button" data-api-provider-nav="'+esc(id)+'" onclick="toggleAPIProviderCard(\''+id+'\')" aria-selected="'+(selected?'true':'false')+'"><span class="api-provider-nav-main"><span class="'+stateDot+'"></span><strong>'+esc(p.name)+'</strong></span><span class="api-provider-nav-state">'+stateText+'</span></button>');
+    const details='<div class="api-head"><strong>'+esc(p.name)+'</strong><span class="api-meta">'+esc(p.id)+'</span></div>'+(isCustom?'<div class="field"><label>名称</label><input id="name_'+id+'" value="'+esc(p.name || '')+'" placeholder="自定义源"></div>':'')+customProtocolField(p,id)+'<label class="toggle"><input type="checkbox" id="enabled_'+id+'" onchange="saveAPIProvider(\''+id+'\')" '+(p.enabled?'checked':'')+'> 启用</label><div class="field"><label>Base URL</label><input id="base_'+id+'" value="'+esc(p.base_url || '')+'" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="key_'+id+'" value="'+esc(p.api_key || '')+'" placeholder="sk-..."></div><div class="bar"><button onclick="saveAPIProvider(\''+id+'\')">保存</button><button class="secondary" onclick="fetchAPIProviderModels(\''+id+'\')">保存并拉取模型</button><span id="apiStatus_'+id+'" class="muted"></span></div><div class="field"><label>手动添加模型</label><div class="inline-field grow"><input id="manualModel_'+id+'" placeholder="model-id"><button class="secondary" onclick="addAPIModel(\''+id+'\')" type="button">添加</button></div></div><div class="bar"><button id="probeStart_'+id+'" class="small" onclick="probeProvider(\''+id+'\',\'apiStatus_'+id+'\')" '+(!providerConnected(p) || !apiModelsLoaded(p) || !probeCount || providerProbeControllers.has(id)?'disabled':'')+'>探测可用</button><button id="probeStop_'+id+'" class="small secondary" onclick="stopProviderProbe(\''+id+'\',\'apiStatus_'+id+'\')" '+(providerProbeControllers.has(id)?'':'disabled')+'>停止探测</button><button class="small secondary" onclick="saveModelSelection(\''+id+'\',\'apiStatus_'+id+'\')" '+(!apiModelsLoaded(p)?'disabled':'')+'>保存发布</button></div><div id="probeProgress_'+id+'" class="progress-wrap"><progress value="0" max="'+probeCount+'"></progress><span class="muted">0/'+probeCount+'</span></div>'+count+listControls+rows+deleteButton;
+    detailItems.push('<div class="api-card api-provider-detail'+(selected?' active':'')+'" data-api-provider-detail="'+esc(id)+'">'+details+'</div>');
+  });
+  root.innerHTML='<div class="api-provider-list">'+navItems.join('')+'</div><div class="api-provider-detail-pane">'+detailItems.join('')+'</div>';
   hydrateCustomKeyEditors(cfg);
+}
+function toggleAPIProviderCard(id){
+  expandedAPIProviderID=id;
+  document.querySelectorAll('[data-api-provider-nav]').forEach(button=>{
+    const selected=button.getAttribute('data-api-provider-nav')===id;
+    button.classList.toggle('active',selected);
+    button.setAttribute('aria-selected',selected?'true':'false');
+  });
+  document.querySelectorAll('[data-api-provider-detail]').forEach(detail=>{
+    detail.classList.toggle('active',detail.getAttribute('data-api-provider-detail')===id);
+  });
 }
 function renderPublishProviders(){
   const root=document.getElementById('publishProviders'); const cfg=parseConfig();
@@ -803,7 +919,7 @@ function renderPublishProviders(){
     const listControls=models.length ? '<div class="bar"><button class="small secondary" onclick="selectProviderModels(\''+p.id+'\',true)">全选</button><button class="small secondary" onclick="selectProviderModels(\''+p.id+'\',false)">取消所有选择</button></div>' : '';
     const rows=models.length ? '<div class="model-list">'+modelRows(p)+'</div>' : '<div class="muted">登录或拉取后会显示模型。</div>';
     const probeCount=chatProbeModels(p).length;
-    return '<div class="card">'+providerTitleHTML(p,connected?'green-dot':'gray-dot')+oauthControls(p.id)+authText+'<div class="muted">已加载 '+models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div><div class="bar">'+fetchOAuthModelsButton(p)+'<button class="small" onclick="probeProvider(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!connected || !probeCount?'disabled':'')+'>探测可用</button><button class="small secondary" onclick="saveModelSelection(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!models.length?'disabled':'')+'>保存发布列表</button><span id="publishStatus_'+p.id+'" class="muted"></span></div><div id="probeProgress_'+p.id+'" class="progress-wrap"><progress value="0" max="'+probeCount+'"></progress><span class="muted">0/'+probeCount+'</span></div>'+listControls+rows+'<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="disableProvider(\''+p.id+'\')">停用</button></div></div>';
+    return '<div class="card">'+providerTitleHTML(p,connected?'green-dot':'gray-dot')+oauthControls(p.id)+authText+'<div class="muted">已加载 '+models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div><div class="bar">'+fetchOAuthModelsButton(p)+'<button id="probeStart_'+p.id+'" class="small" onclick="probeProvider(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!connected || !probeCount || providerProbeControllers.has(p.id)?'disabled':'')+'>探测可用</button><button id="probeStop_'+p.id+'" class="small secondary" onclick="stopProviderProbe(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(providerProbeControllers.has(p.id)?'':'disabled')+'>停止探测</button><button class="small secondary" onclick="saveModelSelection(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!models.length?'disabled':'')+'>保存发布列表</button><span id="publishStatus_'+p.id+'" class="muted"></span></div><div id="probeProgress_'+p.id+'" class="progress-wrap"><progress value="0" max="'+probeCount+'"></progress><span class="muted">0/'+probeCount+'</span></div>'+listControls+rows+'<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="disableProvider(\''+p.id+'\')">停用</button></div></div>';
   });
   root.innerHTML=items.join('') || '<div class="muted">还没有可发布的模型。</div>';
 }
@@ -813,7 +929,10 @@ function buildAPIProvider(id){
   const prev=cfg.providers.find(x=>x.id===id); if(!prev) throw new Error('provider not found: '+id);
   const custom=isCustomProvider(prev);
   const keys=apiKeyValues(id);
-  const next={ ...prev, name:custom?(document.getElementById('name_'+id).value.trim() || prev.name || 'Custom OpenAI Compatible'):prev.name, enabled:!!document.getElementById('enabled_'+id).checked, base_url:document.getElementById('base_'+id).value.trim(), api_key:keys[0] || '' };
+  const protocol=custom ? document.getElementById('protocol_'+id) : null;
+  const protocolValue=protocol ? protocol.value : '';
+  const next={ ...prev, name:custom?(document.getElementById('name_'+id).value.trim() || prev.name || 'Custom Compatible'):prev.name, enabled:!!document.getElementById('enabled_'+id).checked, base_url:document.getElementById('base_'+id).value.trim(), api_key:keys[0] || '' };
+  if(custom) next.type=protocolValue==='anthropic' ? 'anthropic' : 'openai';
   if(custom && next.name.includes('/')) throw new Error('自定义渠道名称不能包含 /');
   next.image_endpoint=mediaBaseInputValue(id,'image');
   next.image_edit_endpoint=mediaBaseInputValue(id,'image_edit');
@@ -832,6 +951,9 @@ function buildAPIProvider(id){
   delete psd.active_key_index;
   delete psd.failed_key_indexes;
   Object.keys(psd).forEach(key=>{ if(key.startsWith('failed_key_indexes_model_')) delete psd[key]; });
+  const anthropicMode=document.getElementById('anthropicMode_'+id);
+  if(custom && next.type==='anthropic' && anthropicMode && anthropicMode.value==='claude-code') psd.anthropicRequestMode='claude-code'; else delete psd.anthropicRequestMode;
+  if(custom && next.type==='openai' && protocolValue==='responses') psd.openaiRequestMode='responses'; else delete psd.openaiRequestMode;
   [['curlTemplateImage','image'],['curlTemplateVideo','video'],['curlTemplateAudio','audio'],['curlTemplateTTS','tts']].forEach(([key,kind])=>{
     const value=templateFieldValue(id,key);
     if(value && value!==defaultCurlTemplate(kind)) psd[key]=value; else delete psd[key];
@@ -847,6 +969,7 @@ function remapProviderRouteRefs(cfg,prev,next){
   if(!oldRoute || !newRoute || oldRoute===newRoute) return;
   const remap=value=>String(value || '').startsWith(oldRoute+'/') ? newRoute+String(value).slice(oldRoute.length) : value;
   if(cfg.auto_model && Array.isArray(cfg.auto_model.models)) cfg.auto_model.models=unique(cfg.auto_model.models.map(remap));
+  if(cfg.auto_model && Array.isArray(cfg.auto_model.vision_models)) cfg.auto_model.vision_models=unique(cfg.auto_model.vision_models.map(remap));
   (cfg.model_groups || []).forEach(group=>{ group.models=unique((group.models || []).map(remap)); });
 }
 async function saveConfigObject(cfg){ const res=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(cfg)}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); return data; }
@@ -898,10 +1021,30 @@ function applyGatewaySettings(cfg){
   cfg.access_key=document.getElementById('accessKey').value.trim();
   cfg.auto_probe_enabled=!!document.getElementById('autoProbeEnabled').checked;
   cfg.auto_probe_interval_minutes=parseInt(document.getElementById('autoProbeInterval').value || '60',10);
-  cfg.auto_model={enabled:!!document.getElementById('autoModelEnabled').checked,models:autoModels(cfg)};
+  cfg.auto_model={enabled:!!document.getElementById('autoModelEnabled').checked,models:autoModels(cfg),vision_models:autoVisionModels(cfg)};
   return cfg;
 }
 async function saveGateway(){ try{ const cfg=parseConfig(); if(!cfg) throw new Error('config is invalid'); applyGatewaySettings(cfg); ensureBlankCustomProvider(cfg); await saveConfigObject(cfg); await reloadConfig(); setText('status','ok','已保存'); }catch(e){ setText('status','err',e.message); } }
+function toggleAdminPasswordFields(){
+  ['adminCurrentPassword','adminNewPassword','adminConfirmPassword'].forEach(id=>{
+    const el=document.getElementById(id); if(el) el.type=el.type==='password'?'text':'password';
+  });
+}
+async function changeAdminPassword(){
+  try{
+    const current=document.getElementById('adminCurrentPassword').value;
+    const next=document.getElementById('adminNewPassword').value;
+    const confirmPassword=document.getElementById('adminConfirmPassword').value;
+    if(next!==confirmPassword) throw new Error('两次输入的新密码不一致');
+    if(next.trim().length<8) throw new Error('新密码至少需要 8 个字符');
+    setText('adminPasswordStatus','muted','正在保存...');
+    const res=await fetch('/api/admin/password',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({current_password:current,new_password:next})});
+    const data=await res.json();
+    if(!res.ok) throw new Error(data.error || res.statusText);
+    setText('adminPasswordStatus','ok','密码已修改，正在返回登录页...');
+    window.setTimeout(()=>{ window.location.href='/admin'; },500);
+  }catch(e){ setText('adminPasswordStatus','err',e.message); }
+}
 function toggleAccessKey(){ const el=document.getElementById('accessKey'); el.type=el.type==='password'?'text':'password'; }
 async function copyTextValue(value){
   if(navigator.clipboard && navigator.clipboard.writeText){
@@ -1012,6 +1155,29 @@ async function addAPIModel(id){
 function selectProviderModels(id, checked){
   document.querySelectorAll('input[data-provider="'+id+'"][data-model]').forEach(node=>{ node.checked=!!checked; });
 }
+async function saveModelKind(select){
+  const id=select.getAttribute('data-provider');
+  const model=select.getAttribute('data-model');
+  const kind=select.value;
+  const statusID=document.getElementById('publishStatus_'+id)?'publishStatus_'+id:'apiStatus_'+id;
+  try{
+    const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid');
+    cfg.providers=cfg.providers.map(p=>{
+      if(p.id!==id) return p;
+      p={...p};
+      const kinds={...(p.model_kinds || {})};
+      if(kind==='auto') delete kinds[model]; else kinds[model]=kind;
+      if(Object.keys(kinds).length) p.model_kinds=kinds; else delete p.model_kinds;
+      return p;
+    });
+    await saveConfigObject(cfg);
+    await reloadConfig();
+    const label={auto:'自动',text:'文本',image:'图片',video:'视频',audio:'音频',tts:'TTS'}[kind] || kind;
+    setText(statusID,'ok',model+' 已设为 '+label+' 类型');
+  }catch(e){
+    setText(statusID,'err','保存模型类型失败：'+e.message);
+  }
+}
 async function toggleModelLock(button){
   try{
     const id=button.getAttribute('data-provider');
@@ -1036,34 +1202,37 @@ function stopProbe(){
   probeStopRequested=true;
   setText('probeAllStatus','muted','正在停止，当前请求完成后不再继续。');
 }
-async function probeOneModel(id, model, autoPublish, dropUnavailable){ if(dropUnavailable===undefined) dropUnavailable=!autoPublish; const res=await fetch('/api/provider/probe-model',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id, model, auto_publish:!!autoPublish, drop_unavailable_on_failure:!!dropUnavailable})}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); return data; }
+async function probeOneModel(id, model, autoPublish, dropUnavailable, signal){ if(dropUnavailable===undefined) dropUnavailable=!autoPublish; const options={method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id, model, auto_publish:!!autoPublish, drop_unavailable_on_failure:!!dropUnavailable})}; if(signal) options.signal=signal; const res=await fetch('/api/provider/probe-model',options); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); return data; }
+function setProviderProbeButtons(id,running){ const start=document.getElementById('probeStart_'+id); const stop=document.getElementById('probeStop_'+id); if(start) start.disabled=!!running; if(stop) stop.disabled=!running; }
+function stopProviderProbe(id,statusID){ const controller=providerProbeControllers.get(id); if(!controller) return; controller.abort(); const stop=document.getElementById('probeStop_'+id); if(stop) stop.disabled=true; setText(statusID || 'publishStatus_'+id,'muted','正在停止当前卡片探测...'); }
 async function probeProvider(id, statusID){
-  probeStopRequested=false;
+  if(providerProbeControllers.has(id)) return;
   const cfg=parseConfig(); const p=cfg.providers.find(x=>x.id===id); if(!p) return;
   const models=chatProbeModels(p); let ok=0; let failed=0; statusID=statusID || 'publishStatus_'+id; setProgress('probeProgress_'+id,0,models.length);
   if(!models.length){ setText(statusID,'muted','没有可探测的文本模型，多媒体模型已跳过。'); return; }
+  const controller=new AbortController(); providerProbeControllers.set(id,controller); setProviderProbeButtons(id,true);
   setText(statusID,'muted','正在探测...');
-  let done=0;
+  let done=0; let stopped=false;
   for(let i=0;i<models.length;i++){
-    if(probeStopRequested) break;
     setText(statusID,'muted','正在探测 '+(i+1)+'/'+models.length+'：'+models[i]);
     try{
-      const data=await probeOneModel(id,models[i],false);
+      const data=await probeOneModel(id,models[i],false,undefined,controller.signal);
       if(data.ok) ok++;
     }catch(e){
+      if(e && e.name==='AbortError'){ stopped=true; break; }
       failed++;
       setText(statusID,'err','探测失败：'+e.message);
     }
     done=i+1; setProgress('probeProgress_'+id,done,models.length);
   }
-  await reloadConfig(); setText(statusID,probeStopRequested?'muted':(failed?'err':'ok'),(probeStopRequested?'已停止，已探测 ':'可用 ')+ok+' 个模型'+(failed?'，失败 '+failed+' 个':''));
+  providerProbeControllers.delete(id); await reloadConfig(); setText(statusID,stopped?'muted':(failed?'err':'ok'),stopped?'已停止，已探测 '+done+'/'+models.length+'，可用 '+ok+' 个模型':'可用 '+ok+' 个模型'+(failed?'，失败 '+failed+' 个':''));
 }
 async function probeAllProviders(){
   probeStopRequested=false;
   const cfg=parseConfig(); const providers=cfg.providers.filter(p=>providerConnected(p) && visibleModels(p).length);
   const jobs=[]; providers.forEach(p=>{
     const locked=new Set(lockedModels(p));
-    visibleModels(p).filter(model=>!locked.has(model) && !isMediaModel(model)).forEach(model=>jobs.push({id:p.id,model}));
+    visibleModels(p).filter(model=>!locked.has(model) && !providerIsMediaModel(p,model)).forEach(model=>jobs.push({id:p.id,model}));
   });
   let ok=0; let failed=0; setProgress('probeAllProgress',0,jobs.length); setText('probeAllStatus','muted','正在探测...');
   if(!jobs.length){ setText('probeAllStatus','muted','没有可探测的文本模型，或模型都已上锁。'); return; }
@@ -1103,7 +1272,6 @@ async function deleteProviderModel(button){
 async function save(){ try{ const body=JSON.parse(document.getElementById('cfg').value); applyGatewaySettings(body); ensureBlankCustomProvider(body); const res=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); setText('status','ok','已保存'); renderProviderStatus(); renderAPIProviders(); renderPublishProviders(); }catch(e){ setText('status','err',e.message); } }
 async function startQoder(){ try{ const data=await (await fetch('/api/oauth/qoder/device-code')).json(); localStorage.setItem('qoder_flow', JSON.stringify(data)); window.open(data.verification_uri_complete, '_blank', 'noopener,noreferrer'); setText('qoderStatus','ok','已打开 Qoder 登录页，完成登录后点击轮询令牌。'); }catch(e){ setText('qoderStatus','err',e.message); } }
 async function pollQoder(){ try{ const flow=JSON.parse(localStorage.getItem('qoder_flow')||'{}'); if(!flow.device_code || !flow.codeVerifier) throw new Error('请先开始 Qoder 登录'); const res=await fetch('/api/oauth/qoder/poll',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({ deviceCode: flow.device_code, codeVerifier: flow.codeVerifier, extraData: {_qoderMachineId: flow._qoderMachineId, _qoderNonce: flow._qoderNonce, _qoderVerifier: flow.codeVerifier} })}); const data=await res.json(); if(data.pending){ setText('qoderStatus','muted','还在等待授权完成...'); return; } if(!res.ok || !data.success) throw new Error(data.errorDescription || data.error || 'poll failed'); localStorage.removeItem('qoder_flow'); await reloadConfig(); setText('qoderStatus','ok','Qoder 已连接。'); }catch(e){ setText('qoderStatus','err',e.message); } }
-async function startGemini(){ try{ const data=await (await fetch('/api/oauth/gemini/authorize')).json(); if(!data.authUrl) throw new Error(data.error || 'missing auth url'); window.open(data.authUrl, '_blank', 'noopener,noreferrer'); setText('geminiStatus','ok','已打开 Gemini 登录页，回调完成后会自动保存令牌。'); }catch(e){ setText('geminiStatus','err',e.message); } }
 async function startKilo(){ try{ const data=await (await fetch('/api/oauth/kilo/device-code')).json(); localStorage.setItem('kilo_flow', JSON.stringify(data)); window.open(data.verification_uri_complete, '_blank', 'noopener,noreferrer'); setText('kiloStatus','ok','已打开 Kilo 登录页，完成登录后点击轮询令牌。'); }catch(e){ setText('kiloStatus','err',e.message); } }
 async function pollKilo(){ try{ const flow=JSON.parse(localStorage.getItem('kilo_flow')||'{}'); if(!flow.device_code) throw new Error('请先开始 Kilo 登录'); const res=await fetch('/api/oauth/kilo/poll',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({deviceCode: flow.device_code})}); const data=await res.json(); if(data.pending){ setText('kiloStatus','muted','还在等待授权完成...'); return; } if(!res.ok || !data.success) throw new Error(data.errorDescription || data.error || 'poll failed'); localStorage.removeItem('kilo_flow'); await reloadConfig(); setText('kiloStatus','ok','Kilo 已连接。'); }catch(e){ setText('kiloStatus','err',e.message); } }
 async function startCline(){ try{ const data=await (await fetch('/api/oauth/cline/authorize')).json(); window.open(data.authUrl, '_blank', 'noopener,noreferrer'); setText('clineStatus','ok','已打开 Cline 登录页，回调完成后会自动保存令牌。'); }catch(e){ setText('clineStatus','err',e.message); } }

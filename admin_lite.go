@@ -85,8 +85,6 @@ details{margin-top:22px}
 <span id="qoderStatus" class="muted"></span>
 </div>
 <div class="bar">
-<button onclick="startGemini()">开始 Gemini 登录</button>
-<span id="geminiStatus" class="muted"></span>
 </div>
 <div class="bar">
 <button onclick="startKilo()">开始 Kilo 登录</button>
@@ -119,7 +117,7 @@ details{margin-top:22px}
 
 <script>
 const apiProviderIDs=['glm','groq','deepseek','mimo','custom'];
-const statusProviderIDs=['oc','mmf','qoder','gemini','kilo','cline','glm','groq','deepseek','mimo','custom'];
+const statusProviderIDs=['oc','mmf','qoder','kilo','cline','glm','groq','deepseek','mimo','custom'];
 function parseConfig(){ try { return JSON.parse(document.getElementById('cfg').value); } catch { return null; } }
 function setConfig(cfg){
   document.getElementById('cfg').value=JSON.stringify(cfg,null,2);
@@ -213,7 +211,6 @@ async function saveModelSelection(id){ try{ const nodes=[...document.querySelect
 async function save(){ try{ const body=JSON.parse(document.getElementById('cfg').value); applyGatewaySettings(body); const res=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); setText('status','ok','已保存'); renderProviderStatus(); renderAPIProviders(); renderPublishProviders(); }catch(e){ setText('status','err',e.message); } }
 async function startQoder(){ try{ const data=await (await fetch('/api/oauth/qoder/device-code')).json(); localStorage.setItem('qoder_flow', JSON.stringify(data)); window.open(data.verification_uri_complete, '_blank', 'noopener,noreferrer'); setText('qoderStatus','ok','已打开 Qoder 登录页，完成登录后点击轮询。'); }catch(e){ setText('qoderStatus','err',e.message); } }
 async function pollQoder(){ try{ const flow=JSON.parse(localStorage.getItem('qoder_flow')||'{}'); if(!flow.device_code || !flow.codeVerifier) throw new Error('请先开始 Qoder 登录'); const res=await fetch('/api/oauth/qoder/poll',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({ deviceCode: flow.device_code, codeVerifier: flow.codeVerifier, extraData: {_qoderMachineId: flow._qoderMachineId, _qoderNonce: flow._qoderNonce, _qoderVerifier: flow.codeVerifier} })}); const data=await res.json(); if(data.pending){ setText('qoderStatus','muted','还在等待授权完成...'); return; } if(!res.ok || !data.success) throw new Error(data.errorDescription || data.error || 'poll failed'); localStorage.removeItem('qoder_flow'); await reloadConfig(); setText('qoderStatus','ok','Qoder 已连接。'); }catch(e){ setText('qoderStatus','err',e.message); } }
-async function startGemini(){ try{ const data=await (await fetch('/api/oauth/gemini/authorize')).json(); if(!data.authUrl) throw new Error(data.error || 'missing auth url'); window.open(data.authUrl, '_blank', 'noopener,noreferrer'); setText('geminiStatus','ok','已打开 Gemini 登录页，回调完成后会自动保存令牌。'); }catch(e){ setText('geminiStatus','err',e.message); } }
 async function startKilo(){ try{ const data=await (await fetch('/api/oauth/kilo/device-code')).json(); localStorage.setItem('kilo_flow', JSON.stringify(data)); window.open(data.verification_uri_complete, '_blank', 'noopener,noreferrer'); setText('kiloStatus','ok','已打开 Kilo 登录页，完成登录后点击轮询。'); }catch(e){ setText('kiloStatus','err',e.message); } }
 async function pollKilo(){ try{ const flow=JSON.parse(localStorage.getItem('kilo_flow')||'{}'); if(!flow.device_code) throw new Error('请先开始 Kilo 登录'); const res=await fetch('/api/oauth/kilo/poll',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({deviceCode: flow.device_code})}); const data=await res.json(); if(data.pending){ setText('kiloStatus','muted','还在等待授权完成...'); return; } if(!res.ok || !data.success) throw new Error(data.errorDescription || data.error || 'poll failed'); localStorage.removeItem('kilo_flow'); await reloadConfig(); setText('kiloStatus','ok','Kilo 已连接。'); }catch(e){ setText('kiloStatus','err',e.message); } }
 async function startCline(){ try{ const data=await (await fetch('/api/oauth/cline/authorize')).json(); window.open(data.authUrl, '_blank', 'noopener,noreferrer'); setText('clineStatus','ok','已打开 Cline 登录页，回调完成后会自动保存令牌。'); }catch(e){ setText('clineStatus','err',e.message); } }

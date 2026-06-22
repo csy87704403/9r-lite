@@ -875,6 +875,13 @@ func normalizeKiroToolSchema(schema map[string]any) map[string]any {
 	return schema
 }
 
+func normalizeSchemaRoot(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok && m != nil {
+		return m
+	}
+	return map[string]any{"type": "object", "properties": map[string]any{}}
+}
+
 func extractFirstKiroTools(history []any) []any {
 	for _, item := range history {
 		entry, _ := item.(map[string]any)

@@ -49,8 +49,9 @@ type Config struct {
 }
 
 type AutoModelConfig struct {
-	Enabled bool     `json:"enabled,omitempty"`
-	Models  []string `json:"models,omitempty"`
+	Enabled      bool     `json:"enabled,omitempty"`
+	Models       []string `json:"models,omitempty"`
+	VisionModels []string `json:"vision_models,omitempty"`
 }
 
 type ModelGroup struct {
@@ -91,6 +92,7 @@ type ProviderConfig struct {
 	Models                []string          `json:"models,omitempty"`
 	EnabledModels         []string          `json:"enabled_models,omitempty"`
 	LockedModels          []string          `json:"locked_models,omitempty"`
+	ModelKinds            map[string]string `json:"model_kinds,omitempty"`
 	AvailableModels       []string          `json:"available_models,omitempty"`
 	ModelLatencyMS        map[string]int64  `json:"model_latency_ms,omitempty"`
 	ModelErrors           map[string]string `json:"model_errors,omitempty"`
@@ -158,6 +160,8 @@ type Server struct {
 	probeMu     sync.Mutex
 	client      *http.Client
 	mimo        *MimoAuth
+	adminMu     sync.RWMutex
+	adminHash   []byte
 	adminSecret string
 }
 
@@ -196,6 +200,8 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleRoot)
 	mux.HandleFunc("/admin", srv.handleAdmin)
+	mux.HandleFunc("/admin/help", srv.handleAdminHelp)
+	mux.HandleFunc("/api/admin/password", srv.handleAdminPassword)
 	mux.HandleFunc("/api/config", srv.handleConfig)
 	mux.HandleFunc("/api/provider/models", srv.handleProviderModels)
 	mux.HandleFunc("/api/provider/probe", srv.handleProviderProbe)
@@ -205,17 +211,19 @@ func main() {
 	mux.HandleFunc("/api/provider/model/delete", srv.handleProviderModelDelete)
 	mux.HandleFunc("/api/oauth/qoder/device-code", srv.handleQoderDeviceCode)
 	mux.HandleFunc("/api/oauth/qoder/poll", srv.handleQoderPoll)
-	mux.HandleFunc("/api/oauth/gemini/authorize", srv.handleGeminiAuthorize)
-	mux.HandleFunc("/api/oauth/gemini/callback", srv.handleGeminiCallback)
 	mux.HandleFunc("/api/oauth/kilo/device-code", srv.handleKiloDeviceCode)
 	mux.HandleFunc("/api/oauth/kilo/poll", srv.handleKiloPoll)
 	mux.HandleFunc("/api/oauth/cline/authorize", srv.handleClineAuthorize)
 	mux.HandleFunc("/api/oauth/cline/callback", srv.handleClineCallback)
 	mux.HandleFunc("/health", srv.handleHealth)
 	mux.HandleFunc("/v1/models", srv.handleModels)
+	mux.HandleFunc("/v2/models", srv.handleClaudeCodeModels)
 	mux.HandleFunc("/v1/tools", srv.handleTools)
 	mux.HandleFunc("/tools.json", srv.handleTools)
 	mux.HandleFunc("/v1/chat/completions", srv.handleChatCompletions)
+	mux.HandleFunc("/anthropic/v1/models", srv.handleAnthropicModels)
+	mux.HandleFunc("/anthropic/v1/messages", srv.handleAnthropicMessages)
+	mux.HandleFunc("/anthropic/v1/messages/count_tokens", srv.handleAnthropicCountTokens)
 	mux.HandleFunc("/v1/images", srv.handleMedia("image"))
 	mux.HandleFunc("/v1/images/models", srv.handleMediaModels("image"))
 	mux.HandleFunc("/v1/videos", srv.handleMedia("video"))
@@ -252,7 +260,7 @@ func NewServer(dataDir string) (*Server, error) {
 			Proxy:               http.ProxyFromEnvironment,
 		},
 	}
-	return &Server{
+	srv := &Server{
 		dataDir:     dataDir,
 		config:      cfg,
 		client:      client,
@@ -261,7 +269,13 @@ func NewServer(dataDir string) (*Server, error) {
 			sessionID: newSessionID(),
 			client:    client,
 		},
-	}, nil
+	}
+	adminHash, err := loadAdminPasswordHash(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	srv.adminHash = adminHash
+	return srv, nil
 }
 
 func loadConfig(dataDir string) (Config, error) {
@@ -320,13 +334,6 @@ func defaultConfig() Config {
 			Type:    "qoder",
 			Enabled: false,
 			Models:  qoderStaticModels(),
-		},
-		{
-			ID:      "gemini",
-			Name:    "Gemini CLI",
-			Type:    "gemini-cli",
-			Enabled: false,
-			Models:  []string{"gemini-3-flash-preview", "gemini-3-pro-preview"},
 		},
 		{ID: "codex", Name: "OpenAI Codex OAuth", Type: "placeholder", Enabled: false},
 		{
@@ -414,13 +421,12 @@ func mergeDefaultConfig(cfg Config) Config {
 	for _, p := range cfg.Providers {
 		d, ok := byID[p.ID]
 		if !ok {
-			if !isCustomOpenAIProvider(p) {
+			if !isCustomProvider(p) {
 				continue
 			}
 			if p.Name == "" {
-				p.Name = "Custom OpenAI Compatible"
+				p.Name = "Custom Compatible"
 			}
-			p.Type = "openai"
 			if p.ProviderSpecificData == nil {
 				p.ProviderSpecificData = map[string]string{}
 			}
@@ -445,7 +451,7 @@ func mergeDefaultConfig(cfg Config) Config {
 		if len(p.Models) == 0 {
 			p.Models = d.Models
 		}
-		if p.Type == "openai" && p.FetchModels && len(providerAPIKeys(p)) > 0 && len(p.Models) > 0 {
+		if (p.Type == "openai" || p.Type == "anthropic") && p.FetchModels && len(providerAPIKeys(p)) > 0 && len(p.Models) > 0 {
 			if p.ProviderSpecificData == nil {
 				p.ProviderSpecificData = map[string]string{}
 			}
@@ -487,6 +493,10 @@ func normalizeConfigModelRefs(cfg *Config) {
 		cfg.AutoModel.Models[i] = normalize(ref)
 	}
 	cfg.AutoModel.Models = uniqueStrings(cfg.AutoModel.Models)
+	for i, ref := range cfg.AutoModel.VisionModels {
+		cfg.AutoModel.VisionModels[i] = normalize(ref)
+	}
+	cfg.AutoModel.VisionModels = uniqueStrings(cfg.AutoModel.VisionModels)
 	for i := range cfg.ModelGroups {
 		for j, ref := range cfg.ModelGroups[i].Models {
 			cfg.ModelGroups[i].Models[j] = normalize(ref)
@@ -555,7 +565,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(renderAdminLoginHTML("登录请求无效")))
 			return
 		}
-		if strings.TrimSpace(r.Form.Get("password")) != s.adminPassword() {
+		if !s.verifyAdminPassword(r.Form.Get("password")) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = w.Write([]byte(renderAdminLoginHTML("密码错误")))
 			return
@@ -710,7 +720,7 @@ func (s *Server) handleProviderProbe(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider has no loaded models"})
 		return
 	}
-	probeModels := chatModelIDs(p.Models)
+	probeModels := chatModelIDs(p, p.Models)
 	if len(probeModels) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider has no text chat models to probe"})
 		return
@@ -766,7 +776,7 @@ func (s *Server) handleProviderProbeModel(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "model is not loaded by provider"})
 		return
 	}
-	if isMediaModel(model) {
+	if providerModelIsMedia(p, model) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "media models are not probed by chat probe"})
 		return
 	}
@@ -826,7 +836,7 @@ func (s *Server) handleProviderProbeKey(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider not found"})
 		return
 	}
-	if p.Type != "openai" {
+	if p.Type != "openai" && p.Type != "anthropic" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "key probe only supports API key providers"})
 		return
 	}
@@ -839,7 +849,7 @@ func (s *Server) handleProviderProbeKey(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "model is not loaded by provider"})
 		return
 	}
-	if isMediaModel(model) {
+	if providerModelIsMedia(p, model) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "media models are not probed by chat probe"})
 		return
 	}
@@ -851,7 +861,7 @@ func (s *Server) handleProviderProbeKey(w http.ResponseWriter, r *http.Request) 
 
 	start := time.Now()
 	probeCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	status, respBody, err := s.probeSingleOpenAIModelWithKey(probeCtx, p, model, keys[body.KeyIndex])
+	status, respBody, err := s.probeSingleCompatibleModelWithKey(probeCtx, p, model, keys[body.KeyIndex])
 	cancel()
 	latency := time.Since(start).Milliseconds()
 	if err == nil {
@@ -953,6 +963,9 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	var models []map[string]any
 	grouped := map[string][]string{}
 	for _, p := range s.enabledProviders() {
+		if isClaudeCodeCompatibleProvider(p) {
+			continue
+		}
 		ids := s.chatModelsForProvider(ctx, p)
 		if len(ids) > 0 {
 			var visible []string
@@ -977,7 +990,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	if target, ok := s.resolveAutoModel(ctx); ok {
+	if target, ok := s.resolveAutoModelForOpenAI(ctx); ok {
 		if !isMediaModel(target) && scopeAllowsModel(scope, "auto") {
 			grouped["Auto"] = []string{target}
 			models = append(models, map[string]any{
@@ -985,6 +998,53 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 				"object":   "model",
 				"created":  0,
 				"owned_by": "auto",
+			})
+		}
+	}
+	sort.Slice(models, func(i, j int) bool {
+		return fmt.Sprint(models[i]["id"]) < fmt.Sprint(models[j]["id"])
+	})
+	if wantsHTML(r) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(renderModelsHTML(grouped)))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
+}
+
+func (s *Server) handleClaudeCodeModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireAccessKey(w, r) {
+		return
+	}
+	scope, _ := s.accessScopeForRequest(r)
+	if !scope.Full {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "model group keys cannot access Claude Code compatible models"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	var models []map[string]any
+	grouped := map[string][]string{}
+	for _, p := range s.enabledProviders() {
+		if !isClaudeCodeCompatibleProvider(p) {
+			continue
+		}
+		ids := s.chatModelsForProvider(ctx, p)
+		if len(ids) > 0 {
+			grouped[p.Name] = ids
+		}
+		for _, id := range ids {
+			models = append(models, map[string]any{
+				"id":       providerModelRef(p, id),
+				"object":   "model",
+				"created":  0,
+				"owned_by": providerPublicID(p),
 			})
 		}
 	}
@@ -1026,9 +1086,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "model is not allowed by this access key: " + requestedModel})
 			return
 		}
-		target, ok := s.resolveAutoModel(r.Context())
+		hasImage := openAIChatHasImage(raw)
+		target, ok := s.resolveAutoModelForOpenAI(r.Context())
+		if hasImage {
+			target, ok = s.resolveAutoVisionModelForOpenAI(r.Context())
+		}
 		if !ok {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "auto model has no available target"})
+			message := "auto model has no available target"
+			if hasImage {
+				message = "auto model has no available multimodal target"
+			}
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": message})
 			return
 		}
 		req.Model = target
@@ -1050,6 +1118,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider is not enabled: " + providerID})
 		return
 	}
+	if isClaudeCodeCompatibleProvider(p) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "this provider only accepts native Claude Code requests; use the Anthropic Base URL"})
+		return
+	}
 	if requestedModel != "auto" && !scopeAllowsProviderModel(scope, p, upstreamModel) {
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": "model is not allowed by this access key: " + requestedModel})
 		return
@@ -1066,14 +1138,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		s.proxyMimoFree(w, r, req, upstreamModel)
 	case "qoder":
 		s.proxyQoder(w, r, p, req, upstreamModel)
-	case "gemini-cli":
-		s.proxyGeminiCLI(w, r, p, req, upstreamModel)
 	case "kilocode":
 		s.proxyKiloCode(w, r, p, req, upstreamModel)
 	case "cline":
 		s.proxyCline(w, r, p, req, upstreamModel)
 	case "openai":
-		s.proxyOpenAI(w, r, p, req, upstreamModel)
+		if isResponsesCompatibleProvider(p) {
+			s.proxyResponsesAsOpenAI(w, r, p, req, upstreamModel)
+		} else {
+			s.proxyOpenAI(w, r, p, req, upstreamModel)
+		}
+	case "anthropic":
+		s.proxyAnthropicAsOpenAI(w, r, p, req, upstreamModel)
 	default:
 		writeJSON(w, http.StatusNotImplemented, map[string]any{
 			"error":    "provider is kept as placeholder in lite MVP",
@@ -1099,7 +1175,7 @@ func (s *Server) handleMediaModels(kind string) http.HandlerFunc {
 			if mediaEndpoint(p, kind) == "" {
 				continue
 			}
-			for _, id := range mediaModelsForKind(s.publishedModelsForProvider(p), kind) {
+			for _, id := range mediaModelsForProviderKind(p, s.publishedModelsForProvider(p), kind) {
 				if !scopeAllowsProviderModel(scope, p, id) {
 					continue
 				}
@@ -1454,12 +1530,6 @@ func (s *Server) modelsForProvider(ctx context.Context, p ProviderConfig) []stri
 			return p.Models
 		}
 		return qoderStaticModels()
-	case "gemini-cli":
-		ids, err := s.fetchGeminiCLIModels(ctx, p)
-		if err == nil && len(ids) > 0 {
-			return ids
-		}
-		return p.Models
 	case "kilocode":
 		ids, err := fetchKiloFreeModels(ctx, s.client, p)
 		if err == nil && len(ids) > 0 {
@@ -1468,7 +1538,7 @@ func (s *Server) modelsForProvider(ctx context.Context, p ProviderConfig) []stri
 		return p.Models
 	case "cline":
 		return p.Models
-	case "openai":
+	case "openai", "anthropic":
 		if p.FetchModels && p.BaseURL != "" && len(providerAPIKeys(p)) > 0 {
 			ids, err := fetchOpenAIModels(ctx, s.client, p)
 			if err == nil && len(ids) > 0 {
@@ -1504,14 +1574,14 @@ func (s *Server) fetchProviderModels(ctx context.Context, p ProviderConfig) ([]s
 		return fetchQoderModels(ctx, s.client, p, true)
 	case "kilocode":
 		return fetchKiloFreeModels(ctx, s.client, p)
-	case "openai":
+	case "openai", "anthropic":
 		if strings.TrimSpace(p.BaseURL) == "" {
 			return nil, errors.New("provider base_url is empty")
 		}
 		if len(providerAPIKeys(p)) == 0 {
 			return nil, errors.New("provider api_key is empty")
 		}
-		return fetchOpenAIModels(ctx, s.client, p)
+		return fetchCompatibleModels(ctx, s.client, p)
 	default:
 		if len(p.Models) == 0 {
 			return nil, fmt.Errorf("%s does not support model fetch", p.ID)
@@ -1563,6 +1633,7 @@ func (s *Server) deleteProviderModel(providerID, model string) (ProviderConfig, 
 		p.Models = remaining
 		p.AvailableModels = removeString(p.AvailableModels, model)
 		p.LockedModels = removeString(p.LockedModels, model)
+		delete(p.ModelKinds, model)
 		delete(p.ModelLatencyMS, model)
 		delete(p.ModelErrors, model)
 		if p.ProviderSpecificData == nil {
@@ -1575,6 +1646,7 @@ func (s *Server) deleteProviderModel(providerID, model string) (ProviderConfig, 
 		fullModel := providerModelRef(p, model)
 		legacyModel := providerID + "/" + model
 		s.config.AutoModel.Models = removeString(removeString(s.config.AutoModel.Models, fullModel), legacyModel)
+		s.config.AutoModel.VisionModels = removeString(removeString(s.config.AutoModel.VisionModels, fullModel), legacyModel)
 		for groupIndex := range s.config.ModelGroups {
 			s.config.ModelGroups[groupIndex].Models = removeString(removeString(s.config.ModelGroups[groupIndex].Models, fullModel), legacyModel)
 		}
@@ -1637,15 +1709,26 @@ func fetchOpenCodeModels(ctx context.Context, client *http.Client) ([]string, er
 }
 
 func fetchOpenAIModels(ctx context.Context, client *http.Client, p ProviderConfig) ([]string, error) {
+	return fetchCompatibleModels(ctx, client, p)
+}
+
+func fetchCompatibleModels(ctx context.Context, client *http.Client, p ProviderConfig) ([]string, error) {
 	keys := providerAPIKeys(p)
 	if len(keys) == 0 {
 		return nil, errors.New("provider api_key is empty")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, joinURL(p.BaseURL, "/models"), nil)
+	target := joinURL(p.BaseURL, "/models")
+	if p.Type == "anthropic" {
+		target = anthropicRequestTarget(p, "/models")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+keys[0])
+	if p.Type == "anthropic" {
+		applyAnthropicUpstreamHeaders(req.Header, nil, p, keys[0], false)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -1653,6 +1736,12 @@ func fetchOpenAIModels(ctx context.Context, client *http.Client, p ProviderConfi
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, fmt.Errorf("%s models status %d", p.ID, resp.StatusCode)
+	}
+	if isResponsesCompatibleProvider(p) {
+		return parseResponsesModelIDs(resp.Body)
+	}
+	if p.Type == "anthropic" {
+		return parseMessagesModelIDs(resp.Body)
 	}
 	return parseModelIDs(resp.Body)
 }
@@ -1860,18 +1949,11 @@ func scopeAllowsModel(scope accessScope, model string) bool {
 	return sliceSet(scope.Group.Models)[strings.TrimSpace(model)]
 }
 
-func (s *Server) adminPassword() string {
-	if v := strings.TrimSpace(os.Getenv("ADMIN_PASSWORD")); v != "" {
-		return v
-	}
-	if v := strings.TrimSpace(s.currentConfig().AccessKey); v != "" {
-		return v
-	}
-	return "123456"
-}
-
 func (s *Server) adminCookieValue() string {
-	sum := sha256.Sum256([]byte(s.adminPassword() + "|" + s.adminSecret))
+	s.adminMu.RLock()
+	secret := s.adminSecret
+	s.adminMu.RUnlock()
+	sum := sha256.Sum256([]byte("9router-lite-admin|" + secret))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -1930,7 +2012,7 @@ func (s *Server) providerByRouteID(id string) (ProviderConfig, bool) {
 }
 
 func providerPublicID(p ProviderConfig) string {
-	if isCustomOpenAIProvider(p) {
+	if isCustomProvider(p) {
 		if name := strings.TrimSpace(p.Name); name != "" && !strings.Contains(name, "/") {
 			return name
 		}
@@ -1953,7 +2035,7 @@ func providerHasCredential(p ProviderConfig) bool {
 	if len(providerAPIKeys(p)) > 0 || p.AccessToken != "" || p.Type == "opencode-free" || p.Type == "mimo-free" {
 		return true
 	}
-	return isCustomOpenAIProvider(p) && strings.TrimSpace(p.BaseURL) != "" && p.BaseURL != "https://example.com/v1"
+	return isCustomProvider(p) && strings.TrimSpace(p.BaseURL) != "" && p.BaseURL != "https://example.com/v1"
 }
 
 func providerAPIKeys(p ProviderConfig) []string {
@@ -2124,6 +2206,9 @@ func (s *Server) updateProviderKeyStatus(id string, index int, model string, fai
 func (s *Server) visibleModelsForProvider(ctx context.Context, p ProviderConfig) []string {
 	_ = ctx
 	selected := s.publishedModelsForProvider(p)
+	if providerManualPublishOverride(p) {
+		return selected
+	}
 	if p.AvailabilityCheckedAt == 0 && len(p.AvailableModels) == 0 {
 		return selected
 	}
@@ -2144,13 +2229,13 @@ func (s *Server) publishedModelsForProvider(p ProviderConfig) []string {
 }
 
 func (s *Server) chatModelsForProvider(ctx context.Context, p ProviderConfig) []string {
-	return chatModelIDs(s.visibleModelsForProvider(ctx, p))
+	return chatModelIDs(p, s.visibleModelsForProvider(ctx, p))
 }
 
-func chatModelIDs(models []string) []string {
+func chatModelIDs(p ProviderConfig, models []string) []string {
 	var out []string
 	for _, model := range uniqueStrings(models) {
-		if !isMediaModel(model) {
+		if !providerModelIsMedia(p, model) {
 			out = append(out, model)
 		}
 	}
@@ -2169,11 +2254,43 @@ func unlockedModelIDs(models, locked []string) []string {
 }
 
 func (s *Server) resolveAutoModel(ctx context.Context) (string, bool) {
+	return s.resolveAutoModelMatching(ctx, nil)
+}
+
+func (s *Server) resolveAutoModelForOpenAI(ctx context.Context) (string, bool) {
+	return s.resolveAutoModelMatching(ctx, func(p ProviderConfig) bool {
+		return !isClaudeCodeCompatibleProvider(p)
+	})
+}
+
+func (s *Server) resolveAutoVisionModel(ctx context.Context) (string, bool) {
+	return s.resolveAutoVisionModelMatching(ctx, nil)
+}
+
+func (s *Server) resolveAutoVisionModelForOpenAI(ctx context.Context) (string, bool) {
+	return s.resolveAutoVisionModelMatching(ctx, func(p ProviderConfig) bool {
+		return !isClaudeCodeCompatibleProvider(p)
+	})
+}
+
+func (s *Server) resolveAutoModelMatching(ctx context.Context, accept func(ProviderConfig) bool) (string, bool) {
 	cfg := s.currentConfig()
 	if !cfg.AutoModel.Enabled {
 		return "", false
 	}
-	for _, candidate := range uniqueStrings(cfg.AutoModel.Models) {
+	return s.resolveAutoCandidatesMatching(ctx, cfg.AutoModel.Models, accept)
+}
+
+func (s *Server) resolveAutoVisionModelMatching(ctx context.Context, accept func(ProviderConfig) bool) (string, bool) {
+	cfg := s.currentConfig()
+	if !cfg.AutoModel.Enabled {
+		return "", false
+	}
+	return s.resolveAutoCandidatesMatching(ctx, cfg.AutoModel.VisionModels, accept)
+}
+
+func (s *Server) resolveAutoCandidatesMatching(ctx context.Context, candidates []string, accept func(ProviderConfig) bool) (string, bool) {
+	for _, candidate := range uniqueStrings(candidates) {
 		if candidate == "auto" {
 			continue
 		}
@@ -2181,11 +2298,14 @@ func (s *Server) resolveAutoModel(ctx context.Context) (string, bool) {
 		if !ok || providerID == "" || model == "" {
 			continue
 		}
-		if isMediaModel(model) {
-			continue
-		}
 		p, ok := s.providerByRouteID(providerID)
 		if !ok || !p.Enabled {
+			continue
+		}
+		if providerModelIsMedia(p, model) {
+			continue
+		}
+		if accept != nil && !accept(p) {
 			continue
 		}
 		if sliceSet(s.visibleModelsForProvider(ctx, p))[model] {
@@ -2201,6 +2321,24 @@ func (s *Server) probeProviderModels(ctx context.Context, p ProviderConfig, mode
 	latencies := map[string]int64{}
 	if len(models) == 0 {
 		return nil, failures, latencies
+	}
+	if isClaudeCodeCompatibleProvider(p) {
+		start := time.Now()
+		ids, err := fetchCompatibleModels(ctx, s.client, p)
+		latency := time.Since(start).Milliseconds()
+		listed := sliceSet(ids)
+		var available []string
+		for _, id := range models {
+			latencies[id] = latency
+			if err == nil && listed[id] {
+				available = append(available, id)
+			} else if err != nil {
+				failures[id] = formatProbeFailure(http.StatusBadGateway, err.Error())
+			} else {
+				failures[id] = "上游模型列表中不存在"
+			}
+		}
+		return available, failures, latencies
 	}
 	var available []string
 	for _, id := range models {
@@ -2219,6 +2357,16 @@ func (s *Server) probeProviderModels(ctx context.Context, p ProviderConfig, mode
 }
 
 func (s *Server) probeSingleModel(ctx context.Context, providerID, model string) error {
+	if p, ok := s.providerByID(providerID); ok && isClaudeCodeCompatibleProvider(p) {
+		ids, err := fetchCompatibleModels(ctx, s.client, p)
+		if err != nil {
+			return err
+		}
+		if !sliceSet(ids)[model] {
+			return errors.New("上游模型列表中不存在")
+		}
+		return nil
+	}
 	body := map[string]any{
 		"model": providerID + "/" + model,
 		"messages": []map[string]string{
@@ -2240,6 +2388,38 @@ func (s *Server) probeSingleModel(ctx context.Context, providerID, model string)
 }
 
 func (s *Server) probeSingleOpenAIModelWithKey(ctx context.Context, p ProviderConfig, model, key string) (int, []byte, error) {
+	return s.probeSingleCompatibleModelWithKey(ctx, p, model, key)
+}
+
+func (s *Server) probeSingleCompatibleModelWithKey(ctx context.Context, p ProviderConfig, model, key string) (int, []byte, error) {
+	if isClaudeCodeCompatibleProvider(p) {
+		target := anthropicRequestTarget(p, "/models")
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return http.StatusBadRequest, nil, err
+		}
+		applyAnthropicUpstreamHeaders(req.Header, nil, p, key, false)
+		resp, err := s.client.Do(req)
+		if err != nil {
+			return http.StatusBadGateway, nil, err
+		}
+		defer resp.Body.Close()
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if readErr != nil {
+			return resp.StatusCode, respBody, readErr
+		}
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			return resp.StatusCode, respBody, errors.New(formatProbeFailure(resp.StatusCode, string(respBody)))
+		}
+		ids, err := parseModelIDs(bytes.NewReader(respBody))
+		if err != nil {
+			return resp.StatusCode, respBody, err
+		}
+		if !sliceSet(ids)[model] {
+			return http.StatusNotFound, respBody, errors.New("上游模型列表中不存在")
+		}
+		return resp.StatusCode, respBody, nil
+	}
 	body := map[string]any{
 		"model": model,
 		"messages": []map[string]string{
@@ -2248,6 +2428,19 @@ func (s *Server) probeSingleOpenAIModelWithKey(ctx context.Context, p ProviderCo
 		"stream":     false,
 		"max_tokens": 4,
 	}
+	target := joinURL(p.BaseURL, "/chat/completions")
+	if isResponsesCompatibleProvider(p) {
+		body = map[string]any{"model": model, "input": "Reply with OK.", "stream": false, "max_output_tokens": 16}
+		target = joinURL(p.BaseURL, "/responses")
+	} else if p.Type == "anthropic" {
+		body = map[string]any{
+			"model": model, "messages": []map[string]string{{"role": "user", "content": "Reply with OK."}}, "stream": false, "max_tokens": 4,
+		}
+		if isClaudeCodeCompatibleProvider(p) {
+			body["system"] = []any{map[string]any{"type": "text", "text": claudeCodeSystemPrompt}}
+		}
+		target = anthropicRequestTarget(p, "/messages")
+	}
 	raw, _ := json.Marshal(body)
 	headers := map[string]string{
 		"Content-Type":  "application/json",
@@ -2255,7 +2448,16 @@ func (s *Server) probeSingleOpenAIModelWithKey(ctx context.Context, p ProviderCo
 		"Accept":        "application/json",
 		"User-Agent":    "9router-lite/0.1",
 	}
-	status, _, respBody, err := s.postUpstreamBuffered(ctx, joinURL(p.BaseURL, "/chat/completions"), raw, headers)
+	if p.Type == "anthropic" {
+		anthropicHeaders := make(http.Header)
+		applyAnthropicUpstreamHeaders(anthropicHeaders, nil, p, key, false)
+		for name, values := range anthropicHeaders {
+			if len(values) > 0 {
+				headers[name] = values[0]
+			}
+		}
+	}
+	status, _, respBody, err := s.postUpstreamBuffered(ctx, target, raw, headers)
 	if err != nil {
 		return status, respBody, err
 	}
@@ -2370,7 +2572,7 @@ func (s *Server) probeAllProviders(ctx context.Context, autoPublish bool) {
 	for _, p := range s.enabledProviders() {
 		models := s.visibleModelsForProvider(ctx, p)
 		models = unlockedModelIDs(models, p.LockedModels)
-		models = chatModelIDs(models)
+		models = chatModelIDs(p, models)
 		if len(models) == 0 {
 			continue
 		}
@@ -2450,9 +2652,16 @@ func validateConfig(cfg Config) error {
 		}
 		seen[p.ID] = true
 		routeIDs[p.ID] = true
+		for model, kind := range p.ModelKinds {
+			switch strings.ToLower(strings.TrimSpace(kind)) {
+			case "", "auto", "text", "image", "video", "audio", "tts":
+			default:
+				return fmt.Errorf("invalid model kind for %s/%s: %s", p.ID, model, kind)
+			}
+		}
 	}
 	for _, p := range cfg.Providers {
-		if !isCustomOpenAIProvider(p) {
+		if !isCustomProvider(p) {
 			continue
 		}
 		name := strings.TrimSpace(p.Name)
@@ -2508,7 +2717,15 @@ func validateConfig(cfg Config) error {
 }
 
 func isCustomOpenAIProvider(p ProviderConfig) bool {
-	return p.Type == "openai" && (p.ID == "custom" || strings.HasPrefix(p.ID, "custom-") || strings.HasPrefix(p.ID, "custom_") || strings.HasPrefix(p.ID, "custom"))
+	return p.Type == "openai" && isCustomProviderID(p.ID)
+}
+
+func isCustomProvider(p ProviderConfig) bool {
+	return (p.Type == "openai" || p.Type == "anthropic") && isCustomProviderID(p.ID)
+}
+
+func isCustomProviderID(id string) bool {
+	return id == "custom" || strings.HasPrefix(id, "custom-") || strings.HasPrefix(id, "custom_") || strings.HasPrefix(id, "custom")
 }
 
 func extractBearerToken(header string) string {
@@ -2646,6 +2863,46 @@ func mediaModelsForKind(models []string, kind string) []string {
 	return out
 }
 
+func providerModelKind(p ProviderConfig, model string) string {
+	kind := strings.ToLower(strings.TrimSpace(p.ModelKinds[model]))
+	switch kind {
+	case "text", "image", "video", "audio", "tts":
+		return kind
+	default:
+		return "auto"
+	}
+}
+
+func providerModelMatchesKind(p ProviderConfig, model, kind string) bool {
+	explicit := providerModelKind(p, model)
+	if explicit == "text" {
+		return false
+	}
+	if explicit != "auto" {
+		return explicit == kind
+	}
+	return len(mediaModelsForKind([]string{model}, kind)) > 0
+}
+
+func mediaModelsForProviderKind(p ProviderConfig, models []string, kind string) []string {
+	var out []string
+	for _, model := range uniqueStrings(models) {
+		if providerModelMatchesKind(p, model, kind) {
+			out = append(out, model)
+		}
+	}
+	return out
+}
+
+func providerModelIsMedia(p ProviderConfig, model string) bool {
+	for _, kind := range []string{"image", "video", "audio", "tts"} {
+		if providerModelMatchesKind(p, model, kind) {
+			return true
+		}
+	}
+	return false
+}
+
 func isMediaModel(model string) bool {
 	if _, raw, ok := strings.Cut(model, "/"); ok {
 		model = raw
@@ -2665,7 +2922,7 @@ func (s *Server) healthMediaTemplates(revealSecrets bool) []HealthMediaTemplate 
 			if endpoint == "" {
 				continue
 			}
-			for _, model := range mediaModelsForKind(models, kind) {
+			for _, model := range mediaModelsForProviderKind(p, models, kind) {
 				out = append(out, healthMediaTemplateForProvider(p, kind, endpoint, model, revealSecrets))
 			}
 		}
@@ -3122,7 +3379,7 @@ func (s *Server) mediaToolDefinition(kind, base, key string) map[string]any {
 		if mediaEndpoint(p, kind) == "" {
 			continue
 		}
-		for _, model := range mediaModelsForKind(s.publishedModelsForProvider(p), kind) {
+		for _, model := range mediaModelsForProviderKind(p, s.publishedModelsForProvider(p), kind) {
 			models = append(models, providerModelRef(p, model))
 		}
 	}
@@ -3158,9 +3415,9 @@ func firstMediaModel(providers []ProviderConfig, kind string) string {
 		if mediaEndpoint(p, kind) == "" {
 			continue
 		}
-		models := mediaModelsForKind(uniqueStrings(p.EnabledModels), kind)
+		models := mediaModelsForProviderKind(p, uniqueStrings(p.EnabledModels), kind)
 		if len(models) == 0 && !providerManualPublishOverride(p) {
-			models = mediaModelsForKind(p.Models, kind)
+			models = mediaModelsForProviderKind(p, p.Models, kind)
 		}
 		if len(models) > 0 {
 			return providerModelRef(p, models[0])
@@ -3253,7 +3510,7 @@ func renderAdminLoginHTML(message string) string {
 	if strings.TrimSpace(message) != "" {
 		msg = `<div class="err">` + htmlEscape(message) + `</div>`
 	}
-	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>9Router Lite 登录</title><style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#fafafa;color:#111;min-height:100vh;display:grid;place-items:center}.box{width:min(420px,calc(100vw - 32px));background:#fff;border:1px solid #ddd;border-radius:8px;padding:24px;box-sizing:border-box}h1{font-size:26px;margin:0 0 8px}.muted{color:#666;font-size:13px;margin-bottom:18px}.field{display:grid;gap:6px;margin:12px 0}.field label{font-size:13px;color:#444}.field input{width:100%;box-sizing:border-box;padding:11px 12px;border:1px solid #ddd;border-radius:6px;font:16px/1.3 system-ui,-apple-system,Segoe UI,sans-serif}button{width:100%;background:#111;color:#fff;border:0;border-radius:6px;padding:11px 14px;font:inherit;cursor:pointer;margin-top:8px}.err{color:#b91c1c;font-size:13px;margin:10px 0}.hint{color:#666;font-size:12px;margin-top:14px;line-height:1.5}code{background:#eee;padding:2px 5px;border-radius:4px}</style></head><body><form class="box" method="post" action="/admin"><h1>9Router Lite</h1><div class="muted">请输入管理密码访问后台</div>` + msg + `<div class="field"><label>管理密码</label><input name="password" type="password" autocomplete="current-password" autofocus></div><button type="submit">登录</button><div class="hint">优先使用环境变量 <code>ADMIN_PASSWORD</code>；未设置时使用网关访问密钥；首次未设置访问密钥时默认是 <code>123456</code>。</div></form></body></html>`
+	return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>9Router Lite 登录</title><style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#fafafa;color:#111;min-height:100vh;display:grid;place-items:center}.box{width:min(420px,calc(100vw - 32px));background:#fff;border:1px solid #ddd;border-radius:8px;padding:24px;box-sizing:border-box}h1{font-size:26px;margin:0 0 8px}.muted{color:#666;font-size:13px;margin-bottom:18px}.field{display:grid;gap:6px;margin:12px 0}.field label{font-size:13px;color:#444}.field input{width:100%;box-sizing:border-box;padding:11px 12px;border:1px solid #ddd;border-radius:6px;font:16px/1.3 system-ui,-apple-system,Segoe UI,sans-serif}button{width:100%;background:#111;color:#fff;border:0;border-radius:6px;padding:11px 14px;font:inherit;cursor:pointer;margin-top:8px}.err{color:#b91c1c;font-size:13px;margin:10px 0}.hint{color:#666;font-size:12px;margin-top:14px;line-height:1.5}code{background:#eee;padding:2px 5px;border-radius:4px}</style></head><body><form class="box" method="post" action="/admin"><h1>9Router Lite</h1><div class="muted">请输入管理密码访问后台</div>` + msg + `<div class="field"><label>管理密码</label><input name="password" type="password" autocomplete="current-password" autofocus></div><button type="submit">登录</button><div class="hint">修改过密码时使用后台密码。首次启动依次使用 <code>ADMIN_PASSWORD</code>、网关访问密钥或默认密码 <code>123456</code>。</div></form></body></html>`
 }
 
 func renderModelsHTML(grouped map[string][]string) string {
@@ -3432,10 +3689,6 @@ code{background:#eee;padding:2px 5px;border-radius:4px}
 <span id="qoderStatus" class="muted"></span>
 </div>
 <div class="bar">
-<button onclick="startGemini()">Start Gemini Login</button>
-<span id="geminiStatus" class="muted"></span>
-</div>
-<div class="bar">
 <button onclick="startKilo()">Start Kilo Login</button>
 <button onclick="pollKilo()">Poll Kilo Token</button>
 <span id="kiloStatus" class="muted"></span>
@@ -3585,10 +3838,6 @@ details{margin-top:22px}
 <span id="qoderStatus" class="muted"></span>
 </div>
 <div class="bar">
-<button onclick="startGemini()">开始 Gemini 登录</button>
-<span id="geminiStatus" class="muted"></span>
-</div>
-<div class="bar">
 <button onclick="startKilo()">开始 Kilo 登录</button>
 <button onclick="pollKilo()">轮询 Kilo 令牌</button>
 <span id="kiloStatus" class="muted"></span>
@@ -3610,7 +3859,7 @@ details{margin-top:22px}
 </details>
 <script>
 const apiProviderIDs=['glm','groq','deepseek','mimo','custom'];
-const statusProviderIDs=['oc','mmf','qoder','gemini','kilo','cline','glm','groq','deepseek','mimo','custom'];
+const statusProviderIDs=['oc','mmf','qoder','kilo','cline','glm','groq','deepseek','mimo','custom'];
 function parseConfig(){ try { return JSON.parse(document.getElementById('cfg').value); } catch { return null; } }
 function setConfig(cfg){ document.getElementById('cfg').value=JSON.stringify(cfg,null,2); document.getElementById('accessKey').value=cfg.access_key || ''; }
 function providerConnected(p){ return !!(p && p.enabled && (p.api_key || p.access_token || p.type === 'opencode-free' || p.type === 'mimo-free')); }
@@ -3667,7 +3916,6 @@ async function saveModelSelection(id){ try{ const nodes=[...document.querySelect
 async function save(){ try{ const body=JSON.parse(document.getElementById('cfg').value); applyAccessKey(body); const res=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); setText('status','ok','已保存'); renderProviderStatus(); renderAPIProviders(); renderPublishProviders(); }catch(e){ setText('status','err',e.message); } }
 async function startQoder(){ try{ const data=await (await fetch('/api/oauth/qoder/device-code')).json(); localStorage.setItem('qoder_flow', JSON.stringify(data)); window.open(data.verification_uri_complete, '_blank', 'noopener,noreferrer'); setText('qoderStatus','ok','已打开 Qoder 登录页，完成登录后点击轮询。'); }catch(e){ setText('qoderStatus','err',e.message); } }
 async function pollQoder(){ try{ const flow=JSON.parse(localStorage.getItem('qoder_flow')||'{}'); if(!flow.device_code || !flow.codeVerifier) throw new Error('请先开始 Qoder 登录'); const res=await fetch('/api/oauth/qoder/poll',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({ deviceCode: flow.device_code, codeVerifier: flow.codeVerifier, extraData: {_qoderMachineId: flow._qoderMachineId, _qoderNonce: flow._qoderNonce, _qoderVerifier: flow.codeVerifier} })}); const data=await res.json(); if(data.pending){ setText('qoderStatus','muted','还在等待授权完成...'); return; } if(!res.ok || !data.success) throw new Error(data.errorDescription || data.error || 'poll failed'); localStorage.removeItem('qoder_flow'); await reloadConfig(); setText('qoderStatus','ok','Qoder 已连接。'); }catch(e){ setText('qoderStatus','err',e.message); } }
-async function startGemini(){ try{ const data=await (await fetch('/api/oauth/gemini/authorize')).json(); if(!data.authUrl) throw new Error(data.error || 'missing auth url'); window.open(data.authUrl, '_blank', 'noopener,noreferrer'); setText('geminiStatus','ok','已打开 Gemini 登录页，回调完成后会自动保存令牌。'); }catch(e){ setText('geminiStatus','err',e.message); } }
 async function startKilo(){ try{ const data=await (await fetch('/api/oauth/kilo/device-code')).json(); localStorage.setItem('kilo_flow', JSON.stringify(data)); window.open(data.verification_uri_complete, '_blank', 'noopener,noreferrer'); setText('kiloStatus','ok','已打开 Kilo 登录页，完成登录后点击轮询。'); }catch(e){ setText('kiloStatus','err',e.message); } }
 async function pollKilo(){ try{ const flow=JSON.parse(localStorage.getItem('kilo_flow')||'{}'); if(!flow.device_code) throw new Error('请先开始 Kilo 登录'); const res=await fetch('/api/oauth/kilo/poll',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({deviceCode: flow.device_code})}); const data=await res.json(); if(data.pending){ setText('kiloStatus','muted','还在等待授权完成...'); return; } if(!res.ok || !data.success) throw new Error(data.errorDescription || data.error || 'poll failed'); localStorage.removeItem('kilo_flow'); await reloadConfig(); setText('kiloStatus','ok','Kilo 已连接。'); }catch(e){ setText('kiloStatus','err',e.message); } }
 async function startCline(){ try{ const data=await (await fetch('/api/oauth/cline/authorize')).json(); window.open(data.authUrl, '_blank', 'noopener,noreferrer'); setText('clineStatus','ok','已打开 Cline 登录页，回调完成后会自动保存令牌。'); }catch(e){ setText('clineStatus','err',e.message); } }
