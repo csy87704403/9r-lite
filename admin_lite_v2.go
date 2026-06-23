@@ -248,6 +248,7 @@ const statusProviderIDs=['oc','mmf','qoder','kilo','cline','glm','groq','deepsee
 let probeStopRequested=false;
 let expandedAPIProviderID='';
 const providerProbeControllers=new Map();
+let mimoProxySearchController=null;
 function parseConfig(){ try { return JSON.parse(document.getElementById('cfg').value); } catch { return null; } }
 function showMainTab(name){
   ['api','oauth','auto','groups'].forEach(id=>{
@@ -712,6 +713,11 @@ function oauthControls(id){
   if(id==='cline') return '<div class="bar"><button class="small" onclick="startCline()">开始登录</button><span id="clineStatus" class="muted"></span></div>';
   return '';
 }
+function mimoProxyControls(p){
+  if(!p || p.id!=='mmf') return '';
+  const running=!!mimoProxySearchController;
+  return '<div class="bar"><button id="mimoProxySearchStart" class="small secondary" onclick="findMimoProxyNode()" '+(running?'disabled':'')+'>寻找可用出口</button><button id="mimoProxySearchStop" class="small secondary" onclick="stopMimoProxySearch()" '+(running?'':'disabled')+'>停止寻找</button><span id="mimoProxySearchStatus" class="muted"></span></div><div id="mimoProxySearchProgress" class="progress-wrap"><progress value="0" max="1"></progress><span class="muted">0/0</span></div>';
+}
 function canFetchOAuthModels(id){ return ['oc','mmf','qoder','kilo'].includes(id); }
 function fetchOAuthModelsButton(p){
   if(!canFetchOAuthModels(p.id)) return '';
@@ -919,7 +925,7 @@ function renderPublishProviders(){
     const listControls=models.length ? '<div class="bar"><button class="small secondary" onclick="selectProviderModels(\''+p.id+'\',true)">全选</button><button class="small secondary" onclick="selectProviderModels(\''+p.id+'\',false)">取消所有选择</button></div>' : '';
     const rows=models.length ? '<div class="model-list">'+modelRows(p)+'</div>' : '<div class="muted">登录或拉取后会显示模型。</div>';
     const probeCount=chatProbeModels(p).length;
-    return '<div class="card">'+providerTitleHTML(p,connected?'green-dot':'gray-dot')+oauthControls(p.id)+authText+'<div class="muted">已加载 '+models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div><div class="bar">'+fetchOAuthModelsButton(p)+'<button id="probeStart_'+p.id+'" class="small" onclick="probeProvider(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!connected || !probeCount || providerProbeControllers.has(p.id)?'disabled':'')+'>探测可用</button><button id="probeStop_'+p.id+'" class="small secondary" onclick="stopProviderProbe(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(providerProbeControllers.has(p.id)?'':'disabled')+'>停止探测</button><button class="small secondary" onclick="saveModelSelection(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!models.length?'disabled':'')+'>保存发布列表</button><span id="publishStatus_'+p.id+'" class="muted"></span></div><div id="probeProgress_'+p.id+'" class="progress-wrap"><progress value="0" max="'+probeCount+'"></progress><span class="muted">0/'+probeCount+'</span></div>'+listControls+rows+'<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="disableProvider(\''+p.id+'\')">停用</button></div></div>';
+    return '<div class="card">'+providerTitleHTML(p,connected?'green-dot':'gray-dot')+oauthControls(p.id)+mimoProxyControls(p)+authText+'<div class="muted">已加载 '+models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div><div class="bar">'+fetchOAuthModelsButton(p)+'<button id="probeStart_'+p.id+'" class="small" onclick="probeProvider(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!connected || !probeCount || providerProbeControllers.has(p.id)?'disabled':'')+'>探测可用</button><button id="probeStop_'+p.id+'" class="small secondary" onclick="stopProviderProbe(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(providerProbeControllers.has(p.id)?'':'disabled')+'>停止探测</button><button class="small secondary" onclick="saveModelSelection(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!models.length?'disabled':'')+'>保存发布列表</button><span id="publishStatus_'+p.id+'" class="muted"></span></div><div id="probeProgress_'+p.id+'" class="progress-wrap"><progress value="0" max="'+probeCount+'"></progress><span class="muted">0/'+probeCount+'</span></div>'+listControls+rows+'<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="disableProvider(\''+p.id+'\')">停用</button></div></div>';
   });
   root.innerHTML=items.join('') || '<div class="muted">还没有可发布的模型。</div>';
 }
@@ -1203,6 +1209,37 @@ function stopProbe(){
   setText('probeAllStatus','muted','正在停止，当前请求完成后不再继续。');
 }
 async function probeOneModel(id, model, autoPublish, dropUnavailable, signal){ if(dropUnavailable===undefined) dropUnavailable=!autoPublish; const options={method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id, model, auto_publish:!!autoPublish, drop_unavailable_on_failure:!!dropUnavailable})}; if(signal) options.signal=signal; const res=await fetch('/api/provider/probe-model',options); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); return data; }
+function setMimoProxySearchButtons(running){ const start=document.getElementById('mimoProxySearchStart'); const stop=document.getElementById('mimoProxySearchStop'); if(start) start.disabled=!!running; if(stop) stop.disabled=!running; }
+function stopMimoProxySearch(){ if(!mimoProxySearchController) return; mimoProxySearchController.abort(); setText('mimoProxySearchStatus','muted','正在停止寻找...'); }
+function waitForMimoProxySearch(ms,signal){ return new Promise((resolve,reject)=>{ const timer=setTimeout(resolve,ms); if(signal) signal.addEventListener('abort',()=>{clearTimeout(timer); reject(new DOMException('Aborted','AbortError'));},{once:true}); }); }
+async function selectMimoProxyNode(node){ const res=await fetch('/api/mimo/proxy-select',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({node})}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); return data; }
+async function findMimoProxyNode(){
+  if(mimoProxySearchController) return;
+  const controller=new AbortController(); mimoProxySearchController=controller; setMimoProxySearchButtons(true);
+  let total=0; let tested=0; let original=''; let finalClass='err'; let finalText='没有找到可用出口';
+  try{
+    const nodesRes=await fetch('/api/mimo/proxy-nodes',{signal:controller.signal}); const nodesData=await nodesRes.json(); if(!nodesRes.ok) throw new Error(nodesData.error || nodesRes.statusText);
+    original=String(nodesData.current || '');
+    let nodes=unique(nodesData.nodes || []); if(original){ nodes=nodes.filter(node=>node!==original); nodes.push(original); }
+    total=nodes.length; setProgress('mimoProxySearchProgress',0,total); if(!total) throw new Error('Mihomo 策略组中没有可测试节点');
+    for(let i=0;i<nodes.length;i++){
+      const node=nodes[i]; setText('mimoProxySearchStatus','muted','正在测试 '+(i+1)+'/'+total+'：'+node);
+      const res=await fetch('/api/mimo/proxy-test-node',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({node}),signal:controller.signal});
+      const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText);
+      tested=i+1; setProgress('mimoProxySearchProgress',tested,total);
+      if(data.ok){ finalClass='ok'; finalText='已切换到 '+node+' · '+(data.latency_ms || 0)+'ms'; original=''; break; }
+      finalText=node+' 不可用'+(data.error?' · '+data.error:'');
+      if(i+1<nodes.length) await waitForMimoProxySearch(600+Math.floor(Math.random()*900),controller.signal);
+    }
+  }catch(e){
+    if(e && e.name==='AbortError'){ finalClass='muted'; finalText='已停止寻找'; } else { finalText=e.message || String(e); }
+  }finally{
+    if(original){ try{ await selectMimoProxyNode(original); }catch(e){} }
+    mimoProxySearchController=null;
+    try{ await reloadConfig(); }catch(e){}
+    setMimoProxySearchButtons(false); setProgress('mimoProxySearchProgress',total,total); setText('mimoProxySearchStatus',finalClass,finalText+(tested&&finalClass!=='ok'?' · 已测试 '+tested+'/'+total:''));
+  }
+}
 function setProviderProbeButtons(id,running){ const start=document.getElementById('probeStart_'+id); const stop=document.getElementById('probeStop_'+id); if(start) start.disabled=!!running; if(stop) stop.disabled=!running; }
 function stopProviderProbe(id,statusID){ const controller=providerProbeControllers.get(id); if(!controller) return; controller.abort(); const stop=document.getElementById('probeStop_'+id); if(stop) stop.disabled=true; setText(statusID || 'publishStatus_'+id,'muted','正在停止当前卡片探测...'); }
 async function probeProvider(id, statusID){

@@ -154,15 +154,19 @@ type HealthMediaCurlTemplate struct {
 }
 
 type Server struct {
-	dataDir     string
-	config      Config
-	mu          sync.RWMutex
-	probeMu     sync.Mutex
-	client      *http.Client
-	mimo        *MimoAuth
-	adminMu     sync.RWMutex
-	adminHash   []byte
-	adminSecret string
+	dataDir                string
+	config                 Config
+	mu                     sync.RWMutex
+	probeMu                sync.Mutex
+	client                 *http.Client
+	mimo                   *MimoAuth
+	mimoProxyMu            sync.Mutex
+	mimoProxyControlURL    string
+	mimoProxyGroup         string
+	mimoProxyControlClient *http.Client
+	adminMu                sync.RWMutex
+	adminHash              []byte
+	adminSecret            string
 }
 
 type MimoAuth struct {
@@ -209,6 +213,9 @@ func main() {
 	mux.HandleFunc("/api/provider/probe-key", srv.handleProviderProbeKey)
 	mux.HandleFunc("/api/provider/selection", srv.handleProviderSelection)
 	mux.HandleFunc("/api/provider/model/delete", srv.handleProviderModelDelete)
+	mux.HandleFunc("/api/mimo/proxy-nodes", srv.handleMimoProxyNodes)
+	mux.HandleFunc("/api/mimo/proxy-test-node", srv.handleMimoProxyTestNode)
+	mux.HandleFunc("/api/mimo/proxy-select", srv.handleMimoProxySelect)
 	mux.HandleFunc("/api/oauth/qoder/device-code", srv.handleQoderDeviceCode)
 	mux.HandleFunc("/api/oauth/qoder/poll", srv.handleQoderPoll)
 	mux.HandleFunc("/api/oauth/kilo/device-code", srv.handleKiloDeviceCode)
@@ -260,11 +267,21 @@ func NewServer(dataDir string) (*Server, error) {
 			return nil, fmt.Errorf("invalid MIMO_PROXY_URL")
 		}
 	}
+	mimoProxyControlURL := strings.TrimRight(strings.TrimSpace(os.Getenv("MIMO_PROXY_CONTROL_URL")), "/")
+	if mimoProxyControlURL != "" {
+		controlURL, parseErr := url.Parse(mimoProxyControlURL)
+		if parseErr != nil || controlURL.Host == "" || (controlURL.Scheme != "http" && controlURL.Scheme != "https") {
+			return nil, fmt.Errorf("invalid MIMO_PROXY_CONTROL_URL")
+		}
+	}
 	srv := &Server{
-		dataDir:     dataDir,
-		config:      cfg,
-		client:      client,
-		adminSecret: newSessionID(),
+		dataDir:                dataDir,
+		config:                 cfg,
+		client:                 client,
+		mimoProxyControlURL:    mimoProxyControlURL,
+		mimoProxyGroup:         envDefault("MIMO_PROXY_GROUP", "MonoCloud"),
+		mimoProxyControlClient: newDirectHTTPClient(15 * time.Second),
+		adminSecret:            newSessionID(),
 		mimo: &MimoAuth{
 			sessionID: newSessionID(),
 			client:    mimoClient,
@@ -276,6 +293,19 @@ func NewServer(dataDir string) (*Server, error) {
 	}
 	srv.adminHash = adminHash
 	return srv, nil
+}
+
+func newDirectHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DisableKeepAlives:   true,
+			MaxIdleConns:        0,
+			MaxIdleConnsPerHost: 0,
+			IdleConnTimeout:     5 * time.Second,
+			DialContext:         preferIPv4DialContext(),
+		},
+	}
 }
 
 func newHTTPClient(proxyAddress string) (*http.Client, error) {
