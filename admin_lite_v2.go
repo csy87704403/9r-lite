@@ -21,6 +21,8 @@ button{background:#111;color:#fff;border:0;border-radius:6px;padding:9px 14px;cu
 button.secondary{background:#fff;color:#111;border:1px solid #ddd}
 button.small{padding:7px 10px;font-size:13px}
 button.add-auto-model,button.delete-model{width:17px;height:17px;padding:0;border-radius:3px;font-size:12px;line-height:1;display:inline-flex;align-items:center;justify-content:center;flex:0 0 17px;margin-top:1px}
+button.add-auto-model.added{background:#16a34a;color:#fff;border-color:#16a34a}
+button.add-auto-model.duplicate{background:#d97706;color:#fff;border-color:#d97706}
 button.model-lock{width:17px;height:17px;padding:0;border-radius:3px;font-size:12px;line-height:1;display:inline-flex;align-items:center;justify-content:center;flex:0 0 17px;margin-top:1px}
 button.model-lock.locked{background:#111;color:#fff;border-color:#111}
 button:disabled{opacity:.55;cursor:not-allowed}
@@ -80,13 +82,25 @@ code{background:#eee;padding:2px 5px;border-radius:4px}
 .toggle{display:flex;gap:8px;align-items:center;font-size:13px;margin:8px 0}
 .model-list{display:grid;gap:8px;margin-top:10px;max-height:280px;overflow:auto;padding-right:4px}
 .model-item{display:flex;gap:8px;align-items:flex-start;font-size:13px}
+.auto-sort-item{cursor:grab;user-select:none;touch-action:pan-y;border:1px solid transparent;border-radius:6px;padding:5px 6px;transition:background .12s,border-color .12s,box-shadow .12s}
+.auto-sort-item:hover{background:#f8fafc}
+.auto-sort-item.dragging{cursor:grabbing;background:#eef2ff;border-color:#6366f1;box-shadow:0 5px 16px rgba(79,70,229,.18);touch-action:none;opacity:.96}
+.auto-drag-handle{color:#9ca3af;font-size:16px;line-height:20px;flex:0 0 auto}
+.auto-sort-item .model-name{flex:1 1 auto}
 .model-kind-select{width:72px;flex:0 0 72px;padding:2px 3px;border:1px solid #ddd;border-radius:4px;background:#fff;font:12px/1.2 system-ui,-apple-system,Segoe UI,sans-serif}
 .model-item.off{color:#999}
 .model-name{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;word-break:break-all}
 .multimodal-badge{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:999px;background:#7c3aed;color:#fff;font:700 11px/18px system-ui,-apple-system,Segoe UI,sans-serif;vertical-align:1px;white-space:nowrap}
+.auto-member-badge{display:inline-block;margin:0 4px 0 0;padding:1px 6px;border-radius:999px;background:#2563eb;color:#fff;font:700 11px/18px system-ui,-apple-system,Segoe UI,sans-serif;vertical-align:1px;white-space:nowrap}
+.auto-remove-badge{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;margin:0 6px 0 0;padding:0;border:1px solid #93c5fd;border-radius:4px;background:#eff6ff;color:#1d4ed8;font-size:12px;line-height:14px;vertical-align:1px}
+.auto-remove-badge:hover{background:#dbeafe}
 .published-model-title{margin-top:10px;color:#555;font-size:12px}
 .published-model-list{display:flex;flex-wrap:wrap;gap:5px;margin-top:5px;max-height:92px;overflow:auto;padding-right:3px}
-.published-model-tag{max-width:100%;padding:2px 7px;border-radius:999px;background:#f3f4f6;border:1px solid #e5e7eb;color:#374151;font:11px/16px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}
+.published-model-tag{display:inline-flex;align-items:center;max-width:100%;padding:2px 7px;border-radius:999px;background:#f3f4f6;border:1px solid #e5e7eb;color:#374151;font:11px/16px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}
+.published-model-tag .multimodal-badge{font-size:10px;line-height:15px;padding:0 5px}
+.ui-toast{position:fixed;right:20px;top:20px;z-index:1000;max-width:min(420px,calc(100vw - 40px));padding:10px 14px;border-radius:7px;background:#111;color:#fff;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.2);opacity:0;transform:translateY(-8px);pointer-events:none;transition:opacity .18s,transform .18s}
+.ui-toast.show{opacity:1;transform:translateY(0)}
+.ui-toast.warn{background:#b45309}.ui-toast.err{background:#b91c1c}.ui-toast.ok{background:#047857;color:#fff}
 .latency{margin-left:6px;font-weight:700}
 .latency.good{color:#047857}.latency.warn{color:#a16207}.latency.bad{color:#b91c1c}
 .progress-wrap{display:none;align-items:center;gap:10px;margin:8px 0}
@@ -110,6 +124,7 @@ details{margin-top:22px}
 </style>
 </head>
 <body>
+<div id="uiToast" class="ui-toast" role="status" aria-live="polite"></div>
 <main>
 <h1>9Router Lite</h1>
 <div class="muted">接口基址是 <code>/v1</code>，配置保存在本机 <code>data/config.json</code>。</div>
@@ -212,7 +227,8 @@ details{margin-top:22px}
 </div>
 </div>
 <div class="muted">第三方 Agent 继续使用上面的 Base URL 和访问密钥，模型名填写 <code>auto</code>。</div>
-<div class="muted">请求包含图片时，只会从本列表中带“多模态”标签的模型里按顺序选择。</div>
+<div class="muted">纯文本请求会在整个列表中轮询；请求包含图片时，只会在带“多模态”标签的模型中轮询。</div>
+<div class="muted">长按模型行约 300 毫秒后可以上下拖拽排序，调整后请点击保存。</div>
 <div id="autoModelList" class="model-list"></div>
 <div class="bar"><button class="secondary" onclick="saveGateway()">保存 Auto 设置</button><span id="autoModelStatus" class="muted"></span></div>
 </div>
@@ -265,6 +281,8 @@ let probeStopRequested=false;
 let expandedAPIProviderID='';
 const providerProbeControllers=new Map();
 let mimoProxySearchController=null;
+let uiToastTimer=null;
+let autoSortState=null;
 function parseConfig(){ try { return JSON.parse(document.getElementById('cfg').value); } catch { return null; } }
 function showMainTab(name){
   ['api','oauth','auto','groups','usage'].forEach(id=>{
@@ -607,11 +625,67 @@ function autoModelBadgeHTML(cfg,ref){
   const provider=((cfg && cfg.providers) || []).find(p=>providerRouteID(p)===route || p.id===route);
   return modelMultimodalBadgeHTML(provider,model);
 }
+function showToast(message,type){
+  const toast=document.getElementById('uiToast'); if(!toast) return;
+  clearTimeout(uiToastTimer);
+  toast.className='ui-toast show '+(type || 'ok');
+  toast.textContent=message;
+  uiToastTimer=setTimeout(()=>{ toast.className='ui-toast'; },1800);
+}
 function renderAutoModels(cfg){
   const root=document.getElementById('autoModelList'); if(!root) return;
   const models=autoModels(cfg);
-  root.innerHTML=models.length ? models.map((model,i)=>'<div class="model-item"><span class="model-name">'+esc(model)+autoModelBadgeHTML(cfg,model)+'</span><button class="small secondary" onclick="moveAutoModel('+i+',-1)" '+(i===0?'disabled':'')+'>上移</button><button class="small secondary" onclick="moveAutoModel('+i+',1)" '+(i===models.length-1?'disabled':'')+'>下移</button><button class="small secondary" onclick="removeAutoModel('+i+')">删除</button></div>').join('') : '<div class="muted">还没有候选模型。</div>';
+  root.innerHTML=models.length ? models.map((model,i)=>'<div class="model-item auto-sort-item" data-auto-sort-index="'+i+'" data-auto-model="'+esc(model)+'"><span class="auto-drag-handle" title="长按后拖拽排序">⋮⋮</span><span class="model-name">'+esc(model)+autoModelBadgeHTML(cfg,model)+'</span><button class="small secondary" onclick="removeAutoModel('+i+')">删除</button></div>').join('') : '<div class="muted">还没有候选模型。</div>';
+  root.querySelectorAll('.auto-sort-item').forEach(row=>row.addEventListener('pointerdown',autoSortPointerDown));
 }
+function autoSortPointerDown(event){
+  if(event.button!==undefined && event.button!==0) return;
+  if(event.target.closest('button,input,select,a')) return;
+  const row=event.currentTarget; const root=row.parentElement;
+  if(!root) return;
+  if(autoSortState && autoSortState.timer) clearTimeout(autoSortState.timer);
+  autoSortState={row:row,root:root,pointerId:event.pointerId,startX:event.clientX,startY:event.clientY,active:false,timer:null};
+  autoSortState.timer=setTimeout(()=>{
+    if(!autoSortState || autoSortState.row!==row) return;
+    autoSortState.active=true;
+    row.classList.add('dragging');
+    try{ row.setPointerCapture(event.pointerId); }catch(_){}
+  },300);
+}
+function autoSortPointerMove(event){
+  const state=autoSortState;
+  if(!state || state.pointerId!==event.pointerId) return;
+  if(!state.active){
+    if(Math.abs(event.clientX-state.startX)>8 || Math.abs(event.clientY-state.startY)>8){ clearTimeout(state.timer); autoSortState=null; }
+    return;
+  }
+  event.preventDefault();
+  const bounds=state.root.getBoundingClientRect();
+  if(event.clientY<bounds.top+24) state.root.scrollTop-=10;
+  if(event.clientY>bounds.bottom-24) state.root.scrollTop+=10;
+  const target=document.elementFromPoint(event.clientX,event.clientY);
+  const targetRow=target && target.closest ? target.closest('.auto-sort-item') : null;
+  if(!targetRow || targetRow===state.row || targetRow.parentElement!==state.root) return;
+  const rect=targetRow.getBoundingClientRect();
+  state.root.insertBefore(state.row,event.clientY<rect.top+rect.height/2 ? targetRow : targetRow.nextSibling);
+}
+function finishAutoSort(event,cancelled){
+  const state=autoSortState;
+  if(!state || state.pointerId!==event.pointerId) return;
+  clearTimeout(state.timer);
+  autoSortState=null;
+  if(!state.active) return;
+  state.row.classList.remove('dragging');
+  try{ state.row.releasePointerCapture(event.pointerId); }catch(_){}
+  if(cancelled){ renderAutoModels(parseConfig()); return; }
+  const order=[...state.root.querySelectorAll('.auto-sort-item')].map(row=>row.getAttribute('data-auto-model'));
+  updateAutoModels(models=>{ models.splice(0,models.length,...order); });
+  setText('autoModelStatus','ok','已调整顺序，记得保存');
+  showToast('Auto 顺序已调整，记得保存','ok');
+}
+window.addEventListener('pointermove',autoSortPointerMove,{passive:false});
+window.addEventListener('pointerup',event=>finishAutoSort(event,false));
+window.addEventListener('pointercancel',event=>finishAutoSort(event,true));
 function updateAutoModels(mutator){
   const cfg=parseConfig(); if(!cfg) return;
   if(!cfg.auto_model) cfg.auto_model={enabled:false,models:[]};
@@ -620,29 +694,50 @@ function updateAutoModels(mutator){
   delete cfg.auto_model.vision_models;
   mutator(cfg.auto_model.models);
   setConfig(cfg);
+  renderAPIProviders();
+  renderPublishProviders();
 }
 function addAutoModel(){
   const input=document.getElementById('autoModelInput'); const value=(input && input.value || '').trim();
   if(!value || value==='auto'){ setText('autoModelStatus','err','请输入真实模型 ID，例如 oc/big-pickle'); return; }
   if(!value.includes('/')){ setText('autoModelStatus','err','候选模型需要使用 provider/model 格式'); return; }
+  if(autoModels(parseConfig()).includes(value)){ setText('autoModelStatus','err','该模型已在 Auto 列表中'); showToast('该模型已在 Auto 列表中','warn'); return; }
   updateAutoModels(models=>{ models.push(value); });
   if(input) input.value='';
   setText('autoModelStatus','ok','已添加候选模型，记得保存');
+  showToast('已加入 Auto：'+value,'ok');
 }
-function removeAutoModel(index){ updateAutoModels(models=>{ models.splice(index,1); }); setText('autoModelStatus','ok','已移除候选模型，记得保存'); }
+function removeAutoModel(index){ updateAutoModels(models=>{ models.splice(index,1); }); setText('autoModelStatus','ok','已移除候选模型，记得保存'); showToast('已从 Auto 列表移除','ok'); }
+function removeAutoModelValue(source){
+  const value=(typeof source==='string' ? source : (source && source.getAttribute('data-model')) || '').trim();
+  if(!value) return;
+  updateAutoModels(models=>{
+    for(let i=models.length-1;i>=0;i--) if(models[i]===value) models.splice(i,1);
+  });
+  setText('autoModelStatus','ok','已从 Auto 列表移除，记得保存');
+  showToast('已从 Auto 列表移除：'+value,'ok');
+}
+function flashAutoAddButton(value,state){
+  document.querySelectorAll('button.add-auto-model').forEach(button=>{
+    if(button.getAttribute('data-model')!==value) return;
+    button.classList.add(state); button.textContent=state==='added'?'✓':'!';
+    setTimeout(()=>{ button.classList.remove(state); button.textContent='+'; },1200);
+  });
+}
 function addAutoModelValue(source){
   const value=(typeof source==='string' ? source : (source && source.getAttribute('data-model')) || '').trim();
   if(!value || value==='auto'){ setText('autoModelStatus','err','请输入真实模型 ID，例如 oc/big-pickle'); return; }
   if(!value.includes('/')){ setText('autoModelStatus','err','候选模型需要使用 provider/model 格式'); return; }
+  if(autoModels(parseConfig()).includes(value)){
+    flashAutoAddButton(value,'duplicate');
+    showToast('该模型已在 Auto 列表中','warn');
+    setText('autoModelStatus','err','该模型已在 Auto 列表中');
+    return;
+  }
   updateAutoModels(models=>{ models.push(value); });
+  flashAutoAddButton(value,'added');
+  showToast('已加入 Auto：'+value,'ok');
   setText('autoModelStatus','ok','已加入 Auto 候选，记得保存');
-}
-function moveAutoModel(index, delta){
-  updateAutoModels(models=>{
-    const next=index+delta; if(next<0 || next>=models.length) return;
-    const item=models[index]; models.splice(index,1); models.splice(next,0,item);
-  });
-  setText('autoModelStatus','ok','已调整顺序，记得保存');
 }
 function publishedGroupModels(cfg){
   const out=[];
@@ -796,6 +891,7 @@ function providerTitleHTML(p,dotClass){
 function modelRows(p, canProbeIndividually){
   const selected=new Set(selectedModels(p));
   const available=new Set(availableModels(p));
+  const autoSet=new Set(autoModels(parseConfig()));
   const checkedAt=!!p.availability_checked_at;
   const models=unique(p.models || []);
   return models.map(model=>{
@@ -806,12 +902,15 @@ function modelRows(p, canProbeIndividually){
     const remove='<button class="delete-model secondary" type="button" title="删除模型" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" onclick="deleteProviderModel(this)">−</button>';
     const recover=providerModelQuotaBlocked(p,model)?'<button class="small secondary" type="button" title="额度恢复后，执行一次显式恢复探测" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" onclick="recoverQuotaBlockedModel(this)">恢复</button>':'';
     const probe=canProbeIndividually && !providerIsMediaModel(p,model) ? '<button class="small secondary" type="button" title="单独探测模型有效性" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" onclick="probeAPIProviderModel(this)">探测</button>' : '';
-    const addAuto='<button class="add-auto-model secondary" type="button" title="Add to Auto" data-model="'+esc(providerRouteID(p)+'/'+model)+'" onclick="addAutoModelValue(this)">+</button>';
+    const autoRef=providerRouteID(p)+'/'+model;
+    const autoMember=autoSet.has(autoRef);
+    const addAuto='<button class="add-auto-model secondary" type="button" title="'+(autoMember?'已在 Auto 列表中':'加入 Auto')+'" data-model="'+esc(autoRef)+'" onclick="addAutoModelValue(this)">+</button>';
     const locked=isLockedModel(p,model);
     const lock='<button class="model-lock secondary '+(locked?'locked':'')+'" type="button" title="'+(locked?'已上锁：一键/定时探测会跳过':'未上锁：一键/定时探测会包含')+'" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" onclick="toggleModelLock(this)">'+(locked?'🔒':'🔓')+'</button>';
     const kind=providerModelKind(p,model);
     const kindSelect='<select class="model-kind-select" title="模型类型" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" onchange="saveModelKind(this)">'+[['auto','自动'],['text','文本'],['image','图片'],['video','视频'],['audio','音频'],['tts','TTS']].map(item=>'<option value="'+item[0]+'" '+(kind===item[0]?'selected':'')+'>'+item[1]+'</option>').join('')+'</select>';
-    return '<div class="model-item '+(usable?'':'off')+'">'+toggle+remove+recover+probe+addAuto+lock+kindSelect+'<span class="model-name">'+esc(model)+modelMultimodalBadgeHTML(p,model)+note+latencyHTML(p,model)+(usable?'':modelErrorHTML(p,model))+'</span></div>';
+    const autoBadge=autoMember?'<span class="auto-member-badge">Auto</span><button class="auto-remove-badge" type="button" title="从 Auto 列表删除" data-model="'+esc(autoRef)+'" onclick="removeAutoModelValue(this)">×</button>':'';
+    return '<div class="model-item '+(usable?'':'off')+'">'+toggle+remove+recover+probe+addAuto+lock+kindSelect+'<span class="model-name">'+autoBadge+esc(model)+modelMultimodalBadgeHTML(p,model)+note+latencyHTML(p,model)+(usable?'':modelErrorHTML(p,model))+'</span></div>';
   }).join('');
 }
 function renderProviderStatus(){
@@ -824,7 +923,7 @@ function renderProviderStatus(){
     const availableCount=p.availability_checked_at?available.length:loaded.length;
     const auth=authStatus(p); const authText=auth==='needs_login' ? '<div class="err">登录失效，需要重新登录。'+esc(authError(p))+'</div>' : '<div class="muted">已连接</div>';
     const publishedHTML=published.length
-      ? '<div class="published-model-list">'+published.map(model=>'<span class="published-model-tag">'+esc(model)+'</span>').join('')+'</div>'
+      ? '<div class="published-model-list">'+published.map(model=>'<span class="published-model-tag">'+esc(model)+modelMultimodalBadgeHTML(p,model)+'</span>').join('')+'</div>'
       : '<div class="muted" style="margin-top:5px">暂无已发布模型</div>';
     return '<div class="card">'+providerTitleHTML(p,'green-dot')+authText+'<div class="muted">已加载 '+loaded.length+' 个模型，可用 '+availableCount+' 个，已发布 '+published.length+' 个</div><div class="published-model-title">已发布模型</div>'+publishedHTML+'</div>';
   });

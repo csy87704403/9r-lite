@@ -201,7 +201,7 @@ func TestAdminShowsDetectedMultimodalBadge(t *testing.T) {
 
 func TestAdminConnectedCardsShowPublishedModels(t *testing.T) {
 	html := adminHTMLLiteV2(`{"providers":[]}`)
-	for _, marker := range []string{"published-model-title", "published-model-list", "published-model-tag", "已发布模型", "暂无已发布模型"} {
+	for _, marker := range []string{"published-model-title", "published-model-list", "published-model-tag", "已发布模型", "暂无已发布模型", "published.map(model=>", "modelMultimodalBadgeHTML(p,model)"} {
 		if !strings.Contains(html, marker) {
 			t.Fatalf("admin page is missing published model card marker %q", marker)
 		}

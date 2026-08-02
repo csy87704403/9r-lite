@@ -35,7 +35,7 @@ func TestImageHistoryDetection(t *testing.T) {
 	}
 }
 
-func TestAutoImageConversationReturnsToTextCandidates(t *testing.T) {
+func TestAutoImageConversationReturnsToGeneralCandidates(t *testing.T) {
 	var normalCalls atomic.Int32
 	var visionCalls atomic.Int32
 	newUpstream := func(counter *atomic.Int32, reply string) *httptest.Server {
@@ -72,10 +72,10 @@ func TestAutoImageConversationReturnsToTextCandidates(t *testing.T) {
 		t.Fatalf("vision Auto route failed: %d %s", image.Code, image.Body.String())
 	}
 	textFollowUp := call(`{"model":"auto","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}},{"type":"text","text":"describe"}]},{"role":"assistant","content":"previous"},{"role":"user","content":"continue with text only"}]}`)
-	if textFollowUp.Code != http.StatusOK || !strings.Contains(textFollowUp.Body.String(), `"content":"normal"`) {
-		t.Fatalf("text follow-up did not return to a text model: %d %s", textFollowUp.Code, textFollowUp.Body.String())
+	if textFollowUp.Code != http.StatusOK || !strings.Contains(textFollowUp.Body.String(), `"content":"vision"`) {
+		t.Fatalf("text follow-up did not continue the full candidate rotation: %d %s", textFollowUp.Code, textFollowUp.Body.String())
 	}
-	if normalCalls.Load() != 2 || visionCalls.Load() != 1 {
+	if normalCalls.Load() != 1 || visionCalls.Load() != 2 {
 		t.Fatalf("unexpected route counts: normal=%d vision=%d", normalCalls.Load(), visionCalls.Load())
 	}
 }
@@ -88,11 +88,14 @@ func TestAutoCandidatesRoundRobinByModality(t *testing.T) {
 		{ID: "vision2", Enabled: true, Models: []string{"model"}, ModelMultimodal: map[string]bool{"model": true}},
 	}
 	s := &Server{config: Config{AutoModel: AutoModelConfig{Enabled: true, Models: []string{"text1/model", "vision1/model", "text2/model", "vision2/model"}}, Providers: providers}}
-	if got := s.autoChatCandidatesForOpenAI(t.Context(), false); len(got) != 2 || got[0] != "text1/model" {
+	if got := s.autoChatCandidatesForOpenAI(t.Context(), false); len(got) != 4 || got[0] != "text1/model" {
 		t.Fatalf("first text rotation = %#v", got)
 	}
-	if got := s.autoChatCandidatesForOpenAI(t.Context(), false); len(got) != 2 || got[0] != "text2/model" {
+	if got := s.autoChatCandidatesForOpenAI(t.Context(), false); len(got) != 4 || got[0] != "vision1/model" {
 		t.Fatalf("second text rotation = %#v", got)
+	}
+	if got := s.autoChatCandidatesForOpenAI(t.Context(), false); len(got) != 4 || got[0] != "text2/model" {
+		t.Fatalf("third text rotation = %#v", got)
 	}
 	if got := s.autoChatCandidatesForOpenAI(t.Context(), true); len(got) != 2 || got[0] != "vision1/model" {
 		t.Fatalf("first vision rotation = %#v", got)
@@ -193,5 +196,10 @@ func TestAutoVisionConfigNormalizationAndAdmin(t *testing.T) {
 	html := adminHTMLLiteV2(`{"providers":[],"auto_model":{"enabled":true,"models":[],"vision_models":[]}}`)
 	if strings.Contains(html, "autoVisionModelInput") || strings.Contains(html, "addAutoVisionModelValue") || !strings.Contains(html, "请求包含图片时") {
 		t.Fatal("Admin did not switch to the single Auto model list")
+	}
+	for _, marker := range []string{"auto-sort-item", "autoSortPointerDown", "长按后拖拽排序", "uiToast", "auto-member-badge", "auto-remove-badge", "removeAutoModelValue"} {
+		if !strings.Contains(html, marker) {
+			t.Fatalf("Admin is missing Auto interaction marker %q", marker)
+		}
 	}
 }

@@ -2690,9 +2690,6 @@ func (s *Server) autoChatCandidatesForOpenAI(ctx context.Context, hasImage bool)
 	candidates := s.autoCandidatesMatching(ctx, cfg.AutoModel.Models, func(p ProviderConfig) bool {
 		return !isClaudeCodeCompatibleProvider(p)
 	}, hasImage)
-	if !hasImage {
-		candidates = s.preferTextAutoCandidates(candidates)
-	}
 	return s.rotateAutoCandidates(candidates, hasImage)
 }
 
@@ -2702,28 +2699,7 @@ func (s *Server) autoChatCandidates(ctx context.Context, hasImage bool) []string
 		return nil
 	}
 	candidates := s.autoCandidatesMatching(ctx, cfg.AutoModel.Models, nil, hasImage)
-	if !hasImage {
-		candidates = s.preferTextAutoCandidates(candidates)
-	}
 	return s.rotateAutoCandidates(candidates, hasImage)
-}
-
-func (s *Server) preferTextAutoCandidates(candidates []string) []string {
-	var textCandidates []string
-	for _, candidate := range candidates {
-		providerID, model, ok := strings.Cut(candidate, "/")
-		if !ok {
-			continue
-		}
-		p, ok := s.providerByRouteID(providerID)
-		if ok && !p.ModelMultimodal[model] {
-			textCandidates = append(textCandidates, candidate)
-		}
-	}
-	if len(textCandidates) > 0 {
-		return textCandidates
-	}
-	return candidates
 }
 
 func (s *Server) rotateAutoCandidates(candidates []string, vision bool) []string {
