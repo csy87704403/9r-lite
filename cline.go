@@ -21,6 +21,113 @@ const (
 	clineChatURL          = "https://api.cline.bot/api/v1/chat/completions"
 )
 
+var clineFreeModels = []string{
+	"deepseek/deepseek-v4-flash",
+	"cline-free/glm-5.2",
+	"stepfun/step-3.7-flash",
+}
+
+func withClineFreeModels(models []string) []string {
+	merged := append([]string(nil), clineFreeModels...)
+	merged = append(merged, models...)
+	return uniqueStrings(merged)
+}
+
+func clineProviderAccounts(p ProviderConfig) []ClineAccount {
+	accounts := make([]ClineAccount, 0, len(p.ClineAccounts)+1)
+	for _, account := range p.ClineAccounts {
+		account.Email = strings.TrimSpace(account.Email)
+		account.AccessToken = strings.TrimSpace(account.AccessToken)
+		account.RefreshToken = strings.TrimSpace(account.RefreshToken)
+		if account.AccessToken != "" || account.RefreshToken != "" {
+			accounts = append(accounts, account)
+		}
+	}
+	if len(accounts) == 0 && (strings.TrimSpace(p.AccessToken) != "" || strings.TrimSpace(p.RefreshToken) != "") {
+		accounts = append(accounts, ClineAccount{
+			Email:        strings.TrimSpace(p.Email),
+			AccessToken:  strings.TrimSpace(p.AccessToken),
+			RefreshToken: strings.TrimSpace(p.RefreshToken),
+			ExpiresIn:    p.ExpiresIn,
+		})
+	}
+	return accounts
+}
+
+func syncClineLegacyAccount(p *ProviderConfig) {
+	if p == nil {
+		return
+	}
+	accounts := clineProviderAccounts(*p)
+	if len(accounts) == 0 {
+		p.ClineAccounts = nil
+		p.ActiveClineAccount = 0
+		return
+	}
+	if p.ActiveClineAccount < 0 || p.ActiveClineAccount >= len(accounts) {
+		p.ActiveClineAccount = 0
+	}
+	p.ClineAccounts = accounts
+	active := accounts[p.ActiveClineAccount]
+	p.AccessToken = active.AccessToken
+	p.RefreshToken = active.RefreshToken
+	p.Email = active.Email
+	p.ExpiresIn = active.ExpiresIn
+}
+
+func migrateClineProviderAccounts(p *ProviderConfig) {
+	if p == nil || p.Type != "cline" {
+		return
+	}
+	syncClineLegacyAccount(p)
+}
+
+func upsertClineAccount(p ProviderConfig, account ClineAccount) (ProviderConfig, int) {
+	accounts := clineProviderAccounts(p)
+	match := -1
+	for i, existing := range accounts {
+		if account.Email != "" && strings.EqualFold(existing.Email, account.Email) {
+			match = i
+			break
+		}
+	}
+	if match < 0 {
+		accounts = append(accounts, account)
+		match = len(accounts) - 1
+	} else {
+		if account.AccessToken == "" {
+			account.AccessToken = accounts[match].AccessToken
+		}
+		if account.RefreshToken == "" {
+			account.RefreshToken = accounts[match].RefreshToken
+		}
+		if account.Email == "" {
+			account.Email = accounts[match].Email
+		}
+		accounts[match] = account
+	}
+	p.ClineAccounts = accounts
+	p.ActiveClineAccount = match
+	syncClineLegacyAccount(&p)
+	return p, match
+}
+
+func clineAccountOrder(p ProviderConfig) []int {
+	accounts := clineProviderAccounts(p)
+	if len(accounts) == 0 {
+		return nil
+	}
+	active := p.ActiveClineAccount
+	if active < 0 || active >= len(accounts) {
+		active = 0
+	}
+	order := make([]int, 0, len(accounts))
+	for offset := 0; offset < len(accounts); offset++ {
+		order = append(order, (active+offset)%len(accounts))
+	}
+	return order
+}
+
 func (s *Server) handleClineAuthorize(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
@@ -63,21 +170,29 @@ func (s *Server) handleClineCallback(w http.ResponseWriter, r *http.Request) {
 	p.Type = "cline"
 	p.Enabled = true
 	p.BaseURL = firstNonEmpty(p.BaseURL, clineChatURL)
-	p.AccessToken = firstNonEmpty(stringValue(tokens["access_token"]), stringValue(tokens["accessToken"]))
-	p.RefreshToken = firstNonEmpty(stringValue(tokens["refresh_token"]), stringValue(tokens["refreshToken"]))
-	p.Email = stringValue(tokens["email"])
-	p.ProviderSpecificData = map[string]string{
-		"firstName": stringValue(tokens["firstName"]),
-		"lastName":  stringValue(tokens["lastName"]),
+	account := ClineAccount{
+		AccessToken:  firstNonEmpty(stringValue(tokens["access_token"]), stringValue(tokens["accessToken"])),
+		RefreshToken: firstNonEmpty(stringValue(tokens["refresh_token"]), stringValue(tokens["refreshToken"])),
+		Email:        strings.TrimSpace(stringValue(tokens["email"])),
 	}
+	if account.AccessToken == "" {
+		http.Error(w, "cline token exchange returned no access token", http.StatusBadGateway)
+		return
+	}
+	if p.ProviderSpecificData == nil {
+		p.ProviderSpecificData = map[string]string{}
+	}
+	p.ProviderSpecificData["firstName"] = stringValue(tokens["firstName"])
+	p.ProviderSpecificData["lastName"] = stringValue(tokens["lastName"])
 	if expiresAt := firstNonEmpty(stringValue(tokens["expires_at"]), stringValue(tokens["expiresAt"])); expiresAt != "" {
 		if t, err := time.Parse(time.RFC3339, expiresAt); err == nil {
-			p.ExpiresIn = int64(time.Until(t).Seconds())
+			account.ExpiresIn = int64(time.Until(t).Seconds())
 		}
 	}
-	if p.ExpiresIn <= 0 {
-		p.ExpiresIn = 3600
+	if account.ExpiresIn <= 0 {
+		account.ExpiresIn = 3600
 	}
+	p, _ = upsertClineAccount(p, account)
 	if len(p.Models) == 0 {
 		p.Models = []string{
 			"anthropic/claude-opus-4.7",
@@ -90,16 +205,14 @@ func (s *Server) handleClineCallback(w http.ResponseWriter, r *http.Request) {
 			"kwaipilot/kat-coder-pro",
 		}
 	}
-	if p.AccessToken == "" {
-		http.Error(w, "cline token exchange returned no access token", http.StatusBadGateway)
-		return
-	}
+	p.Models = withClineFreeModels(p.Models)
 	if err := s.updateProvider(p); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte("<!doctype html><meta charset=\"utf-8\"><title>Cline Connected</title><p>Cline connected. You can close this window.</p><script>setTimeout(()=>window.close(),1200)</script>"))
+	message := fmt.Sprintf("Cline connected: %s. %d account(s) saved.", htmlEscape(account.Email), len(p.ClineAccounts))
+	_, _ = w.Write([]byte("<!doctype html><meta charset=\"utf-8\"><title>Cline Connected</title><p>" + message + "</p><script>setTimeout(()=>window.close(),1200)</script>"))
 }
 
 func (s *Server) exchangeClineToken(r *http.Request, code, redirectURI string) (map[string]any, error) {
@@ -152,7 +265,7 @@ func (s *Server) exchangeClineToken(r *http.Request, code, redirectURI string) (
 }
 
 func (s *Server) proxyCline(w http.ResponseWriter, r *http.Request, p ProviderConfig, req chatRequest, upstreamModel string) {
-	if p.AccessToken == "" {
+	if len(clineProviderAccounts(p)) == 0 {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "cline is not logged in"})
 		return
 	}
@@ -168,7 +281,7 @@ func (s *Server) proxyCline(w http.ResponseWriter, r *http.Request, p ProviderCo
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+	if resp.StatusCode == http.StatusUnauthorized {
 		s.markProviderAuthState(p.ID, "needs_login", fmt.Sprintf("Cline returned %d; please login again", resp.StatusCode))
 	} else if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
 		s.markProviderAuthState(p.ID, "ok", "")
@@ -187,9 +300,48 @@ func (s *Server) proxyCline(w http.ResponseWriter, r *http.Request, p ProviderCo
 }
 
 func (s *Server) doClineRequest(ctx context.Context, p ProviderConfig, stream bool, body []byte, allowRefresh bool) (*http.Response, ProviderConfig, error) {
+	order := clineAccountOrder(p)
+	if len(order) == 0 {
+		return nil, p, errors.New("Cline has no logged-in accounts")
+	}
+	for position, accountIndex := range order {
+		resp, updated, authFailure, err := s.doClineAccountRequest(ctx, p, accountIndex, stream, body, allowRefresh)
+		p = updated
+		if err != nil {
+			if authFailure && position < len(order)-1 {
+				continue
+			}
+			return nil, p, err
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+			p = s.activateClineAccount(p, accountIndex)
+			return resp, p, nil
+		}
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		_ = resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(responseBody))
+		if readErr != nil {
+			return nil, p, readErr
+		}
+		shouldRotate := authFailure || isQuotaKeyError(resp.StatusCode, responseBody) || isRateLimitKeyError(resp.StatusCode, responseBody)
+		if shouldRotate && position < len(order)-1 {
+			_ = resp.Body.Close()
+			continue
+		}
+		return resp, p, nil
+	}
+	return nil, p, errors.New("all Cline accounts failed")
+}
+
+func (s *Server) doClineAccountRequest(ctx context.Context, p ProviderConfig, accountIndex int, stream bool, body []byte, allowRefresh bool) (*http.Response, ProviderConfig, bool, error) {
+	accounts := clineProviderAccounts(p)
+	if accountIndex < 0 || accountIndex >= len(accounts) {
+		return nil, p, true, errors.New("Cline account index is invalid")
+	}
+	account := accounts[accountIndex]
 	headers := map[string]string{
 		"Content-Type":       "application/json",
-		"Authorization":      clineAuthorization(p.AccessToken),
+		"Authorization":      clineAuthorization(account.AccessToken),
 		"Accept":             acceptHeader(stream),
 		"HTTP-Referer":       "https://cline.bot",
 		"X-Title":            "Cline",
@@ -200,38 +352,69 @@ func (s *Server) doClineRequest(ctx context.Context, p ProviderConfig, stream bo
 		"X-CLIENT-VERSION":   "0.1",
 		"X-CORE-VERSION":     "0.1",
 		"X-IS-MULTIROOT":     "false",
+		"X-Task-ID":          newSessionID(),
 	}
 	target := firstNonEmpty(p.BaseURL, clineChatURL)
 	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
-		return nil, p, err
+		return nil, p, false, err
 	}
 	for k, v := range headers {
 		upReq.Header.Set(k, v)
 	}
 	resp, err := s.client.Do(upReq)
 	if err != nil {
-		return nil, p, err
+		return nil, p, false, err
 	}
-	if allowRefresh && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+	if resp.StatusCode == http.StatusUnauthorized && allowRefresh {
 		_ = resp.Body.Close()
-		refreshed, rerr := s.refreshClineProvider(ctx, p)
+		refreshed, rerr := s.refreshClineAccount(ctx, p, accountIndex)
 		if rerr != nil {
-			s.markProviderAuthState(p.ID, "needs_login", rerr.Error())
-			return nil, p, rerr
+			return nil, p, true, rerr
 		}
-		s.markProviderAuthState(p.ID, "ok", "")
-		return s.doClineRequest(ctx, refreshed, stream, body, false)
+		return s.doClineAccountRequest(ctx, refreshed, accountIndex, stream, body, false)
 	}
-	return resp, p, nil
+	return resp, p, resp.StatusCode == http.StatusUnauthorized, nil
+}
+
+func (s *Server) activateClineAccount(p ProviderConfig, accountIndex int) ProviderConfig {
+	accounts := clineProviderAccounts(p)
+	if accountIndex < 0 || accountIndex >= len(accounts) {
+		return p
+	}
+	changed := p.ActiveClineAccount != accountIndex || len(p.ClineAccounts) != len(accounts)
+	p.ClineAccounts = accounts
+	p.ActiveClineAccount = accountIndex
+	syncClineLegacyAccount(&p)
+	if changed {
+		_ = s.updateProvider(p)
+	}
+	return p
 }
 
 func (s *Server) refreshClineProvider(ctx context.Context, p ProviderConfig) (ProviderConfig, error) {
-	if strings.TrimSpace(p.RefreshToken) == "" {
+	accounts := clineProviderAccounts(p)
+	if len(accounts) == 0 {
+		return p, errors.New("Cline has no logged-in accounts")
+	}
+	index := p.ActiveClineAccount
+	if index < 0 || index >= len(accounts) {
+		index = 0
+	}
+	return s.refreshClineAccount(ctx, p, index)
+}
+
+func (s *Server) refreshClineAccount(ctx context.Context, p ProviderConfig, accountIndex int) (ProviderConfig, error) {
+	accounts := clineProviderAccounts(p)
+	if accountIndex < 0 || accountIndex >= len(accounts) {
+		return p, errors.New("Cline account index is invalid")
+	}
+	account := accounts[accountIndex]
+	if strings.TrimSpace(account.RefreshToken) == "" {
 		return p, errors.New("Cline refresh token is empty; please login again")
 	}
 	reqBody := map[string]any{
-		"refreshToken": p.RefreshToken,
+		"refreshToken": account.RefreshToken,
 		"grantType":    "refresh_token",
 		"clientType":   "extension",
 	}
@@ -262,18 +445,21 @@ func (s *Server) refreshClineProvider(ctx context.Context, p ProviderConfig) (Pr
 	if accessToken == "" {
 		return p, errors.New("Cline token refresh returned no access token")
 	}
-	p.AccessToken = accessToken
+	account.AccessToken = accessToken
 	if refreshToken := stringValue(data["refreshToken"]); refreshToken != "" {
-		p.RefreshToken = refreshToken
+		account.RefreshToken = refreshToken
 	}
 	if expiresAt := stringValue(data["expiresAt"]); expiresAt != "" {
 		if t, err := time.Parse(time.RFC3339, expiresAt); err == nil {
-			p.ExpiresIn = int64(time.Until(t).Seconds())
+			account.ExpiresIn = int64(time.Until(t).Seconds())
 		}
 	}
-	if p.ExpiresIn <= 0 {
-		p.ExpiresIn = 3600
+	if account.ExpiresIn <= 0 {
+		account.ExpiresIn = 3600
 	}
+	accounts[accountIndex] = account
+	p.ClineAccounts = accounts
+	syncClineLegacyAccount(&p)
 	if p.ProviderSpecificData == nil {
 		p.ProviderSpecificData = map[string]string{}
 	}

@@ -73,6 +73,43 @@ func TestMasterKeyStillSeesAllModels(t *testing.T) {
 	}
 }
 
+func TestAutoModelAdvertisesImageInput(t *testing.T) {
+	s := testGroupedServer()
+	s.config.AutoModel = AutoModelConfig{Enabled: true, Models: []string{"test/free"}}
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer master-key")
+	rr := httptest.NewRecorder()
+
+	s.handleModels(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Data []struct {
+			ID         string `json:"id"`
+			Attachment bool   `json:"attachment"`
+			ToolCall   bool   `json:"tool_call"`
+			Modalities struct {
+				Input []string `json:"input"`
+			} `json:"modalities"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range body.Data {
+		if model.ID != "auto" {
+			continue
+		}
+		if !model.Attachment || !model.ToolCall || len(model.Modalities.Input) != 2 || model.Modalities.Input[1] != "image" {
+			t.Fatalf("auto capabilities = %#v", model)
+		}
+		return
+	}
+	t.Fatal("auto model not found")
+}
+
 func TestModelGroupKeyCannotCallOutsideGroup(t *testing.T) {
 	s := testGroupedServer()
 	raw := []byte(`{"model":"test/paid","messages":[{"role":"user","content":"hello"}]}`)

@@ -101,10 +101,12 @@ func (s *Server) doResponsesRequest(ctx context.Context, p ProviderConfig, body 
 		}
 		resp.Body = io.NopCloser(bytes.NewReader(raw))
 		resp.ContentLength = int64(len(raw))
-		if isCredentialKeyError(resp.StatusCode, raw) {
-			s.markProviderKeyFailed(p.ID, keyIndex, "", true)
-		} else if isQuotaKeyError(resp.StatusCode, raw) {
+		if isQuotaKeyError(resp.StatusCode, raw) {
 			s.markProviderKeyFailed(p.ID, keyIndex, model, false)
+		} else if isRateLimitKeyError(resp.StatusCode, raw) {
+			// Temporary throttling: continue with the next key.
+		} else if isCredentialKeyError(resp.StatusCode, raw) {
+			s.markProviderKeyFailed(p.ID, keyIndex, "", true)
 		} else {
 			return resp, nil
 		}

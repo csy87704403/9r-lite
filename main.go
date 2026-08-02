@@ -30,12 +30,15 @@ import (
 )
 
 const (
-	openCodeBaseURL    = "https://opencode.ai"
-	openCodeModelsURL  = "https://opencode.ai/zen/v1/models"
-	mimoBootstrapURL   = "https://api.xiaomimimo.com/api/free-ai/bootstrap"
-	mimoFreeChatURL    = "https://api.xiaomimimo.com/api/free-ai/openai/chat"
-	mimoSystemMarker   = "You are MiMoCode, an interactive CLI tool that helps users with software engineering tasks."
-	defaultHTTPTimeout = 60 * time.Second
+	openCodeBaseURL            = "https://opencode.ai"
+	openCodeModelsURL          = "https://opencode.ai/zen/v1/models"
+	mimoBootstrapURL           = "https://api.xiaomimimo.com/api/free-ai/bootstrap"
+	mimoFreeChatURL            = "https://api.xiaomimimo.com/api/free-ai/openai/chat"
+	mimoSystemMarker           = "You are MiMoCode, an interactive CLI tool that helps users with software engineering tasks."
+	defaultHTTPTimeout         = 60 * time.Second
+	autoProbeFailureThreshold  = 3
+	multimodalProbeCode        = "9R7Q"
+	multimodalProbeImageBase64 = "iVBORw0KGgoAAAANSUhEUgAAAGAAAAAgCAYAAADtwH1UAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAIcSURBVGhD7ZiBbcIwEEWzDFuwBDOwAiuwQTZgAiZgARZgARZggFQf9ae/h88OrdSLq3uSRZQ4TnzPPjsMUxLKYE8kf0sKCCYFBJMCgkkBwaSAYFJAMCkgmEUCLpfLtN1up2EYnuVwOEyPx+Nbnd1uN18vlf1+P91ut7n+9Xp9qWML6ij3+/357M1mM9fBMc7hWo80BSD4NjAoEKISWgJYGKh3BZzP55frtqBObzQFcLQhwAi4ChnHca63VABGqwfaZz3MGIKZY9vxis6yHqgK0I4j8ATBwTnIIRSAXwtGvYr0YLsoOrsgjedxvwYZx3qfiuuBqgBNE5oOMPJ5nvxWgD7LphINvofOwJ6ovq03A3REUszSFHQ6neQJX3gC9R28e4GuET2loaoAwE5x0bX5+B0BNrhE27Sj35uFlqX11kZTQGv3wdFWE4D0UwuKziiLNwOQ1jAo2K620dOW9LXHBSBBc3gpYDaFYLZovdruh217ddgGAk4gQ9vmsb5TD/zobY/H47OjS3ZBGhzcZ/HWGaW0C4JgvocWT+JaaQpgYLG9s2tA6TvACsA9+uVqU5GmOC912HWnVuwX+tppCtAtpxbvS9gKALpAQobeV9rSlmitRSxorycJ9V5/gk7pKMbUt52sCQCaLjQVLRUAav8F6X9VOjPXTrvXHcGBYgfHmvlXAnokBQSTAoJJAcGkgGBSQDApIJgUEEwKCOYDKwJOOEG7cI8AAAAASUVORK5CYII="
 )
 
 type Config struct {
@@ -67,6 +70,13 @@ type accessScope struct {
 	Group *ModelGroup
 }
 
+type ClineAccount struct {
+	Email        string `json:"email,omitempty"`
+	AccessToken  string `json:"access_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	ExpiresIn    int64  `json:"expires_in,omitempty"`
+}
+
 type ProviderConfig struct {
 	ID                    string            `json:"id"`
 	Name                  string            `json:"name"`
@@ -85,6 +95,8 @@ type ProviderConfig struct {
 	APIKeys               []string          `json:"api_keys,omitempty"`
 	AccessToken           string            `json:"access_token,omitempty"`
 	RefreshToken          string            `json:"refresh_token,omitempty"`
+	ClineAccounts         []ClineAccount    `json:"cline_accounts,omitempty"`
+	ActiveClineAccount    int               `json:"active_cline_account_index,omitempty"`
 	Email                 string            `json:"email,omitempty"`
 	DisplayName           string            `json:"display_name,omitempty"`
 	ExpiresIn             int64             `json:"expires_in,omitempty"`
@@ -93,9 +105,12 @@ type ProviderConfig struct {
 	EnabledModels         []string          `json:"enabled_models,omitempty"`
 	LockedModels          []string          `json:"locked_models,omitempty"`
 	ModelKinds            map[string]string `json:"model_kinds,omitempty"`
+	ModelMultimodal       map[string]bool   `json:"model_multimodal,omitempty"`
 	AvailableModels       []string          `json:"available_models,omitempty"`
+	QuotaBlockedModels    []string          `json:"quota_blocked_models,omitempty"`
 	ModelLatencyMS        map[string]int64  `json:"model_latency_ms,omitempty"`
 	ModelErrors           map[string]string `json:"model_errors,omitempty"`
+	ModelFailureCounts    map[string]int    `json:"model_failure_counts,omitempty"`
 	AvailabilityCheckedAt int64             `json:"availability_checked_at,omitempty"`
 	FetchModels           bool              `json:"fetch_models,omitempty"`
 }
@@ -157,7 +172,16 @@ type Server struct {
 	dataDir                string
 	config                 Config
 	mu                     sync.RWMutex
+	autoMu                 sync.RWMutex
+	autoFailedModels       map[string]map[string]bool
+	autoTextCursor         uint64
+	autoVisionCursor       uint64
 	probeMu                sync.Mutex
+	multimodalProbeMu      sync.Mutex
+	multimodalProbing      map[string]bool
+	usageMu                sync.Mutex
+	usage                  UsageStore
+	usageSaveCh            chan struct{}
 	client                 *http.Client
 	mimo                   *MimoAuth
 	mimoProxyMu            sync.Mutex
@@ -190,6 +214,99 @@ type mediaRequest struct {
 
 type internalBypassKey struct{}
 
+type autoRetryWriter struct {
+	target    http.ResponseWriter
+	header    http.Header
+	status    int
+	body      bytes.Buffer
+	committed bool
+	bufferOK  bool
+}
+
+// modelFailureTrackingWriter forwards the upstream response immediately while
+// retaining a small error body for availability state updates.
+type modelFailureTrackingWriter struct {
+	target http.ResponseWriter
+	status int
+	body   bytes.Buffer
+}
+
+func (w *modelFailureTrackingWriter) Header() http.Header {
+	return w.target.Header()
+}
+
+func (w *modelFailureTrackingWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.target.WriteHeader(status)
+}
+
+func (w *modelFailureTrackingWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.status >= http.StatusBadRequest && w.body.Len() < 64<<10 {
+		_, _ = w.body.Write(body[:min(len(body), 64<<10-w.body.Len())])
+	}
+	return w.target.Write(body)
+}
+
+func (w *modelFailureTrackingWriter) Flush() {
+	if flusher, ok := w.target.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func newAutoRetryWriter(target http.ResponseWriter, bufferOK bool) *autoRetryWriter {
+	return &autoRetryWriter{target: target, header: make(http.Header), bufferOK: bufferOK}
+}
+
+func (w *autoRetryWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *autoRetryWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	if status >= http.StatusOK && status <= 299 && !w.bufferOK {
+		copyResponseHeaders(w.target.Header(), w.header)
+		w.target.WriteHeader(status)
+		w.committed = true
+	}
+}
+
+func (w *autoRetryWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.committed {
+		return w.target.Write(body)
+	}
+	return w.body.Write(body)
+}
+
+func (w *autoRetryWriter) Flush() {
+	if w.committed {
+		if flusher, ok := w.target.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+}
+
+func (w *autoRetryWriter) relay() {
+	copyResponseHeaders(w.target.Header(), w.header)
+	status := w.status
+	if status == 0 {
+		status = http.StatusBadGateway
+	}
+	w.target.WriteHeader(status)
+	_, _ = w.target.Write(w.body.Bytes())
+}
+
 func main() {
 	tuneRuntime()
 
@@ -206,6 +323,7 @@ func main() {
 	mux.HandleFunc("/admin", srv.handleAdmin)
 	mux.HandleFunc("/admin/help", srv.handleAdminHelp)
 	mux.HandleFunc("/api/admin/password", srv.handleAdminPassword)
+	mux.HandleFunc("/api/admin/usage", srv.handleUsage)
 	mux.HandleFunc("/api/config", srv.handleConfig)
 	mux.HandleFunc("/api/provider/models", srv.handleProviderModels)
 	mux.HandleFunc("/api/provider/probe", srv.handleProviderProbe)
@@ -255,6 +373,10 @@ func NewServer(dataDir string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	usage, err := loadUsage(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("load usage: %w", err)
+	}
 
 	client, err := newHTTPClient("")
 	if err != nil {
@@ -277,6 +399,10 @@ func NewServer(dataDir string) (*Server, error) {
 	srv := &Server{
 		dataDir:                dataDir,
 		config:                 cfg,
+		autoFailedModels:       map[string]map[string]bool{},
+		multimodalProbing:      map[string]bool{},
+		usage:                  usage,
+		usageSaveCh:            make(chan struct{}, 1),
 		client:                 client,
 		mimoProxyControlURL:    mimoProxyControlURL,
 		mimoProxyGroup:         envDefault("MIMO_PROXY_GROUP", "MonoCloud"),
@@ -292,6 +418,7 @@ func NewServer(dataDir string) (*Server, error) {
 		return nil, err
 	}
 	srv.adminHash = adminHash
+	go srv.usageSaveLoop()
 	return srv, nil
 }
 
@@ -524,6 +651,13 @@ func mergeDefaultConfig(cfg Config) Config {
 			merged = append(merged, p)
 		}
 	}
+	for i := range merged {
+		if openRouterFreeModelsOnly(merged[i]) {
+			retainOpenRouterFreeModels(&merged[i])
+		}
+		migrateMultimodalProbeCache(&merged[i])
+		migrateClineProviderAccounts(&merged[i])
+	}
 	cfg.DeletedProviderIDs = keysFromSet(deleted)
 	cfg.Providers = merged
 	normalizeConfigModelRefs(&cfg)
@@ -549,11 +683,11 @@ func normalizeConfigModelRefs(cfg *Config) {
 	for i, ref := range cfg.AutoModel.Models {
 		cfg.AutoModel.Models[i] = normalize(ref)
 	}
-	cfg.AutoModel.Models = uniqueStrings(cfg.AutoModel.Models)
 	for i, ref := range cfg.AutoModel.VisionModels {
 		cfg.AutoModel.VisionModels[i] = normalize(ref)
 	}
-	cfg.AutoModel.VisionModels = uniqueStrings(cfg.AutoModel.VisionModels)
+	cfg.AutoModel.Models = uniqueStrings(append(cfg.AutoModel.Models, cfg.AutoModel.VisionModels...))
+	cfg.AutoModel.VisionModels = nil
 	for i := range cfg.ModelGroups {
 		for j, ref := range cfg.ModelGroups[i].Models {
 			cfg.ModelGroups[i].Models[j] = normalize(ref)
@@ -720,6 +854,7 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 	oldEnabled := append([]string(nil), p.EnabledModels...)
 	manual := providerManualPublishOverride(p)
 	p.Models = uniqueStrings(ids)
+	retainKnownModelMultimodal(&p)
 	if manual {
 		p.EnabledModels = orderedIntersection(p.Models, oldEnabled)
 	} else {
@@ -728,6 +863,7 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 	p.AvailableModels = nil
 	p.ModelLatencyMS = nil
 	p.ModelErrors = nil
+	p.ModelFailureCounts = nil
 	p.AvailabilityCheckedAt = 0
 	p.FetchModels = true
 	if p.ProviderSpecificData == nil {
@@ -777,16 +913,47 @@ func (s *Server) handleProviderProbe(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider has no loaded models"})
 		return
 	}
-	probeModels := chatModelIDs(p, p.Models)
+	probeModels := unlockedModelIDs(chatModelIDs(p, p.Models), p.LockedModels)
 	if len(probeModels) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provider has no text chat models to probe"})
 		return
 	}
+	s.clearNegativeModelMultimodal(p.ID, probeModels)
 	available, failures, latencies := s.probeProviderModels(r.Context(), p, probeModels)
-	p.AvailableModels = uniqueStrings(available)
-	p.ModelLatencyMS = latencies
-	p.ModelErrors = failures
+	latest, exists := s.providerByID(p.ID)
+	if !exists {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "provider was removed during probe"})
+		return
+	}
+	p = latest
+	availableSet := sliceSet(available)
+	knownAvailable := sliceSet(p.AvailableModels)
+	if p.ModelLatencyMS == nil {
+		p.ModelLatencyMS = map[string]int64{}
+	}
+	if p.ModelErrors == nil {
+		p.ModelErrors = map[string]string{}
+	}
+	for _, model := range probeModels {
+		if latency, ok := latencies[model]; ok {
+			p.ModelLatencyMS[model] = latency
+		}
+		if availableSet[model] {
+			p = setModelQuotaBlocked(p, model, false)
+			knownAvailable[model] = true
+			delete(p.ModelErrors, model)
+			continue
+		}
+		delete(knownAvailable, model)
+		p.ModelErrors[model] = failures[model]
+	}
+	p.AvailableModels = orderedIntersection(p.Models, keysFromSet(knownAvailable))
 	p.AvailabilityCheckedAt = time.Now().Unix()
+	for _, model := range p.AvailableModels {
+		if !modelQuotaBlocked(p, model) {
+			s.clearAutoModelFailure(p.ID, model)
+		}
+	}
 	if err := s.updateProvider(p); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -814,6 +981,7 @@ func (s *Server) handleProviderProbeModel(w http.ResponseWriter, r *http.Request
 		Model           string `json:"model"`
 		AutoPublish     bool   `json:"auto_publish"`
 		DropUnavailable bool   `json:"drop_unavailable_on_failure"`
+		RecoverQuota    bool   `json:"recover_quota_block"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<18)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -838,12 +1006,23 @@ func (s *Server) handleProviderProbeModel(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	start := time.Now()
+	s.clearNegativeModelMultimodal(p.ID, []string{model})
 	probeCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	err := s.probeSingleModel(probeCtx, p.ID, model)
+	err, latency := s.probeSingleModelWithLatency(probeCtx, p.ID, model)
 	cancel()
-	latency := time.Since(start).Milliseconds()
+	latest, exists := s.providerByID(p.ID)
+	if !exists {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "provider was removed during probe"})
+		return
+	}
+	p = latest
+	if err == nil && body.RecoverQuota {
+		p = setModelQuotaBlocked(p, model, false)
+	}
 	p = updateProbeResult(p, model, err, latency, body.AutoPublish)
+	if err == nil && !modelQuotaBlocked(p, model) {
+		s.clearAutoModelFailure(p.ID, model)
+	}
 	if body.DropUnavailable && err != nil {
 		if len(p.EnabledModels) == 0 {
 			p.EnabledModels = append([]string(nil), p.Models...)
@@ -919,22 +1098,37 @@ func (s *Server) handleProviderProbeKey(w http.ResponseWriter, r *http.Request) 
 	start := time.Now()
 	probeCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	status, respBody, err := s.probeSingleCompatibleModelWithKey(probeCtx, p, model, keys[body.KeyIndex])
-	cancel()
 	latency := time.Since(start).Milliseconds()
+	cancel()
 	if err == nil {
 		s.markProviderKeyActive(p.ID, body.KeyIndex, model)
-		p, _ = s.providerByID(p.ID)
+		var exists bool
+		p, exists = s.providerByID(p.ID)
+		if !exists {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "provider was removed during probe"})
+			return
+		}
 		p = updateProbeResult(p, model, nil, latency, false)
+		s.clearAutoModelFailure(p.ID, model)
 		_ = s.updateProvider(p)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": p.ID, "model": model, "key_index": body.KeyIndex, "latency_ms": latency, "provider": p})
 		return
 	}
-	if isCredentialKeyError(status, respBody) {
-		s.markProviderKeyFailed(p.ID, body.KeyIndex, "", true)
-	} else if isQuotaKeyError(status, respBody) {
+	if isQuotaKeyError(status, respBody) {
 		s.markProviderKeyFailed(p.ID, body.KeyIndex, model, false)
+	} else if isCredentialKeyError(status, respBody) {
+		s.markProviderKeyFailed(p.ID, body.KeyIndex, "", true)
 	}
-	p, _ = s.providerByID(p.ID)
+	var exists bool
+	p, exists = s.providerByID(p.ID)
+	if !exists {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "provider was removed during probe"})
+		return
+	}
+	if len(keys) == 1 && isQuotaKeyError(status, respBody) {
+		p = setModelQuotaBlocked(p, model, true)
+		s.markAutoModelFailed(p.ID, model)
+	}
 	p = updateProbeResult(p, model, err, latency, false)
 	_ = s.updateProvider(p)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": false, "id": p.ID, "model": model, "key_index": body.KeyIndex, "latency_ms": latency, "error": err.Error(), "provider": p})
@@ -1051,10 +1245,16 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		if !isMediaModel(target) && scopeAllowsModel(scope, "auto") {
 			grouped["Auto"] = []string{target}
 			models = append(models, map[string]any{
-				"id":       "auto",
-				"object":   "model",
-				"created":  0,
-				"owned_by": "auto",
+				"id":         "auto",
+				"object":     "model",
+				"created":    0,
+				"owned_by":   "auto",
+				"attachment": true,
+				"tool_call":  true,
+				"modalities": map[string]any{
+					"input":  []string{"text", "image"},
+					"output": []string{"text"},
+				},
 			})
 		}
 	}
@@ -1137,18 +1337,24 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Raw = raw
 	requestedModel := strings.TrimSpace(req.Model)
+	w, r, finishClientUsage := s.beginClientUsage(w, r, scope)
+	defer finishClientUsage()
 
 	if requestedModel == "auto" {
 		if !scopeAllowsModel(scope, requestedModel) {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "model is not allowed by this access key: " + requestedModel})
 			return
 		}
-		hasImage := openAIChatHasImage(raw)
-		target, ok := s.resolveAutoModelForOpenAI(r.Context())
-		if hasImage {
-			target, ok = s.resolveAutoVisionModelForOpenAI(r.Context())
+		hasImage := openAIChatLatestUserHasImage(raw)
+		if !hasImage {
+			raw, err = stripOpenAIHistoricalImages(raw)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
 		}
-		if !ok {
+		candidates := s.autoChatCandidatesForOpenAI(r.Context(), hasImage)
+		if len(candidates) == 0 {
 			message := "auto model has no available target"
 			if hasImage {
 				message = "auto model has no available multimodal target"
@@ -1156,12 +1362,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": message})
 			return
 		}
-		req.Model = target
-		req.Raw, err = replaceModel(raw, target)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
+		s.proxyAutoChatCompletions(w, r, raw, candidates)
+		return
 	}
 
 	providerID, upstreamModel, ok := strings.Cut(req.Model, "/")
@@ -1187,6 +1389,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "model is not published or not available: " + req.Model})
 		return
 	}
+	w, finishUpstreamUsage := s.beginUpstreamUsage(w, r, p, upstreamModel, req.Stream)
+	defer finishUpstreamUsage()
 
 	switch p.Type {
 	case "opencode-free":
@@ -1214,6 +1418,54 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			"type":     p.Type,
 		})
 	}
+}
+
+func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request, raw []byte, candidates []string) {
+	var request chatRequest
+	_ = json.Unmarshal(raw, &request)
+	var lastFailure *autoRetryWriter
+	for _, candidate := range candidates {
+		body, err := replaceModel(raw, candidate)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		providerID, model, _ := strings.Cut(candidate, "/")
+		internal := r.Clone(context.WithValue(r.Context(), internalBypassKey{}, true))
+		internal.Body = io.NopCloser(bytes.NewReader(body))
+		internal.ContentLength = int64(len(body))
+		internal.Header = r.Header.Clone()
+		internal.Header.Set("Content-Type", "application/json")
+
+		retryWriter := newAutoRetryWriter(w, !request.Stream)
+		s.handleChatCompletions(retryWriter, internal)
+		if retryWriter.committed {
+			s.clearAutoModelFailure(providerID, model)
+			return
+		}
+		if retryWriter.status >= 200 && retryWriter.status <= 299 {
+			if probeResponseHasExplicitError(retryWriter.body.Bytes()) {
+				s.markAutoModelFailed(providerID, model)
+				lastFailure = retryWriter
+				continue
+			}
+			retryWriter.relay()
+			s.clearAutoModelFailure(providerID, model)
+			return
+		}
+		if isAutoFallbackError(retryWriter.status, retryWriter.body.Bytes()) {
+			s.markAutoModelFailed(providerID, model)
+			lastFailure = retryWriter
+			continue
+		}
+		retryWriter.relay()
+		return
+	}
+	if lastFailure != nil {
+		lastFailure.relay()
+		return
+	}
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "auto model has no available target"})
 }
 
 func (s *Server) handleMediaModels(kind string) http.HandlerFunc {
@@ -1434,7 +1686,9 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, p ProviderC
 		"Accept":        acceptHeader(req.Stream),
 		"User-Agent":    "9router-lite/0.1",
 	}
-	s.proxyRaw(w, r, joinURL(p.BaseURL, "/chat/completions"), body, headers)
+	tracked := &modelFailureTrackingWriter{target: w}
+	status := s.proxyRaw(tracked, r, joinURL(p.BaseURL, "/chat/completions"), body, headers)
+	s.markModelUnavailableAfterQuotaError(p, upstreamModel, status, tracked.body.Bytes())
 }
 
 func (s *Server) proxyOpenAIRotating(w http.ResponseWriter, r *http.Request, p ProviderConfig, req chatRequest, upstreamModel string, body []byte, keys []string) {
@@ -1470,10 +1724,12 @@ func (s *Server) proxyPostRotating(w http.ResponseWriter, r *http.Request, targe
 			writeBufferedUpstream(w, status, header, respBody)
 			return
 		}
-		if isCredentialKeyError(status, respBody) {
-			s.markProviderKeyFailed(p.ID, keyIndex, "", true)
-		} else if isQuotaKeyError(status, respBody) {
+		if isQuotaKeyError(status, respBody) {
 			s.markProviderKeyFailed(p.ID, keyIndex, upstreamModel, false)
+		} else if isRateLimitKeyError(status, respBody) {
+			// A rate limit is temporary. Try the next key without persisting a failure.
+		} else if isCredentialKeyError(status, respBody) {
+			s.markProviderKeyFailed(p.ID, keyIndex, "", true)
 		} else {
 			break
 		}
@@ -1598,7 +1854,7 @@ func (s *Server) modelsForProvider(ctx context.Context, p ProviderConfig) []stri
 		}
 		return p.Models
 	case "cline":
-		return p.Models
+		return withClineFreeModels(p.Models)
 	case "openai", "anthropic":
 		if p.FetchModels && p.BaseURL != "" && len(providerAPIKeys(p)) > 0 {
 			ids, err := fetchOpenAIModels(ctx, s.client, p)
@@ -1635,6 +1891,8 @@ func (s *Server) fetchProviderModels(ctx context.Context, p ProviderConfig) ([]s
 		return fetchQoderModels(ctx, s.client, p, true)
 	case "kilocode":
 		return fetchKiloFreeModels(ctx, s.client, p)
+	case "cline":
+		return withClineFreeModels(p.Models), nil
 	case "openai", "anthropic":
 		if strings.TrimSpace(p.BaseURL) == "" {
 			return nil, errors.New("provider base_url is empty")
@@ -1695,8 +1953,11 @@ func (s *Server) deleteProviderModel(providerID, model string) (ProviderConfig, 
 		p.AvailableModels = removeString(p.AvailableModels, model)
 		p.LockedModels = removeString(p.LockedModels, model)
 		delete(p.ModelKinds, model)
+		delete(p.ModelMultimodal, model)
+		p.QuotaBlockedModels = removeString(p.QuotaBlockedModels, model)
 		delete(p.ModelLatencyMS, model)
 		delete(p.ModelErrors, model)
+		delete(p.ModelFailureCounts, model)
 		if p.ProviderSpecificData == nil {
 			p.ProviderSpecificData = map[string]string{}
 		}
@@ -1798,13 +2059,84 @@ func fetchCompatibleModels(ctx context.Context, client *http.Client, p ProviderC
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, fmt.Errorf("%s models status %d", p.ID, resp.StatusCode)
 	}
+	var ids []string
 	if isResponsesCompatibleProvider(p) {
-		return parseResponsesModelIDs(resp.Body)
+		ids, err = parseResponsesModelIDs(resp.Body)
+	} else if p.Type == "anthropic" {
+		ids, err = parseMessagesModelIDs(resp.Body)
+	} else {
+		ids, err = parseModelIDs(resp.Body)
 	}
-	if p.Type == "anthropic" {
-		return parseMessagesModelIDs(resp.Body)
+	if err != nil {
+		return nil, err
 	}
-	return parseModelIDs(resp.Body)
+	if openRouterFreeModelsOnly(p) {
+		ids = filterOpenRouterFreeModelIDs(ids)
+	}
+	return ids, nil
+}
+
+func openRouterFreeModelsOnly(p ProviderConfig) bool {
+	return isOpenRouterProbeProvider(p) && !strings.EqualFold(providerDataValueGo(p, "openrouterFreeModelsOnly"), "false")
+}
+
+func filterOpenRouterFreeModelIDs(ids []string) []string {
+	var out []string
+	for _, id := range uniqueStrings(ids) {
+		if id == "openrouter/free" || strings.HasSuffix(id, ":free") {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func retainOpenRouterFreeModels(p *ProviderConfig) {
+	if p == nil {
+		return
+	}
+	p.Models = filterOpenRouterFreeModelIDs(p.Models)
+	allowed := sliceSet(p.Models)
+	p.EnabledModels = orderedIntersection(p.EnabledModels, p.Models)
+	p.AvailableModels = orderedIntersection(p.AvailableModels, p.Models)
+	p.LockedModels = orderedIntersection(p.LockedModels, p.Models)
+	p.QuotaBlockedModels = orderedIntersection(p.QuotaBlockedModels, p.Models)
+	for model := range p.ModelKinds {
+		if !allowed[model] {
+			delete(p.ModelKinds, model)
+		}
+	}
+	for model := range p.ModelMultimodal {
+		if !allowed[model] {
+			delete(p.ModelMultimodal, model)
+		}
+	}
+	for model := range p.ModelLatencyMS {
+		if !allowed[model] {
+			delete(p.ModelLatencyMS, model)
+		}
+	}
+	for model := range p.ModelErrors {
+		if !allowed[model] {
+			delete(p.ModelErrors, model)
+		}
+	}
+	for model := range p.ModelFailureCounts {
+		if !allowed[model] {
+			delete(p.ModelFailureCounts, model)
+		}
+	}
+}
+
+func retainKnownModelMultimodal(p *ProviderConfig) {
+	if p == nil || len(p.ModelMultimodal) == 0 {
+		return
+	}
+	models := sliceSet(p.Models)
+	for model := range p.ModelMultimodal {
+		if !models[model] {
+			delete(p.ModelMultimodal, model)
+		}
+	}
 }
 
 func parseModelIDs(r io.Reader) ([]string, error) {
@@ -2149,6 +2481,20 @@ func failedKeyIndexesForModel(p ProviderConfig, model string) map[int]bool {
 	return out
 }
 
+func allProviderKeysFailedForModel(p ProviderConfig, model string) bool {
+	keys := providerAPIKeys(p)
+	if len(keys) == 0 {
+		return false
+	}
+	failed := failedKeyIndexesForModel(p, model)
+	for index := range keys {
+		if !failed[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func modelFailedKeyIndexesDataKey(model string) string {
 	model = strings.TrimSpace(model)
 	if model == "" {
@@ -2324,33 +2670,84 @@ func (s *Server) resolveAutoModelForOpenAI(ctx context.Context) (string, bool) {
 	})
 }
 
-func (s *Server) resolveAutoVisionModel(ctx context.Context) (string, bool) {
-	return s.resolveAutoVisionModelMatching(ctx, nil)
-}
-
-func (s *Server) resolveAutoVisionModelForOpenAI(ctx context.Context) (string, bool) {
-	return s.resolveAutoVisionModelMatching(ctx, func(p ProviderConfig) bool {
-		return !isClaudeCodeCompatibleProvider(p)
-	})
-}
-
 func (s *Server) resolveAutoModelMatching(ctx context.Context, accept func(ProviderConfig) bool) (string, bool) {
 	cfg := s.currentConfig()
 	if !cfg.AutoModel.Enabled {
 		return "", false
 	}
-	return s.resolveAutoCandidatesMatching(ctx, cfg.AutoModel.Models, accept)
-}
-
-func (s *Server) resolveAutoVisionModelMatching(ctx context.Context, accept func(ProviderConfig) bool) (string, bool) {
-	cfg := s.currentConfig()
-	if !cfg.AutoModel.Enabled {
+	candidates := s.autoCandidatesMatching(ctx, cfg.AutoModel.Models, accept, false)
+	if len(candidates) == 0 {
 		return "", false
 	}
-	return s.resolveAutoCandidatesMatching(ctx, cfg.AutoModel.VisionModels, accept)
+	return candidates[0], true
 }
 
-func (s *Server) resolveAutoCandidatesMatching(ctx context.Context, candidates []string, accept func(ProviderConfig) bool) (string, bool) {
+func (s *Server) autoChatCandidatesForOpenAI(ctx context.Context, hasImage bool) []string {
+	cfg := s.currentConfig()
+	if !cfg.AutoModel.Enabled {
+		return nil
+	}
+	candidates := s.autoCandidatesMatching(ctx, cfg.AutoModel.Models, func(p ProviderConfig) bool {
+		return !isClaudeCodeCompatibleProvider(p)
+	}, hasImage)
+	if !hasImage {
+		candidates = s.preferTextAutoCandidates(candidates)
+	}
+	return s.rotateAutoCandidates(candidates, hasImage)
+}
+
+func (s *Server) autoChatCandidates(ctx context.Context, hasImage bool) []string {
+	cfg := s.currentConfig()
+	if !cfg.AutoModel.Enabled {
+		return nil
+	}
+	candidates := s.autoCandidatesMatching(ctx, cfg.AutoModel.Models, nil, hasImage)
+	if !hasImage {
+		candidates = s.preferTextAutoCandidates(candidates)
+	}
+	return s.rotateAutoCandidates(candidates, hasImage)
+}
+
+func (s *Server) preferTextAutoCandidates(candidates []string) []string {
+	var textCandidates []string
+	for _, candidate := range candidates {
+		providerID, model, ok := strings.Cut(candidate, "/")
+		if !ok {
+			continue
+		}
+		p, ok := s.providerByRouteID(providerID)
+		if ok && !p.ModelMultimodal[model] {
+			textCandidates = append(textCandidates, candidate)
+		}
+	}
+	if len(textCandidates) > 0 {
+		return textCandidates
+	}
+	return candidates
+}
+
+func (s *Server) rotateAutoCandidates(candidates []string, vision bool) []string {
+	if len(candidates) < 2 {
+		return candidates
+	}
+	s.autoMu.Lock()
+	cursor := &s.autoTextCursor
+	if vision {
+		cursor = &s.autoVisionCursor
+	}
+	start := int(*cursor % uint64(len(candidates)))
+	*cursor = *cursor + 1
+	s.autoMu.Unlock()
+
+	rotated := make([]string, 0, len(candidates))
+	rotated = append(rotated, candidates[start:]...)
+	rotated = append(rotated, candidates[:start]...)
+	return rotated
+}
+
+func (s *Server) autoCandidatesMatching(ctx context.Context, candidates []string, accept func(ProviderConfig) bool, multimodalOnly bool) []string {
+	_ = ctx
+	var out []string
 	for _, candidate := range uniqueStrings(candidates) {
 		if candidate == "auto" {
 			continue
@@ -2366,14 +2763,82 @@ func (s *Server) resolveAutoCandidatesMatching(ctx context.Context, candidates [
 		if providerModelIsMedia(p, model) {
 			continue
 		}
+		if multimodalOnly && !p.ModelMultimodal[model] {
+			continue
+		}
 		if accept != nil && !accept(p) {
 			continue
 		}
-		if sliceSet(s.visibleModelsForProvider(ctx, p))[model] {
-			return providerModelRef(p, model), true
+		if !providerModelAvailableForAuto(p, model) {
+			continue
 		}
+		if s.autoModelFailed(p.ID, model) {
+			continue
+		}
+		out = append(out, providerModelRef(p, model))
 	}
-	return "", false
+	return out
+}
+
+func providerModelAvailableForAuto(p ProviderConfig, model string) bool {
+	if !sliceSet(p.Models)[model] || modelQuotaBlocked(p, model) || allProviderKeysFailedForModel(p, model) {
+		return false
+	}
+	if p.AvailabilityCheckedAt == 0 && len(p.AvailableModels) == 0 {
+		return true
+	}
+	return sliceSet(p.AvailableModels)[model]
+}
+
+func (s *Server) autoModelFailed(providerID, model string) bool {
+	s.autoMu.RLock()
+	defer s.autoMu.RUnlock()
+	return s.autoFailedModels[providerID][model]
+}
+
+func (s *Server) markAutoModelFailed(providerID, model string) {
+	s.autoMu.Lock()
+	defer s.autoMu.Unlock()
+	if s.autoFailedModels == nil {
+		s.autoFailedModels = map[string]map[string]bool{}
+	}
+	if s.autoFailedModels[providerID] == nil {
+		s.autoFailedModels[providerID] = map[string]bool{}
+	}
+	s.autoFailedModels[providerID][model] = true
+}
+
+func (s *Server) clearAutoModelFailure(providerID, model string) {
+	s.autoMu.Lock()
+	defer s.autoMu.Unlock()
+	if s.autoFailedModels == nil {
+		return
+	}
+	delete(s.autoFailedModels[providerID], model)
+	if len(s.autoFailedModels[providerID]) == 0 {
+		delete(s.autoFailedModels, providerID)
+	}
+}
+
+func (s *Server) markModelUnavailableAfterQuotaError(p ProviderConfig, model string, status int, body []byte) {
+	if len(providerAPIKeys(p)) != 1 || !isQuotaKeyError(status, body) {
+		return
+	}
+	p = setModelQuotaBlocked(p, model, true)
+	available := sliceSet(p.AvailableModels)
+	delete(available, model)
+	p.AvailableModels = orderedIntersection(p.Models, keysFromSet(available))
+	if p.ModelErrors == nil {
+		p.ModelErrors = map[string]string{}
+	}
+	p.ModelErrors[model] = formatProbeFailure(status, string(body))
+	if p.ModelFailureCounts == nil {
+		p.ModelFailureCounts = map[string]int{}
+	}
+	p.ModelFailureCounts[model] = autoProbeFailureThreshold
+	p.AvailabilityCheckedAt = time.Now().Unix()
+	s.markAutoModelFailed(p.ID, model)
+	_ = s.updateProvider(p)
 }
 
 func (s *Server) probeProviderModels(ctx context.Context, p ProviderConfig, models []string) ([]string, map[string]string, map[string]int64) {
@@ -2403,11 +2868,10 @@ func (s *Server) probeProviderModels(ctx context.Context, p ProviderConfig, mode
 	}
 	var available []string
 	for _, id := range models {
-		start := time.Now()
 		probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		err := s.probeSingleModel(probeCtx, p.ID, id)
+		err, latency := s.probeSingleModelWithLatency(probeCtx, p.ID, id)
+		latencies[id] = latency
 		cancel()
-		latencies[id] = time.Since(start).Milliseconds()
 		if err == nil {
 			available = append(available, id)
 			continue
@@ -2417,35 +2881,288 @@ func (s *Server) probeProviderModels(ctx context.Context, p ProviderConfig, mode
 	return available, failures, latencies
 }
 
-func (s *Server) probeSingleModel(ctx context.Context, providerID, model string) error {
-	if p, ok := s.providerByID(providerID); ok && isClaudeCodeCompatibleProvider(p) {
-		ids, err := fetchCompatibleModels(ctx, s.client, p)
-		if err != nil {
-			return err
-		}
-		if !sliceSet(ids)[model] {
-			return errors.New("上游模型列表中不存在")
-		}
-		return nil
+func openAIProbeRequest(model string, maxTokens int) map[string]any {
+	request := map[string]any{
+		"model":    model,
+		"messages": []any{map[string]any{"role": "user", "content": "Reply with OK."}},
+		"stream":   false,
 	}
-	body := map[string]any{
-		"model": providerID + "/" + model,
-		"messages": []map[string]string{
-			{"role": "user", "content": "Reply with OK."},
-		},
+	if maxTokens > 0 {
+		request["max_tokens"] = maxTokens
+	}
+	return request
+}
+
+func anthropicProbeRequest(model string, maxTokens int) map[string]any {
+	return map[string]any{
+		"model":      model,
+		"messages":   []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "Reply with OK."}}}},
 		"stream":     false,
-		"max_tokens": 4,
+		"max_tokens": maxTokens,
 	}
+}
+
+func probeMaxTokens(p ProviderConfig) int {
+	if p.Type == "cline" || isOpenRouterProbeProvider(p) {
+		return 0
+	}
+	return 16
+}
+
+func isOpenRouterProbeProvider(p ProviderConfig) bool {
+	if p.Type != "openai" {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(p.Name), "openrouter") {
+		return true
+	}
+	u, err := url.Parse(strings.TrimSpace(p.BaseURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "openrouter.ai" || strings.HasSuffix(host, ".openrouter.ai")
+}
+
+func probeResponseHasExplicitError(raw []byte) bool {
+	var body map[string]any
+	if json.Unmarshal(raw, &body) != nil {
+		return false
+	}
+	if body["error"] != nil {
+		return true
+	}
+	if success, ok := body["success"].(bool); ok && !success {
+		return true
+	}
+	return false
+}
+
+func multimodalProbeRequest(model string, maxTokens int) map[string]any {
+	request := map[string]any{
+		"model": model,
+		"messages": []any{map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "Read the four-character code in this image. Reply with only the code."},
+				map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64," + multimodalProbeImageBase64}},
+			},
+		}},
+		"stream": false,
+	}
+	if maxTokens > 0 {
+		request["max_tokens"] = maxTokens
+	}
+	return request
+}
+
+const (
+	multimodalProbeMaxTokens    = 128
+	multimodalProbeCacheVersion = "3"
+)
+
+func migrateMultimodalProbeCache(p *ProviderConfig) {
+	if p == nil || len(p.ModelMultimodal) == 0 || providerDataValueGo(*p, "multimodalProbeCacheVersion") == multimodalProbeCacheVersion {
+		return
+	}
+	for model, supported := range p.ModelMultimodal {
+		if !supported {
+			delete(p.ModelMultimodal, model)
+		}
+	}
+	if p.ProviderSpecificData == nil {
+		p.ProviderSpecificData = map[string]string{}
+	}
+	p.ProviderSpecificData["multimodalProbeCacheVersion"] = multimodalProbeCacheVersion
+}
+
+func multimodalProbeResponseText(raw []byte) string {
+	var body map[string]any
+	if json.Unmarshal(raw, &body) != nil {
+		return ""
+	}
+	if data := anyMap(body["data"]); len(data) > 0 {
+		body = data
+	}
+	choices, _ := body["choices"].([]any)
+	if len(choices) == 0 {
+		return ""
+	}
+	message := anyMap(anyMap(choices[0])["message"])
+	parts := []string{
+		contentAsText(message["content"]),
+		contentAsText(message["reasoning"]),
+		contentAsText(message["reasoning_details"]),
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func (s *Server) clearNegativeModelMultimodal(providerID string, models []string) {
+	wanted := sliceSet(models)
+	if len(wanted) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, p := range s.config.Providers {
+		if p.ID != providerID || len(p.ModelMultimodal) == 0 {
+			continue
+		}
+		changed := false
+		for model := range wanted {
+			if supported, known := p.ModelMultimodal[model]; known && !supported {
+				delete(p.ModelMultimodal, model)
+				changed = true
+			}
+		}
+		if changed {
+			s.config.Providers[i] = p
+			_ = saveConfig(s.dataDir, s.config)
+		}
+		return
+	}
+}
+
+func multimodalProbeFailureIsTemporary(status int, raw []byte) bool {
+	if status == http.StatusUnauthorized || status == http.StatusPaymentRequired || status == http.StatusForbidden || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500 {
+		return true
+	}
+	if isQuotaKeyError(status, raw) || isRateLimitKeyError(status, raw) {
+		return true
+	}
+	lower := strings.ToLower(string(raw))
+	for _, marker := range []string{"timeout", "timed out", "temporarily unavailable", "temporary unavailable", "service unavailable", "server error", "overloaded", "connection reset"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) beginMultimodalProbe(providerID, model string) bool {
+	p, ok := s.providerByID(providerID)
+	if !ok || isClaudeCodeCompatibleProvider(p) || providerModelIsMedia(p, model) || !sliceSet(p.Models)[model] {
+		return false
+	}
+	if _, known := p.ModelMultimodal[model]; known {
+		return false
+	}
+
+	key := providerID + "\x00" + model
+	s.multimodalProbeMu.Lock()
+	if s.multimodalProbing == nil {
+		s.multimodalProbing = map[string]bool{}
+	}
+	if s.multimodalProbing[key] {
+		s.multimodalProbeMu.Unlock()
+		return false
+	}
+	s.multimodalProbing[key] = true
+	s.multimodalProbeMu.Unlock()
+
+	p, ok = s.providerByID(providerID)
+	if !ok {
+		s.endMultimodalProbe(providerID, model)
+		return false
+	}
+	if _, known := p.ModelMultimodal[model]; known {
+		s.endMultimodalProbe(providerID, model)
+		return false
+	}
+	return true
+}
+
+func (s *Server) endMultimodalProbe(providerID, model string) {
+	key := providerID + "\x00" + model
+	s.multimodalProbeMu.Lock()
+	delete(s.multimodalProbing, key)
+	s.multimodalProbeMu.Unlock()
+}
+
+func (s *Server) recordModelMultimodal(providerID, model string, supported bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, p := range s.config.Providers {
+		if p.ID != providerID || !sliceSet(p.Models)[model] {
+			continue
+		}
+		if p.ModelMultimodal == nil {
+			p.ModelMultimodal = map[string]bool{}
+		}
+		if _, known := p.ModelMultimodal[model]; known {
+			return
+		}
+		p.ModelMultimodal[model] = supported
+		if p.ProviderSpecificData == nil {
+			p.ProviderSpecificData = map[string]string{}
+		}
+		p.ProviderSpecificData["multimodalProbeCacheVersion"] = multimodalProbeCacheVersion
+		s.config.Providers[i] = p
+		_ = saveConfig(s.dataDir, s.config)
+		return
+	}
+}
+
+func (s *Server) probeModelMultimodalOnce(ctx context.Context, p ProviderConfig, model string) {
+	if !s.beginMultimodalProbe(p.ID, model) {
+		return
+	}
+	defer s.endMultimodalProbe(p.ID, model)
+
+	body := multimodalProbeRequest(p.ID+"/"+model, multimodalProbeMaxTokens)
 	raw, _ := json.Marshal(body)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(raw))
 	req = req.WithContext(context.WithValue(ctx, internalBypassKey{}, true))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 	s.handleChatCompletions(rr, req)
-	if rr.Code >= 200 && rr.Code < 300 {
-		return nil
+	responseBody := rr.Body.Bytes()
+
+	if ctx.Err() != nil || multimodalProbeFailureIsTemporary(rr.Code, responseBody) {
+		return
 	}
-	return errors.New(formatProbeFailure(rr.Code, rr.Body.String()))
+	if rr.Code < 200 || rr.Code >= 300 || probeResponseHasExplicitError(responseBody) {
+		s.recordModelMultimodal(p.ID, model, false)
+		return
+	}
+	s.recordModelMultimodal(p.ID, model, strings.Contains(strings.ToUpper(multimodalProbeResponseText(responseBody)), multimodalProbeCode))
+}
+
+func (s *Server) probeSingleModelWithLatency(ctx context.Context, providerID, model string) (error, int64) {
+	start := time.Now()
+	p, _ := s.providerByID(providerID)
+	if isClaudeCodeCompatibleProvider(p) {
+		ids, err := fetchCompatibleModels(ctx, s.client, p)
+		latency := time.Since(start).Milliseconds()
+		if err != nil {
+			return err, latency
+		}
+		if !sliceSet(ids)[model] {
+			return errors.New("上游模型列表中不存在"), latency
+		}
+		return nil, latency
+	}
+	body := openAIProbeRequest(providerID+"/"+model, probeMaxTokens(p))
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(raw))
+	req = req.WithContext(context.WithValue(ctx, internalBypassKey{}, true))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	s.handleChatCompletions(rr, req)
+	latency := time.Since(start).Milliseconds()
+	if rr.Code >= 200 && rr.Code < 300 {
+		if probeResponseHasExplicitError(rr.Body.Bytes()) {
+			return errors.New(formatProbeFailure(rr.Code, rr.Body.String())), latency
+		}
+		s.probeModelMultimodalOnce(ctx, p, model)
+		return nil, latency
+	}
+	return errors.New(formatProbeFailure(rr.Code, rr.Body.String())), latency
+}
+
+func (s *Server) probeSingleModel(ctx context.Context, providerID, model string) error {
+	err, _ := s.probeSingleModelWithLatency(ctx, providerID, model)
+	return err
 }
 
 func (s *Server) probeSingleOpenAIModelWithKey(ctx context.Context, p ProviderConfig, model, key string) (int, []byte, error) {
@@ -2481,28 +3198,22 @@ func (s *Server) probeSingleCompatibleModelWithKey(ctx context.Context, p Provid
 		}
 		return resp.StatusCode, respBody, nil
 	}
-	body := map[string]any{
-		"model": model,
-		"messages": []map[string]string{
-			{"role": "user", "content": "Reply with OK."},
-		},
-		"stream":     false,
-		"max_tokens": 4,
-	}
+	body := openAIProbeRequest(model, probeMaxTokens(p))
 	target := joinURL(p.BaseURL, "/chat/completions")
 	if isResponsesCompatibleProvider(p) {
-		body = map[string]any{"model": model, "input": "Reply with OK.", "stream": false, "max_output_tokens": 16}
 		target = joinURL(p.BaseURL, "/responses")
 	} else if p.Type == "anthropic" {
-		body = map[string]any{
-			"model": model, "messages": []map[string]string{{"role": "user", "content": "Reply with OK."}}, "stream": false, "max_tokens": 4,
-		}
-		if isClaudeCodeCompatibleProvider(p) {
-			body["system"] = []any{map[string]any{"type": "text", "text": claudeCodeSystemPrompt}}
-		}
+		body = anthropicProbeRequest(model, probeMaxTokens(p))
 		target = anthropicRequestTarget(p, "/messages")
 	}
 	raw, _ := json.Marshal(body)
+	if isResponsesCompatibleProvider(p) {
+		var err error
+		raw, err = chatCompletionsToResponses(raw, model)
+		if err != nil {
+			return http.StatusBadRequest, nil, err
+		}
+	}
 	headers := map[string]string{
 		"Content-Type":  "application/json",
 		"Authorization": "Bearer " + key,
@@ -2523,14 +3234,21 @@ func (s *Server) probeSingleCompatibleModelWithKey(ctx context.Context, p Provid
 		return status, respBody, err
 	}
 	if status >= 200 && status <= 299 {
+		if probeResponseHasExplicitError(respBody) {
+			return status, respBody, errors.New(formatProbeFailure(status, string(respBody)))
+		}
 		return status, respBody, nil
 	}
 	return status, respBody, errors.New(formatProbeFailure(status, string(respBody)))
 }
 
 func updateProbeResult(p ProviderConfig, model string, probeErr error, latency int64, autoPublish bool) ProviderConfig {
-	available := sliceSet(p.AvailableModels)
 	if probeErr == nil {
+		p = setModelQuotaBlocked(p, model, false)
+	}
+	available := sliceSet(p.AvailableModels)
+	blocked := modelQuotaBlocked(p, model)
+	if probeErr == nil && !blocked {
 		available[model] = true
 	} else {
 		delete(available, model)
@@ -2543,8 +3261,13 @@ func updateProbeResult(p ProviderConfig, model string, probeErr error, latency i
 	if p.ModelErrors == nil {
 		p.ModelErrors = map[string]string{}
 	}
-	if probeErr == nil {
+	if probeErr == nil && !blocked {
 		delete(p.ModelErrors, model)
+		delete(p.ModelFailureCounts, model)
+	} else if probeErr == nil && blocked {
+		if p.ModelErrors[model] == "" {
+			p.ModelErrors[model] = "额度不足，等待手动恢复"
+		}
 	} else {
 		p.ModelErrors[model] = probeErr.Error()
 	}
@@ -2560,7 +3283,7 @@ func formatProbeFailure(status int, body string) string {
 	body = strings.TrimSpace(body)
 	lower := strings.ToLower(body)
 	switch {
-	case strings.Contains(lower, "insufficient_credits") || strings.Contains(lower, "insufficient credits"):
+	case status == http.StatusPaymentRequired || strings.Contains(lower, "insufficient_credits") || strings.Contains(lower, "insufficient credits") || strings.Contains(lower, "insufficient balance") || strings.Contains(lower, "out of credit"):
 		return "额度不足"
 	case strings.Contains(lower, "promotion has ended") || strings.Contains(lower, "quota"):
 		return "免费额度已结束"
@@ -2589,6 +3312,9 @@ func formatProbeFailure(status int, body string) string {
 
 func isQuotaKeyError(status int, body []byte) bool {
 	lower := strings.ToLower(string(body))
+	if status == http.StatusPaymentRequired {
+		return true
+	}
 	if strings.Contains(lower, "insufficient_credits") ||
 		strings.Contains(lower, "insufficient credits") ||
 		strings.Contains(lower, "insufficient_quota") ||
@@ -2597,32 +3323,73 @@ func isQuotaKeyError(status int, body []byte) bool {
 		strings.Contains(lower, "quota_exceeded") ||
 		strings.Contains(lower, "promotion has ended") ||
 		strings.Contains(lower, "free promotion has ended") ||
+		strings.Contains(lower, "free usage limit") ||
+		strings.Contains(lower, "usage limit reached") ||
+		strings.Contains(lower, "daily limit reached") ||
+		strings.Contains(lower, "monthly limit reached") ||
 		strings.Contains(lower, "credits") ||
 		strings.Contains(lower, "billing") ||
 		strings.Contains(lower, "balance") {
 		return true
 	}
-	return status == http.StatusPaymentRequired && (strings.Contains(lower, "credit") || strings.Contains(lower, "quota"))
+	return false
+}
+
+func isRateLimitKeyError(status int, body []byte) bool {
+	lower := strings.ToLower(string(body))
+	return status == http.StatusTooManyRequests ||
+		strings.Contains(lower, "rate_limit") ||
+		strings.Contains(lower, "rate limit") ||
+		strings.Contains(lower, "too many requests") ||
+		strings.Contains(lower, "request limit")
+}
+
+func isAutoFallbackError(status int, body []byte) bool {
+	if isQuotaKeyError(status, body) || isCredentialKeyError(status, body) {
+		return true
+	}
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusGone,
+		http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	if status != http.StatusBadRequest {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	for _, marker := range []string{
+		"model_not_found", "model not found", "model does not exist", "model has been deleted",
+		"model is unavailable", "unavailable model", "unsupported model", "no such model",
+		"model decommissioned", "ip blocked", "ip has been blocked", "ip is blocked",
+		"access denied", "request forbidden",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func isCredentialKeyError(status int, body []byte) bool {
 	lower := strings.ToLower(string(body))
 	if strings.Contains(lower, "invalid api key") ||
 		strings.Contains(lower, "api key is invalid") ||
+		strings.Contains(lower, "api key has been revoked") ||
+		strings.Contains(lower, "api key was revoked") ||
+		strings.Contains(lower, "api key is disabled") ||
 		strings.Contains(lower, "invalid authorization") ||
 		strings.Contains(lower, "invalid bearer") ||
 		strings.Contains(lower, "invalid token") ||
+		strings.Contains(lower, "token has expired") ||
+		strings.Contains(lower, "token expired") ||
 		strings.Contains(lower, "authentication failed") ||
 		strings.Contains(lower, "no auth credentials") ||
 		strings.Contains(lower, "incorrect api key") {
 		return true
 	}
-	if status == http.StatusUnauthorized && !isQuotaKeyError(status, body) {
-		return strings.Contains(lower, "api key") ||
-			strings.Contains(lower, "auth") ||
-			strings.Contains(lower, "token") ||
-			strings.Contains(lower, "credential") ||
-			strings.Contains(lower, "unauthorized")
+	if status == http.StatusUnauthorized && !isQuotaKeyError(status, body) && !isRateLimitKeyError(status, body) {
+		return true
 	}
 	return false
 }
@@ -2631,23 +3398,96 @@ func (s *Server) probeAllProviders(ctx context.Context, autoPublish bool) {
 	s.probeMu.Lock()
 	defer s.probeMu.Unlock()
 	for _, p := range s.enabledProviders() {
-		models := s.visibleModelsForProvider(ctx, p)
+		models := p.Models
+		if isClaudeCodeCompatibleProvider(p) {
+			models = s.visibleModelsForProvider(ctx, p)
+		}
 		models = unlockedModelIDs(models, p.LockedModels)
 		models = chatModelIDs(p, models)
 		if len(models) == 0 {
 			continue
 		}
 		available, failures, latencies := s.probeProviderModels(ctx, p, models)
-		p.AvailableModels = uniqueStrings(available)
-		p.ModelLatencyMS = latencies
-		p.ModelErrors = failures
-		p.AvailabilityCheckedAt = time.Now().Unix()
+		latest, exists := s.providerByID(p.ID)
+		if !exists || !latest.Enabled {
+			continue
+		}
+		p = latest
+		p = s.applyAutoProbeResults(p, models, available, failures, latencies)
 		if autoPublish {
 			p.EnabledModels = append([]string(nil), p.AvailableModels...)
 			clearManualPublishOverride(&p)
 		}
 		_ = s.updateProvider(p)
 	}
+}
+
+func (s *Server) applyAutoProbeResults(p ProviderConfig, probed, available []string, failures map[string]string, latencies map[string]int64) ProviderConfig {
+	knownAvailable := sliceSet(p.AvailableModels)
+	if p.AvailabilityCheckedAt == 0 && len(knownAvailable) == 0 {
+		knownAvailable = sliceSet(p.EnabledModels)
+		if len(knownAvailable) == 0 {
+			knownAvailable = sliceSet(p.Models)
+		}
+	}
+	availableSet := sliceSet(available)
+	if p.ModelLatencyMS == nil {
+		p.ModelLatencyMS = map[string]int64{}
+	}
+	if p.ModelErrors == nil {
+		p.ModelErrors = map[string]string{}
+	}
+	if p.ModelFailureCounts == nil {
+		p.ModelFailureCounts = map[string]int{}
+	}
+	for _, model := range uniqueStrings(probed) {
+		if latency, ok := latencies[model]; ok {
+			p.ModelLatencyMS[model] = latency
+		}
+		if availableSet[model] {
+			p = setModelQuotaBlocked(p, model, false)
+		}
+		if modelQuotaBlocked(p, model) {
+			delete(knownAvailable, model)
+			p.ModelFailureCounts[model] = autoProbeFailureThreshold
+			if failures[model] != "" {
+				p.ModelErrors[model] = failures[model]
+			} else if p.ModelErrors[model] == "" {
+				p.ModelErrors[model] = "额度不足，等待手动恢复"
+			}
+			continue
+		}
+		if availableSet[model] && !modelQuotaBlocked(p, model) {
+			knownAvailable[model] = true
+			delete(p.ModelErrors, model)
+			delete(p.ModelFailureCounts, model)
+			s.clearAutoModelFailure(p.ID, model)
+			continue
+		}
+		p.ModelErrors[model] = failures[model]
+		p.ModelFailureCounts[model]++
+		if p.ModelFailureCounts[model] >= autoProbeFailureThreshold {
+			delete(knownAvailable, model)
+		}
+	}
+	p.AvailableModels = orderedIntersection(p.Models, keysFromSet(knownAvailable))
+	p.AvailabilityCheckedAt = time.Now().Unix()
+	return p
+}
+
+func modelQuotaBlocked(p ProviderConfig, model string) bool {
+	return sliceSet(p.QuotaBlockedModels)[model]
+}
+
+func setModelQuotaBlocked(p ProviderConfig, model string, blocked bool) ProviderConfig {
+	models := sliceSet(p.QuotaBlockedModels)
+	if blocked {
+		models[model] = true
+	} else {
+		delete(models, model)
+	}
+	p.QuotaBlockedModels = orderedIntersection(p.Models, keysFromSet(models))
+	return p
 }
 
 func (s *Server) autoProbeLoop() {
@@ -2671,9 +3511,7 @@ func (s *Server) autoProbeLoop() {
 		if time.Now().Before(nextRun) {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), randomizedProbeInterval(interval))
-		s.probeAllProviders(ctx, true)
-		cancel()
+		s.probeAllProviders(context.Background(), true)
 		nextRun = time.Now().Add(randomizedProbeInterval(interval))
 	}
 }

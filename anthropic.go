@@ -137,17 +137,16 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicError(w, http.StatusBadRequest, "model is required")
 		return
 	}
+	w, r, finishClientUsage := s.beginClientUsage(w, r, scope)
+	defer finishClientUsage()
 	if requestedModel == "auto" {
 		if !scopeAllowsModel(scope, "auto") {
 			writeAnthropicError(w, http.StatusForbidden, "model is not allowed by this access key: auto")
 			return
 		}
 		hasImage := anthropicMessagesHaveImage(raw)
-		target, ok := s.resolveAutoModel(r.Context())
-		if hasImage {
-			target, ok = s.resolveAutoVisionModel(r.Context())
-		}
-		if !ok {
+		candidates := s.autoChatCandidates(r.Context(), hasImage)
+		if len(candidates) == 0 {
 			message := "auto model has no available target"
 			if hasImage {
 				message = "auto model has no available multimodal target"
@@ -155,12 +154,8 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			writeAnthropicError(w, http.StatusServiceUnavailable, message)
 			return
 		}
-		req.Model = target
-		req.Raw, err = replaceModel(raw, target)
-		if err != nil {
-			writeAnthropicError(w, http.StatusBadRequest, err.Error())
-			return
-		}
+		s.proxyAutoAnthropicMessages(w, r, raw, candidates)
+		return
 	}
 
 	providerID, upstreamModel, ok := strings.Cut(req.Model, "/")
@@ -183,10 +178,60 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}
 
 	if p.Type == "anthropic" {
+		w, finishUpstreamUsage := s.beginUpstreamUsage(w, r, p, upstreamModel, req.Stream)
+		defer finishUpstreamUsage()
 		s.proxyAnthropicNative(w, r, p, req, upstreamModel)
 		return
 	}
 	s.proxyOpenAIAsAnthropic(w, r, req, requestedModel)
+}
+
+func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Request, raw []byte, candidates []string) {
+	var request anthropicRequest
+	_ = json.Unmarshal(raw, &request)
+	var lastFailure *autoRetryWriter
+	for _, candidate := range candidates {
+		body, err := replaceModel(raw, candidate)
+		if err != nil {
+			writeAnthropicError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		providerID, model, _ := strings.Cut(candidate, "/")
+		internal := r.Clone(context.WithValue(r.Context(), internalBypassKey{}, true))
+		internal.Body = io.NopCloser(bytes.NewReader(body))
+		internal.ContentLength = int64(len(body))
+		internal.Header = r.Header.Clone()
+		internal.Header.Set("Content-Type", "application/json")
+
+		retryWriter := newAutoRetryWriter(w, !request.Stream)
+		s.handleAnthropicMessages(retryWriter, internal)
+		if retryWriter.committed {
+			s.clearAutoModelFailure(providerID, model)
+			return
+		}
+		if retryWriter.status >= 200 && retryWriter.status <= 299 {
+			if probeResponseHasExplicitError(retryWriter.body.Bytes()) {
+				s.markAutoModelFailed(providerID, model)
+				lastFailure = retryWriter
+				continue
+			}
+			retryWriter.relay()
+			s.clearAutoModelFailure(providerID, model)
+			return
+		}
+		if isAutoFallbackError(retryWriter.status, retryWriter.body.Bytes()) {
+			s.markAutoModelFailed(providerID, model)
+			lastFailure = retryWriter
+			continue
+		}
+		retryWriter.relay()
+		return
+	}
+	if lastFailure != nil {
+		lastFailure.relay()
+		return
+	}
+	writeAnthropicError(w, http.StatusServiceUnavailable, "auto model has no available target")
 }
 
 func (s *Server) proxyOpenAIAsAnthropic(w http.ResponseWriter, r *http.Request, req anthropicRequest, responseModel string) {
@@ -330,12 +375,15 @@ func (s *Server) doAnthropicRequest(ctx context.Context, incoming *http.Request,
 		resp.Body.Close()
 		resp.Body = io.NopCloser(bytes.NewReader(lastBody))
 		lastResp = resp
-		if isCredentialKeyError(resp.StatusCode, lastBody) {
-			s.markProviderKeyFailed(p.ID, keyIndex, "", true)
-			continue
-		}
 		if isQuotaKeyError(resp.StatusCode, lastBody) {
 			s.markProviderKeyFailed(p.ID, keyIndex, model, false)
+			continue
+		}
+		if isRateLimitKeyError(resp.StatusCode, lastBody) {
+			continue
+		}
+		if isCredentialKeyError(resp.StatusCode, lastBody) {
+			s.markProviderKeyFailed(p.ID, keyIndex, "", true)
 			continue
 		}
 		return resp, nil

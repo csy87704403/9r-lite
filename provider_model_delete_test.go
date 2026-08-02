@@ -15,6 +15,7 @@ func TestDeleteProviderModelCleansReferences(t *testing.T) {
 				AvailableModels: []string{"keep", "remove"},
 				LockedModels:    []string{"remove"},
 				ModelKinds:      map[string]string{"remove": "image"},
+				ModelMultimodal: map[string]bool{"remove": true},
 				ModelLatencyMS:  map[string]int64{"remove": 123},
 				ModelErrors:     map[string]string{"remove": "failed"},
 			}},
@@ -34,7 +35,7 @@ func TestDeleteProviderModelCleansReferences(t *testing.T) {
 	if len(p.AvailableModels) != 1 || p.AvailableModels[0] != "keep" {
 		t.Fatalf("available models = %#v", p.AvailableModels)
 	}
-	if len(p.LockedModels) != 0 || p.ModelKinds["remove"] != "" || p.ModelLatencyMS["remove"] != 0 || p.ModelErrors["remove"] != "" {
+	if _, known := p.ModelMultimodal["remove"]; len(p.LockedModels) != 0 || p.ModelKinds["remove"] != "" || known || p.ModelLatencyMS["remove"] != 0 || p.ModelErrors["remove"] != "" {
 		t.Fatalf("probe state was not cleaned: %#v", p)
 	}
 	if len(s.config.AutoModel.Models) != 1 || s.config.AutoModel.Models[0] != "test/keep" {
