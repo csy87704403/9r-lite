@@ -144,17 +144,20 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			writeAnthropicError(w, http.StatusForbidden, "model is not allowed by this access key: auto")
 			return
 		}
+		agentKey, clientLabel := autoAgentIdentity(r, scope)
 		hasImage := anthropicMessagesHaveImage(raw)
-		candidates := s.autoChatCandidates(r.Context(), hasImage)
+		visionMode := s.autoAgentVisionMode(agentKey, hasImage)
+		candidates := s.autoChatCandidates(r.Context(), visionMode)
+		candidates = s.orderAutoCandidatesForAgent(agentKey, candidates, visionMode)
 		if len(candidates) == 0 {
 			message := "auto model has no available target"
-			if hasImage {
+			if visionMode {
 				message = "auto model has no available multimodal target"
 			}
 			writeAnthropicError(w, http.StatusServiceUnavailable, message)
 			return
 		}
-		s.proxyAutoAnthropicMessages(w, r, raw, candidates)
+		s.proxyAutoAnthropicMessages(w, r, raw, candidates, agentKey, clientLabel, visionMode)
 		return
 	}
 
@@ -186,13 +189,16 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	s.proxyOpenAIAsAnthropic(w, r, req, requestedModel)
 }
 
-func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Request, raw []byte, candidates []string) {
+func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Request, raw []byte, candidates []string, agentKey, clientLabel string, vision bool) {
 	var request anthropicRequest
 	_ = json.Unmarshal(raw, &request)
 	var lastFailure *autoRetryWriter
 	for _, candidate := range candidates {
+		started := time.Now()
+		s.beginAutoRuntime(candidate, r.UserAgent(), clientLabel)
 		body, err := replaceModel(raw, candidate)
 		if err != nil {
+			s.finishAutoRuntime(candidate, false, http.StatusBadRequest, []byte(err.Error()), started)
 			writeAnthropicError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -206,24 +212,31 @@ func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Reque
 		retryWriter := newAutoRetryWriter(w, !request.Stream)
 		s.handleAnthropicMessages(retryWriter, internal)
 		if retryWriter.committed {
+			s.finishAutoRuntime(candidate, true, retryWriter.status, retryWriter.body.Bytes(), started)
 			s.clearAutoModelFailure(providerID, model)
+			s.commitAutoAgentSuccess(agentKey, candidate, vision)
 			return
 		}
 		if retryWriter.status >= 200 && retryWriter.status <= 299 {
 			if probeResponseHasExplicitError(retryWriter.body.Bytes()) {
+				s.finishAutoRuntime(candidate, false, retryWriter.status, retryWriter.body.Bytes(), started)
 				s.markAutoModelFailed(providerID, model)
 				lastFailure = retryWriter
 				continue
 			}
 			retryWriter.relay()
+			s.finishAutoRuntime(candidate, true, retryWriter.status, retryWriter.body.Bytes(), started)
 			s.clearAutoModelFailure(providerID, model)
+			s.commitAutoAgentSuccess(agentKey, candidate, vision)
 			return
 		}
 		if isAutoFallbackError(retryWriter.status, retryWriter.body.Bytes()) {
+			s.finishAutoRuntime(candidate, false, retryWriter.status, retryWriter.body.Bytes(), started)
 			s.markAutoModelFailed(providerID, model)
 			lastFailure = retryWriter
 			continue
 		}
+		s.finishAutoRuntime(candidate, false, retryWriter.status, retryWriter.body.Bytes(), started)
 		retryWriter.relay()
 		return
 	}

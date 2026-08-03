@@ -143,6 +143,19 @@ type HealthAutoModel struct {
 	OK      bool   `json:"ok"`
 }
 
+type autoRuntimeModelStatus struct {
+	Model          string `json:"model"`
+	ActiveRequests int    `json:"active_requests"`
+	TotalAttempts  uint64 `json:"total_attempts"`
+	LastUserAgent  string `json:"last_user_agent,omitempty"`
+	LastClient     string `json:"last_client,omitempty"`
+	LastStartedAt  int64  `json:"last_started_at,omitempty"`
+	LastFinishedAt int64  `json:"last_finished_at,omitempty"`
+	LastLatencyMS  int64  `json:"last_latency_ms,omitempty"`
+	LastResult     string `json:"last_result,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
+}
+
 type HealthMediaTemplate struct {
 	Type           string                    `json:"type"`
 	ProviderID     string                    `json:"provider_id"`
@@ -173,9 +186,11 @@ type Server struct {
 	config                 Config
 	mu                     sync.RWMutex
 	autoMu                 sync.RWMutex
-	autoFailedModels       map[string]map[string]bool
-	autoTextCursor         uint64
-	autoVisionCursor       uint64
+	autoFailedModels       map[string]map[string]time.Time
+	autoAgentMu            sync.Mutex
+	autoAgents             map[string]*autoAgentBinding
+	autoRuntimeMu          sync.RWMutex
+	autoRuntime            map[string]*autoRuntimeModelStatus
 	probeMu                sync.Mutex
 	multimodalProbeMu      sync.Mutex
 	multimodalProbing      map[string]bool
@@ -324,6 +339,7 @@ func main() {
 	mux.HandleFunc("/admin/help", srv.handleAdminHelp)
 	mux.HandleFunc("/api/admin/password", srv.handleAdminPassword)
 	mux.HandleFunc("/api/admin/usage", srv.handleUsage)
+	mux.HandleFunc("/api/admin/auto-status", srv.handleAutoRuntimeStatus)
 	mux.HandleFunc("/api/config", srv.handleConfig)
 	mux.HandleFunc("/api/provider/models", srv.handleProviderModels)
 	mux.HandleFunc("/api/provider/probe", srv.handleProviderProbe)
@@ -399,7 +415,9 @@ func NewServer(dataDir string) (*Server, error) {
 	srv := &Server{
 		dataDir:                dataDir,
 		config:                 cfg,
-		autoFailedModels:       map[string]map[string]bool{},
+		autoFailedModels:       map[string]map[string]time.Time{},
+		autoAgents:             map[string]*autoAgentBinding{},
+		autoRuntime:            map[string]*autoRuntimeModelStatus{},
 		multimodalProbing:      map[string]bool{},
 		usage:                  usage,
 		usageSaveCh:            make(chan struct{}, 1),
@@ -700,6 +718,17 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin", http.StatusFound)
 }
 
+func (s *Server) handleAutoRuntimeStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"models": s.autoRuntimeSnapshot(), "updated_at": time.Now().UnixMilli()})
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	cfg := s.currentConfig()
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -807,6 +836,9 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cfg = mergeDefaultConfig(cfg)
+		for _, p := range cfg.Providers {
+			pruneAutoModelsForProviderLocked(&cfg, p)
+		}
 		if err := validateConfig(cfg); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
@@ -1345,24 +1377,27 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "model is not allowed by this access key: " + requestedModel})
 			return
 		}
+		agentKey, clientLabel := autoAgentIdentity(r, scope)
 		hasImage := openAIChatLatestUserHasImage(raw)
-		if !hasImage {
+		visionMode := s.autoAgentVisionMode(agentKey, hasImage)
+		if !visionMode {
 			raw, err = stripOpenAIHistoricalImages(raw)
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 				return
 			}
 		}
-		candidates := s.autoChatCandidatesForOpenAI(r.Context(), hasImage)
+		candidates := s.autoChatCandidatesForOpenAI(r.Context(), visionMode)
+		candidates = s.orderAutoCandidatesForAgent(agentKey, candidates, visionMode)
 		if len(candidates) == 0 {
 			message := "auto model has no available target"
-			if hasImage {
+			if visionMode {
 				message = "auto model has no available multimodal target"
 			}
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": message})
 			return
 		}
-		s.proxyAutoChatCompletions(w, r, raw, candidates)
+		s.proxyAutoChatCompletions(w, r, raw, candidates, agentKey, clientLabel, visionMode)
 		return
 	}
 
@@ -1420,13 +1455,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request, raw []byte, candidates []string) {
+func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request, raw []byte, candidates []string, agentKey, clientLabel string, vision bool) {
 	var request chatRequest
 	_ = json.Unmarshal(raw, &request)
 	var lastFailure *autoRetryWriter
 	for _, candidate := range candidates {
+		started := time.Now()
+		s.beginAutoRuntime(candidate, r.UserAgent(), clientLabel)
 		body, err := replaceModel(raw, candidate)
 		if err != nil {
+			s.finishAutoRuntime(candidate, false, http.StatusBadRequest, []byte(err.Error()), started)
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
@@ -1440,24 +1478,31 @@ func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request
 		retryWriter := newAutoRetryWriter(w, !request.Stream)
 		s.handleChatCompletions(retryWriter, internal)
 		if retryWriter.committed {
+			s.finishAutoRuntime(candidate, true, retryWriter.status, retryWriter.body.Bytes(), started)
 			s.clearAutoModelFailure(providerID, model)
+			s.commitAutoAgentSuccess(agentKey, candidate, vision)
 			return
 		}
 		if retryWriter.status >= 200 && retryWriter.status <= 299 {
 			if probeResponseHasExplicitError(retryWriter.body.Bytes()) {
+				s.finishAutoRuntime(candidate, false, retryWriter.status, retryWriter.body.Bytes(), started)
 				s.markAutoModelFailed(providerID, model)
 				lastFailure = retryWriter
 				continue
 			}
+			s.finishAutoRuntime(candidate, true, retryWriter.status, retryWriter.body.Bytes(), started)
 			retryWriter.relay()
 			s.clearAutoModelFailure(providerID, model)
+			s.commitAutoAgentSuccess(agentKey, candidate, vision)
 			return
 		}
 		if isAutoFallbackError(retryWriter.status, retryWriter.body.Bytes()) {
+			s.finishAutoRuntime(candidate, false, retryWriter.status, retryWriter.body.Bytes(), started)
 			s.markAutoModelFailed(providerID, model)
 			lastFailure = retryWriter
 			continue
 		}
+		s.finishAutoRuntime(candidate, false, retryWriter.status, retryWriter.body.Bytes(), started)
 		retryWriter.relay()
 		return
 	}
@@ -1923,7 +1968,40 @@ func (s *Server) updateProvider(next ProviderConfig) error {
 	if !found {
 		s.config.Providers = append(s.config.Providers, next)
 	}
+	pruneAutoModelsForProviderLocked(&s.config, next)
 	return saveConfig(s.dataDir, s.config)
+}
+
+func pruneAutoModelsForProviderLocked(cfg *Config, p ProviderConfig) {
+	if cfg == nil {
+		return
+	}
+	routes := uniqueStrings([]string{p.ID, providerPublicID(p)})
+	allowed := sliceSet(providerPublishedModelIDs(p))
+	filter := func(models []string) []string {
+		out := make([]string, 0, len(models))
+		for _, ref := range uniqueStrings(models) {
+			matched := false
+			keep := true
+			for _, route := range routes {
+				prefix := route + "/"
+				if strings.HasPrefix(ref, prefix) {
+					matched = true
+					model := strings.TrimPrefix(ref, prefix)
+					if !allowed[model] {
+						keep = false
+					}
+					break
+				}
+			}
+			if keep || !matched {
+				out = append(out, ref)
+			}
+		}
+		return out
+	}
+	cfg.AutoModel.Models = filter(cfg.AutoModel.Models)
+	cfg.AutoModel.VisionModels = filter(cfg.AutoModel.VisionModels)
 }
 
 func (s *Server) deleteProviderModel(providerID, model string) (ProviderConfig, error) {
@@ -2622,7 +2700,7 @@ func (s *Server) visibleModelsForProvider(ctx context.Context, p ProviderConfig)
 	return orderedIntersection(selected, uniqueStrings(p.AvailableModels))
 }
 
-func (s *Server) publishedModelsForProvider(p ProviderConfig) []string {
+func providerPublishedModelIDs(p ProviderConfig) []string {
 	base := p.Models
 	base = uniqueStrings(base)
 	if providerManualPublishOverride(p) {
@@ -2633,6 +2711,10 @@ func (s *Server) publishedModelsForProvider(p ProviderConfig) []string {
 		selected = base
 	}
 	return orderedIntersection(base, uniqueStrings(selected))
+}
+
+func (s *Server) publishedModelsForProvider(p ProviderConfig) []string {
+	return providerPublishedModelIDs(p)
 }
 
 func (s *Server) chatModelsForProvider(ctx context.Context, p ProviderConfig) []string {
@@ -2690,7 +2772,7 @@ func (s *Server) autoChatCandidatesForOpenAI(ctx context.Context, hasImage bool)
 	candidates := s.autoCandidatesMatching(ctx, cfg.AutoModel.Models, func(p ProviderConfig) bool {
 		return !isClaudeCodeCompatibleProvider(p)
 	}, hasImage)
-	return s.rotateAutoCandidates(candidates, hasImage)
+	return candidates
 }
 
 func (s *Server) autoChatCandidates(ctx context.Context, hasImage bool) []string {
@@ -2699,26 +2781,7 @@ func (s *Server) autoChatCandidates(ctx context.Context, hasImage bool) []string
 		return nil
 	}
 	candidates := s.autoCandidatesMatching(ctx, cfg.AutoModel.Models, nil, hasImage)
-	return s.rotateAutoCandidates(candidates, hasImage)
-}
-
-func (s *Server) rotateAutoCandidates(candidates []string, vision bool) []string {
-	if len(candidates) < 2 {
-		return candidates
-	}
-	s.autoMu.Lock()
-	cursor := &s.autoTextCursor
-	if vision {
-		cursor = &s.autoVisionCursor
-	}
-	start := int(*cursor % uint64(len(candidates)))
-	*cursor = *cursor + 1
-	s.autoMu.Unlock()
-
-	rotated := make([]string, 0, len(candidates))
-	rotated = append(rotated, candidates[start:]...)
-	rotated = append(rotated, candidates[:start]...)
-	return rotated
+	return candidates
 }
 
 func (s *Server) autoCandidatesMatching(ctx context.Context, candidates []string, accept func(ProviderConfig) bool, multimodalOnly bool) []string {
@@ -2757,7 +2820,7 @@ func (s *Server) autoCandidatesMatching(ctx context.Context, candidates []string
 }
 
 func providerModelAvailableForAuto(p ProviderConfig, model string) bool {
-	if !sliceSet(p.Models)[model] || modelQuotaBlocked(p, model) || allProviderKeysFailedForModel(p, model) {
+	if !sliceSet(providerPublishedModelIDs(p))[model] || modelQuotaBlocked(p, model) || allProviderKeysFailedForModel(p, model) {
 		return false
 	}
 	if p.AvailabilityCheckedAt == 0 && len(p.AvailableModels) == 0 {
@@ -2767,21 +2830,119 @@ func providerModelAvailableForAuto(p ProviderConfig, model string) bool {
 }
 
 func (s *Server) autoModelFailed(providerID, model string) bool {
-	s.autoMu.RLock()
-	defer s.autoMu.RUnlock()
-	return s.autoFailedModels[providerID][model]
+	s.autoMu.Lock()
+	defer s.autoMu.Unlock()
+	until := s.autoFailedModels[providerID][model]
+	if until.IsZero() {
+		return false
+	}
+	if time.Now().Before(until) {
+		return true
+	}
+	delete(s.autoFailedModels[providerID], model)
+	if len(s.autoFailedModels[providerID]) == 0 {
+		delete(s.autoFailedModels, providerID)
+	}
+	return false
+}
+
+func trimAutoUserAgent(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "未知客户端"
+	}
+	if len(value) > 120 {
+		return value[:120] + "..."
+	}
+	return value
+}
+
+func (s *Server) beginAutoRuntime(model, userAgent, clientLabel string) {
+	now := time.Now().UnixMilli()
+	s.autoRuntimeMu.Lock()
+	defer s.autoRuntimeMu.Unlock()
+	if s.autoRuntime == nil {
+		s.autoRuntime = map[string]*autoRuntimeModelStatus{}
+	}
+	status := s.autoRuntime[model]
+	if status == nil {
+		status = &autoRuntimeModelStatus{Model: model}
+		s.autoRuntime[model] = status
+	}
+	status.ActiveRequests++
+	status.TotalAttempts++
+	status.LastUserAgent = trimAutoUserAgent(userAgent)
+	status.LastClient = trimAutoUserAgent(clientLabel)
+	status.LastStartedAt = now
+	status.LastResult = "running"
+	status.LastError = ""
+}
+
+func (s *Server) finishAutoRuntime(model string, success bool, statusCode int, body []byte, started time.Time) {
+	now := time.Now()
+	s.autoRuntimeMu.Lock()
+	defer s.autoRuntimeMu.Unlock()
+	status := s.autoRuntime[model]
+	if status == nil {
+		status = &autoRuntimeModelStatus{Model: model}
+		s.autoRuntime[model] = status
+	}
+	if status.ActiveRequests > 0 {
+		status.ActiveRequests--
+	}
+	status.LastFinishedAt = now.UnixMilli()
+	status.LastLatencyMS = now.Sub(started).Milliseconds()
+	if success {
+		status.LastResult = "success"
+		status.LastError = ""
+		return
+	}
+	status.LastResult = "failed"
+	status.LastError = formatAutoRuntimeError(statusCode, body)
+}
+
+func formatAutoRuntimeError(status int, body []byte) string {
+	message := strings.TrimSpace(string(body))
+	if message == "" {
+		if status > 0 {
+			return fmt.Sprintf("HTTP %d", status)
+		}
+		return "请求失败"
+	}
+	return truncateString(message, 160)
+}
+
+func (s *Server) autoRuntimeSnapshot() []autoRuntimeModelStatus {
+	cfg := s.currentConfig()
+	set := map[string]bool{}
+	ordered := make([]string, 0, len(cfg.AutoModel.Models))
+	for _, model := range uniqueStrings(cfg.AutoModel.Models) {
+		set[model] = true
+		ordered = append(ordered, model)
+	}
+	s.autoRuntimeMu.RLock()
+	defer s.autoRuntimeMu.RUnlock()
+	out := make([]autoRuntimeModelStatus, 0, len(ordered))
+	for _, model := range ordered {
+		if status := s.autoRuntime[model]; status != nil {
+			out = append(out, *status)
+		} else if set[model] {
+			out = append(out, autoRuntimeModelStatus{Model: model, LastResult: "idle"})
+		}
+	}
+	return out
 }
 
 func (s *Server) markAutoModelFailed(providerID, model string) {
 	s.autoMu.Lock()
 	defer s.autoMu.Unlock()
 	if s.autoFailedModels == nil {
-		s.autoFailedModels = map[string]map[string]bool{}
+		s.autoFailedModels = map[string]map[string]time.Time{}
 	}
 	if s.autoFailedModels[providerID] == nil {
-		s.autoFailedModels[providerID] = map[string]bool{}
+		s.autoFailedModels[providerID] = map[string]time.Time{}
 	}
-	s.autoFailedModels[providerID][model] = true
+	s.autoFailedModels[providerID][model] = time.Now().Add(autoFailureCooldown)
 }
 
 func (s *Server) clearAutoModelFailure(providerID, model string) {
@@ -3326,11 +3487,15 @@ func isAutoFallbackError(status int, body []byte) bool {
 	}
 	switch status {
 	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusGone,
+		http.StatusRequestTimeout,
 		http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway,
 		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	}
-	if status != http.StatusBadRequest {
+	if status == 529 {
+		return true
+	}
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
 		return false
 	}
 	lower := strings.ToLower(string(body))
@@ -3339,6 +3504,10 @@ func isAutoFallbackError(status int, body []byte) bool {
 		"model is unavailable", "unavailable model", "unsupported model", "no such model",
 		"model decommissioned", "ip blocked", "ip has been blocked", "ip is blocked",
 		"access denied", "request forbidden",
+		"max_tokens exceeds", "max tokens exceeds", "output token limit", "output cap",
+		"context length exceeded", "maximum context length", "context window exceeded",
+		"tool calling is not supported", "tool use is not supported", "tools are not supported",
+		"image input is not supported", "vision is not supported", "multimodal is not supported",
 	} {
 		if strings.Contains(lower, marker) {
 			return true

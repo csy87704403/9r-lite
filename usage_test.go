@@ -55,7 +55,7 @@ func TestUsageTracksGroupAndActualAutoAttempts(t *testing.T) {
 	}
 	failed := group.Models["first-provider/first"]
 	success := group.Models["second-provider/second"]
-	if failed == nil || failed.Total.UpstreamFailed != 1 {
+	if failed == nil || failed.Total.UpstreamFailed != 1 || failed.LastFailure == "" || failed.LastFailureStatus != http.StatusServiceUnavailable {
 		t.Fatalf("failed model stats = %#v", failed)
 	}
 	if success == nil || success.Total.TotalTokens != 15 || success.Total.PromptTokens != 11 || success.Total.CompletionTokens != 4 {
@@ -88,7 +88,7 @@ func TestInternalProbeDoesNotCreateUsageGroup(t *testing.T) {
 
 func TestAdminIncludesUsageView(t *testing.T) {
 	html := adminHTMLLiteV2(`{"providers":[]}`)
-	for _, marker := range []string{"用量统计", "panel_usage", "loadUsageStats", "/api/admin/usage", "全部分组模型汇总"} {
+	for _, marker := range []string{"用量统计", "panel_usage", "loadUsageStats", "/api/admin/usage", "全部分组模型汇总", "成功调用", "失败尝试", "最后失败原因"} {
 		if !strings.Contains(html, marker) {
 			t.Fatalf("admin usage view missing %q", marker)
 		}
@@ -105,13 +105,27 @@ func TestUsageConcurrentAccounting(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			s.recordClientUsage(info, http.StatusOK)
-			s.recordUpstreamUsage(info, p, "model", http.StatusOK, tokenUsage{Prompt: 2, Completion: 1, Total: 3, Found: true})
+			s.recordUpstreamUsage(info, p, "model", http.StatusOK, tokenUsage{Prompt: 2, Completion: 1, Total: 3, Found: true}, "")
 		}()
 	}
 	wg.Wait()
 	group := s.usageSnapshot().Groups["agents"]
 	if group.Total.ClientRequests != 100 || group.Total.UpstreamCalls != 100 || group.Total.TotalTokens != 300 {
 		t.Fatalf("concurrent counters = %#v", group.Total)
+	}
+}
+
+func TestUsageCountsExplicitErrorResponseAsFailure(t *testing.T) {
+	s := &Server{usage: newUsageStore()}
+	info := usageRequestInfo{GroupID: "agents", GroupName: "Agents"}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req = req.WithContext(context.WithValue(req.Context(), usageRequestContextKey{}, &info))
+	w, finish := s.beginUpstreamUsage(httptest.NewRecorder(), req, ProviderConfig{ID: "provider", Name: "Provider"}, "model", false)
+	writeJSON(w, http.StatusOK, map[string]any{"success": false, "error": "empty response content"})
+	finish()
+	stats := s.usageSnapshot().Groups["agents"].Models["provider/model"]
+	if stats.Total.UpstreamSuccess != 0 || stats.Total.UpstreamFailed != 1 || !strings.Contains(stats.LastFailure, "empty response") {
+		t.Fatalf("explicit error usage stats = %#v", stats)
 	}
 }
 

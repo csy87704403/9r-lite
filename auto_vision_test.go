@@ -80,7 +80,7 @@ func TestAutoImageConversationReturnsToGeneralCandidates(t *testing.T) {
 	}
 }
 
-func TestAutoCandidatesRoundRobinByModality(t *testing.T) {
+func TestAutoCandidatesRoundRobinByModalityLegacy(t *testing.T) {
 	providers := []ProviderConfig{
 		{ID: "text1", Enabled: true, Models: []string{"model"}},
 		{ID: "vision1", Enabled: true, Models: []string{"model"}, ModelMultimodal: map[string]bool{"model": true}},
@@ -88,24 +88,43 @@ func TestAutoCandidatesRoundRobinByModality(t *testing.T) {
 		{ID: "vision2", Enabled: true, Models: []string{"model"}, ModelMultimodal: map[string]bool{"model": true}},
 	}
 	s := &Server{config: Config{AutoModel: AutoModelConfig{Enabled: true, Models: []string{"text1/model", "vision1/model", "text2/model", "vision2/model"}}, Providers: providers}}
-	if got := s.autoChatCandidatesForOpenAI(t.Context(), false); len(got) != 4 || got[0] != "text1/model" {
+	if got := s.orderAutoCandidatesForAgent("legacy-1", s.autoChatCandidatesForOpenAI(t.Context(), false), false); len(got) != 4 || got[0] != "text1/model" {
 		t.Fatalf("first text rotation = %#v", got)
 	}
-	if got := s.autoChatCandidatesForOpenAI(t.Context(), false); len(got) != 4 || got[0] != "vision1/model" {
+	if got := s.orderAutoCandidatesForAgent("legacy-2", s.autoChatCandidatesForOpenAI(t.Context(), false), false); len(got) != 4 || got[0] != "vision1/model" {
 		t.Fatalf("second text rotation = %#v", got)
 	}
-	if got := s.autoChatCandidatesForOpenAI(t.Context(), false); len(got) != 4 || got[0] != "text2/model" {
+	if got := s.orderAutoCandidatesForAgent("legacy-3", s.autoChatCandidatesForOpenAI(t.Context(), false), false); len(got) != 4 || got[0] != "text2/model" {
 		t.Fatalf("third text rotation = %#v", got)
 	}
-	if got := s.autoChatCandidatesForOpenAI(t.Context(), true); len(got) != 2 || got[0] != "vision1/model" {
+	visionServer := &Server{config: s.config}
+	if got := visionServer.orderAutoCandidatesForAgent("legacy-v1", visionServer.autoChatCandidatesForOpenAI(t.Context(), true), true); len(got) != 2 || got[0] != "vision1/model" {
 		t.Fatalf("first vision rotation = %#v", got)
 	}
-	if got := s.autoChatCandidatesForOpenAI(t.Context(), true); len(got) != 2 || got[0] != "vision2/model" {
+	if got := visionServer.orderAutoCandidatesForAgent("legacy-v2", visionServer.autoChatCandidatesForOpenAI(t.Context(), true), true); len(got) != 2 || got[0] != "vision2/model" {
 		t.Fatalf("second vision rotation = %#v", got)
 	}
 }
 
-func TestAutoCandidateRoundRobinIsConcurrentSafe(t *testing.T) {
+func TestAutoCandidatesSkipUnpublishedModels(t *testing.T) {
+	p := ProviderConfig{
+		ID:                   "provider",
+		Enabled:              true,
+		Models:               []string{"published", "hidden"},
+		EnabledModels:        []string{"published"},
+		ProviderSpecificData: map[string]string{"manualPublishOverride": "true"},
+	}
+	s := &Server{config: Config{
+		AutoModel: AutoModelConfig{Enabled: true, Models: []string{"provider/hidden", "provider/published"}},
+		Providers: []ProviderConfig{p},
+	}}
+	got := s.autoChatCandidatesForOpenAI(t.Context(), false)
+	if len(got) != 1 || got[0] != "provider/published" {
+		t.Fatalf("auto candidates = %#v", got)
+	}
+}
+
+func TestAutoCandidateRoundRobinIsConcurrentSafeLegacy(t *testing.T) {
 	providers := []ProviderConfig{
 		{ID: "text1", Enabled: true, Models: []string{"model"}},
 		{ID: "text2", Enabled: true, Models: []string{"model"}},
@@ -117,7 +136,7 @@ func TestAutoCandidateRoundRobinIsConcurrentSafe(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			candidates := s.autoChatCandidatesForOpenAI(t.Context(), false)
+			candidates := s.orderAutoCandidatesForAgent("same-agent", s.autoChatCandidatesForOpenAI(t.Context(), false), false)
 			if len(candidates) == 0 {
 				return
 			}
@@ -130,7 +149,7 @@ func TestAutoCandidateRoundRobinIsConcurrentSafe(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if first.Load() != 50 || second.Load() != 50 {
+	if first.Load() != 100 || second.Load() != 0 {
 		t.Fatalf("unbalanced concurrent rotation: first=%d second=%d", first.Load(), second.Load())
 	}
 }

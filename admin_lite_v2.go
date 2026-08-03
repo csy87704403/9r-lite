@@ -94,6 +94,8 @@ code{background:#eee;padding:2px 5px;border-radius:4px}
 .auto-member-badge{display:inline-block;margin:0 4px 0 0;padding:1px 6px;border-radius:999px;background:#2563eb;color:#fff;font:700 11px/18px system-ui,-apple-system,Segoe UI,sans-serif;vertical-align:1px;white-space:nowrap}
 .auto-remove-badge{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;margin:0 6px 0 0;padding:0;border:1px solid #93c5fd;border-radius:4px;background:#eff6ff;color:#1d4ed8;font-size:12px;line-height:14px;vertical-align:1px}
 .auto-remove-badge:hover{background:#dbeafe}
+.auto-runtime-status{display:inline-block;margin-left:8px;padding:1px 6px;border-radius:999px;font:11px/18px system-ui,-apple-system,Segoe UI,sans-serif;vertical-align:1px;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+.auto-runtime-status.running{background:#dbeafe;color:#1d4ed8}.auto-runtime-status.success{background:#dcfce7;color:#166534}.auto-runtime-status.failed{background:#fee2e2;color:#991b1b}.auto-runtime-status.idle{background:#f3f4f6;color:#6b7280}
 .published-model-title{margin-top:10px;color:#555;font-size:12px}
 .published-model-list{display:flex;flex-wrap:wrap;gap:5px;margin-top:5px;max-height:92px;overflow:auto;padding-right:3px}
 .published-model-tag{display:inline-flex;align-items:center;max-width:100%;padding:2px 7px;border-radius:999px;background:#f3f4f6;border:1px solid #e5e7eb;color:#374151;font:11px/16px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}
@@ -120,6 +122,7 @@ details{margin-top:22px}
 .usage-table{width:100%;border-collapse:collapse;font-size:13px}
 .usage-table th,.usage-table td{padding:8px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap}
 .usage-table th:first-child,.usage-table td:first-child{text-align:left}
+.usage-table th:last-child,.usage-table td:last-child{text-align:left;white-space:normal;min-width:180px;max-width:320px}
 .usage-group{margin:12px 0}
 </style>
 </head>
@@ -229,6 +232,7 @@ details{margin-top:22px}
 <div class="muted">第三方 Agent 继续使用上面的 Base URL 和访问密钥，模型名填写 <code>auto</code>。</div>
 <div class="muted">纯文本请求会在整个列表中轮询；请求包含图片时，只会在带“多模态”标签的模型中轮询。</div>
 <div class="muted">长按模型行约 300 毫秒后可以上下拖拽排序，调整后请点击保存。</div>
+<div class="muted">列表只显示当前正在处理请求的模型，请求结束后“调用中”标识会自动隐藏。</div>
 <div id="autoModelList" class="model-list"></div>
 <div class="bar"><button class="secondary" onclick="saveGateway()">保存 Auto 设置</button><span id="autoModelStatus" class="muted"></span></div>
 </div>
@@ -283,6 +287,7 @@ const providerProbeControllers=new Map();
 let mimoProxySearchController=null;
 let uiToastTimer=null;
 let autoSortState=null;
+let autoRuntimeStatus={};
 function parseConfig(){ try { return JSON.parse(document.getElementById('cfg').value); } catch { return null; } }
 function showMainTab(name){
   ['api','oauth','auto','groups','usage'].forEach(id=>{
@@ -299,8 +304,15 @@ function addUsageCounters(target, source){
 }
 function usageMetric(label,value){ return '<div class="usage-metric"><span class="muted">'+esc(label)+'</span><strong>'+usageNumber(value)+'</strong></div>'; }
 function usageModels(group){ return Object.values((group && group.models) || {}).sort((a,b)=>Number((b.total && b.total.total_tokens)||0)-Number((a.total && a.total.total_tokens)||0)); }
-function usageModelRows(models){ return models.map(item=>'<tr><td>'+esc((item.provider_name || item.provider_id)+' / '+item.model)+'</td><td>'+usageNumber(item.today && item.today.upstream_calls)+'</td><td>'+usageNumber(item.today && item.today.prompt_tokens)+'</td><td>'+usageNumber(item.today && item.today.completion_tokens)+'</td><td>'+usageNumber(item.today && item.today.total_tokens)+'</td><td>'+usageNumber(item.total && item.total.total_tokens)+'</td><td>'+usageNumber(item.today && item.today.unreported_calls)+'</td></tr>').join(''); }
-function usageTable(rows){ return '<div class="usage-table-wrap"><table class="usage-table"><thead><tr><th>实际提供商 / 模型</th><th>今日调用</th><th>今日输入</th><th>今日输出</th><th>今日总计</th><th>累计总计</th><th>未报告</th></tr></thead><tbody>'+rows+'</tbody></table></div>'; }
+function usageFailureHTML(item){
+  const reason=String((item && item.last_failure) || '').trim();
+  if(!reason) return '<span class="muted">—</span>';
+  const at=Number(item.last_failure_at || 0);
+  const when=at ? new Date(at*1000).toLocaleString('zh-CN',{hour12:false}) : '';
+  return '<span class="err" title="'+esc(when ? reason+' · '+when : reason)+'">'+esc(reason)+'</span>'+(when?'<div class="muted">'+esc(when)+'</div>':'');
+}
+function usageModelRows(models){ return models.map(item=>'<tr><td>'+esc((item.provider_name || item.provider_id)+' / '+item.model)+'</td><td>'+usageNumber(item.today && item.today.upstream_success)+'</td><td class="'+(Number(item.today && item.today.upstream_failed)>0?'err':'')+'">'+usageNumber(item.today && item.today.upstream_failed)+'</td><td>'+usageNumber(item.today && item.today.prompt_tokens)+'</td><td>'+usageNumber(item.today && item.today.completion_tokens)+'</td><td>'+usageNumber(item.today && item.today.total_tokens)+'</td><td>'+usageNumber(item.total && item.total.total_tokens)+'</td><td>'+usageNumber(item.today && item.today.unreported_calls)+'</td><td>'+usageFailureHTML(item)+'</td></tr>').join(''); }
+function usageTable(rows){ return '<div class="usage-table-wrap"><table class="usage-table"><thead><tr><th>实际提供商 / 模型</th><th>成功调用</th><th>失败尝试</th><th>今日输入</th><th>今日输出</th><th>今日总计</th><th>累计总计</th><th>未报告</th><th>最后失败原因</th></tr></thead><tbody>'+rows+'</tbody></table></div>'; }
 function renderUsageStats(data){
   const groups=Array.isArray(data && data.groups)?data.groups:[];
   const today={}; const total={};
@@ -312,8 +324,9 @@ function renderUsageStats(data){
   const allModels={};
   groups.forEach(group=>usageModels(group).forEach(item=>{
     const key=(item.provider_id || '')+'/'+(item.model || '');
-    if(!allModels[key]) allModels[key]={provider_id:item.provider_id,provider_name:item.provider_name,model:item.model,today:{},total:{}};
+    if(!allModels[key]) allModels[key]={provider_id:item.provider_id,provider_name:item.provider_name,model:item.model,today:{},total:{},last_failure:'',last_failure_at:0};
     addUsageCounters(allModels[key].today,item.today); addUsageCounters(allModels[key].total,item.total);
+    if(Number(item.last_failure_at || 0)>Number(allModels[key].last_failure_at || 0)){ allModels[key].last_failure=item.last_failure; allModels[key].last_failure_at=item.last_failure_at; allModels[key].last_failure_status=item.last_failure_status; }
   }));
   const overall=Object.values(allModels).sort((a,b)=>Number((b.total && b.total.total_tokens)||0)-Number((a.total && a.total.total_tokens)||0));
   const overallHTML='<div class="card usage-group"><div class="card-title-row"><h3>全部分组模型汇总</h3><span class="provider-badge">累计 '+usageNumber(total.total_tokens)+' Token</span></div>'+usageTable(usageModelRows(overall))+'</div>';
@@ -632,11 +645,29 @@ function showToast(message,type){
   toast.textContent=message;
   uiToastTimer=setTimeout(()=>{ toast.className='ui-toast'; },1800);
 }
+function autoRuntimeBadgeHTML(model){
+  const status=autoRuntimeStatus[model];
+  if(!status || Number(status.active_requests || 0)<=0) return '';
+  const active=Number(status.active_requests || 0);
+  const ua=(status.last_user_agent || '未知客户端');
+  const title='当前调用客户端 User-Agent: '+ua;
+  return '<span class="auto-runtime-status running" title="'+esc(title)+'">调用中 '+active+' · '+esc(ua)+'</span>';
+}
 function renderAutoModels(cfg){
   const root=document.getElementById('autoModelList'); if(!root) return;
   const models=autoModels(cfg);
-  root.innerHTML=models.length ? models.map((model,i)=>'<div class="model-item auto-sort-item" data-auto-sort-index="'+i+'" data-auto-model="'+esc(model)+'"><span class="auto-drag-handle" title="长按后拖拽排序">⋮⋮</span><span class="model-name">'+esc(model)+autoModelBadgeHTML(cfg,model)+'</span><button class="small secondary" onclick="removeAutoModel('+i+')">删除</button></div>').join('') : '<div class="muted">还没有候选模型。</div>';
+  root.innerHTML=models.length ? models.map((model,i)=>'<div class="model-item auto-sort-item" data-auto-sort-index="'+i+'" data-auto-model="'+esc(model)+'"><span class="auto-drag-handle" title="长按后拖拽排序">⋮⋮</span><span class="model-name">'+esc(model)+autoModelBadgeHTML(cfg,model)+autoRuntimeBadgeHTML(model)+'</span><button class="small secondary" onclick="removeAutoModel('+i+')">删除</button></div>').join('') : '<div class="muted">还没有候选模型。</div>';
   root.querySelectorAll('.auto-sort-item').forEach(row=>row.addEventListener('pointerdown',autoSortPointerDown));
+}
+async function loadAutoRuntimeStatus(){
+  try{
+    const res=await fetch('/api/admin/auto-status');
+    if(!res.ok) return;
+    const data=await res.json();
+    autoRuntimeStatus={};
+    (data.models || []).forEach(item=>{ autoRuntimeStatus[item.model]=item; });
+    if(!autoSortState || !autoSortState.active) renderAutoModels(parseConfig());
+  }catch(_){ }
 }
 function autoSortPointerDown(event){
   if(event.button!==undefined && event.button!==0) return;
@@ -1490,7 +1521,7 @@ async function probeAllProviders(){
   }
   await reloadConfig(); setText('probeAllStatus',probeStopRequested?'muted':(failed?'err':'ok'),probeStopRequested?'已停止，已探测 '+done+'/'+jobs.length+'，可用 '+ok+' 个模型':'探测完成，可用 '+ok+' 个模型'+(failed?'，失败 '+failed+' 个':'，已自动发布'));
 }
-async function saveModelSelection(id,statusID){ try{ statusID=statusID || 'publishStatus_'+id; const nodes=[...document.querySelectorAll('input[data-provider="'+id+'"]:checked')]; const enabled_models=nodes.map(node=>node.getAttribute('data-model')); const res=await fetch('/api/provider/selection',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id, enabled_models})}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); await reloadConfig(); setText(statusID,'ok','已保存发布列表'); }catch(e){ setText(statusID || 'status','err',e.message); } }
+async function saveModelSelection(id,statusID){ try{ statusID=statusID || 'publishStatus_'+id; const nodes=[...document.querySelectorAll('input[data-provider="'+id+'"]:checked')]; const enabled_models=nodes.map(node=>node.getAttribute('data-model')); const res=await fetch('/api/provider/selection',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id, enabled_models})}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); await reloadConfig(); setText(statusID,'ok','已保存发布列表，Auto 候选已同步'); }catch(e){ setText(statusID || 'status','err',e.message); } }
 async function deleteSelectedProviderModels(id,statusID){
   const models=[...document.querySelectorAll('input[data-provider="'+id+'"]:checked')].map(node=>node.getAttribute('data-model'));
   if(!models.length){ setText(statusID,'err','请先选择要删除的模型'); return; }
@@ -1532,6 +1563,7 @@ async function pollKilo(){ try{ const flow=JSON.parse(localStorage.getItem('kilo
 async function startCline(){ try{ const data=await (await fetch('/api/oauth/cline/authorize')).json(); window.open(data.authUrl, '_blank', 'noopener,noreferrer'); setText('clineStatus','ok','已打开 Cline 登录页，回调完成后会自动保存令牌。'); }catch(e){ setText('clineStatus','err',e.message); } }
 const initCfg=parseConfig(); if(initCfg){ setConfig(initCfg); }
 renderProviderStatus(); renderAPIProviders(); renderPublishProviders();
+loadAutoRuntimeStatus(); setInterval(loadAutoRuntimeStatus,2000);
 </script>
 </main>
 </body>

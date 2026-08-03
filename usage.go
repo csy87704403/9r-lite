@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -29,11 +30,14 @@ type UsageCounters struct {
 }
 
 type UsageModelStats struct {
-	ProviderID   string        `json:"provider_id"`
-	ProviderName string        `json:"provider_name"`
-	Model        string        `json:"model"`
-	Today        UsageCounters `json:"today"`
-	Total        UsageCounters `json:"total"`
+	ProviderID        string        `json:"provider_id"`
+	ProviderName      string        `json:"provider_name"`
+	Model             string        `json:"model"`
+	Today             UsageCounters `json:"today"`
+	Total             UsageCounters `json:"total"`
+	LastFailure       string        `json:"last_failure,omitempty"`
+	LastFailureAt     int64         `json:"last_failure_at,omitempty"`
+	LastFailureStatus int           `json:"last_failure_status,omitempty"`
 }
 
 type UsageGroupStats struct {
@@ -66,12 +70,13 @@ type tokenUsage struct {
 }
 
 type usageResponseWriter struct {
-	target  http.ResponseWriter
-	status  int
-	stream  bool
-	body    bytes.Buffer
-	pending []byte
-	usage   tokenUsage
+	target      http.ResponseWriter
+	status      int
+	stream      bool
+	body        bytes.Buffer
+	failureBody bytes.Buffer
+	pending     []byte
+	usage       tokenUsage
 }
 
 type usageClientWriter struct {
@@ -167,7 +172,19 @@ func (s *Server) beginUpstreamUsage(w http.ResponseWriter, r *http.Request, p Pr
 		if !stream {
 			usage = extractTokenUsage(tracked.body.Bytes())
 		}
-		s.recordUpstreamUsage(*info, p, model, status, usage)
+		responseBody := tracked.body.Bytes()
+		if stream {
+			responseBody = tracked.failureBody.Bytes()
+		}
+		usageStatus := status
+		failureReason := ""
+		if status < 200 || status > 299 {
+			failureReason = usageFailureReason(status, responseBody)
+		} else if !stream && probeResponseHasExplicitError(responseBody) {
+			usageStatus = http.StatusBadGateway
+			failureReason = usageFailureReason(status, responseBody)
+		}
+		s.recordUpstreamUsage(*info, p, model, usageStatus, usage, failureReason)
 	}
 }
 
@@ -209,6 +226,10 @@ func (w *usageResponseWriter) Write(body []byte) (int, error) {
 		w.status = http.StatusOK
 	}
 	if w.stream {
+		if (w.status < 200 || w.status > 299) && w.failureBody.Len() < 64<<10 {
+			remaining := 64<<10 - w.failureBody.Len()
+			_, _ = w.failureBody.Write(body[:min(len(body), remaining)])
+		}
 		w.consumeStream(body)
 	} else if w.body.Len() < 8<<20 {
 		remaining := 8<<20 - w.body.Len()
@@ -279,6 +300,37 @@ func extractTokenUsage(raw []byte) tokenUsage {
 	return tokenUsage{Prompt: prompt, Completion: completion, Total: total, Found: promptOK || completionOK || totalOK}
 }
 
+func usageFailureReason(status int, raw []byte) string {
+	message := strings.TrimSpace(extractUsageErrorMessage(raw))
+	if message == "" {
+		message = strings.TrimSpace(string(raw))
+	}
+	return truncateString(formatProbeFailure(status, message), 160)
+}
+
+func extractUsageErrorMessage(raw []byte) string {
+	var body map[string]any
+	if json.Unmarshal(raw, &body) != nil {
+		return ""
+	}
+	if value, ok := body["error"].(string); ok {
+		return value
+	}
+	if nested := anyMap(body["error"]); len(nested) > 0 {
+		for _, key := range []string{"message", "detail", "error_description", "errorDescription"} {
+			if value, ok := nested[key].(string); ok && strings.TrimSpace(value) != "" {
+				return value
+			}
+		}
+	}
+	for _, key := range []string{"message", "detail", "error_description", "errorDescription"} {
+		if value, ok := body[key].(string); ok && strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func usageInt(values map[string]any, keys ...string) (int64, bool) {
 	for _, key := range keys {
 		value, ok := values[key]
@@ -344,6 +396,9 @@ func addUpstreamCounters(counters *UsageCounters, status int, usage tokenUsage) 
 
 func (s *Server) usageGroupLocked(info usageRequestInfo) *UsageGroupStats {
 	rollUsageDate(&s.usage)
+	if s.usage.Groups == nil {
+		s.usage.Groups = map[string]*UsageGroupStats{}
+	}
 	group := s.usage.Groups[info.GroupID]
 	if group == nil {
 		group = &UsageGroupStats{ID: info.GroupID, Models: map[string]*UsageModelStats{}}
@@ -366,7 +421,7 @@ func (s *Server) recordClientUsage(info usageRequestInfo, status int) {
 	s.scheduleUsageSave()
 }
 
-func (s *Server) recordUpstreamUsage(info usageRequestInfo, p ProviderConfig, model string, status int, usage tokenUsage) {
+func (s *Server) recordUpstreamUsage(info usageRequestInfo, p ProviderConfig, model string, status int, usage tokenUsage, failureReason string) {
 	s.usageMu.Lock()
 	group := s.usageGroupLocked(info)
 	key := p.ID + "/" + model
@@ -380,6 +435,11 @@ func (s *Server) recordUpstreamUsage(info usageRequestInfo, p ProviderConfig, mo
 	addUpstreamCounters(&group.Total, status, usage)
 	addUpstreamCounters(&stats.Today, status, usage)
 	addUpstreamCounters(&stats.Total, status, usage)
+	if failureReason != "" {
+		stats.LastFailure = failureReason
+		stats.LastFailureAt = time.Now().Unix()
+		stats.LastFailureStatus = status
+	}
 	s.usage.UpdatedAt = time.Now().Unix()
 	s.usageMu.Unlock()
 	s.scheduleUsageSave()

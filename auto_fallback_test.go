@@ -437,7 +437,7 @@ func TestOpenRouterProbeDetectionDoesNotMatchKiloPath(t *testing.T) {
 func TestAutoCandidatesSkipPersistedFailures(t *testing.T) {
 	base := ProviderConfig{ID: "provider", Type: "openai", Enabled: true, APIKey: "key1", APIKeys: []string{"key1", "key2"}, Models: []string{"model"}, EnabledModels: []string{"model"}, AvailableModels: []string{"model"}, AvailabilityCheckedAt: 1}
 	newServer := func(p ProviderConfig) *Server {
-		return &Server{config: Config{AutoModel: AutoModelConfig{Enabled: true, Models: []string{"provider/model"}}, Providers: []ProviderConfig{p}}, autoFailedModels: map[string]map[string]bool{}}
+		return &Server{config: Config{AutoModel: AutoModelConfig{Enabled: true, Models: []string{"provider/model"}}, Providers: []ProviderConfig{p}}}
 	}
 	quotaBlocked := base
 	quotaBlocked.QuotaBlockedModels = []string{"model"}
@@ -453,14 +453,14 @@ func TestAutoCandidatesSkipPersistedFailures(t *testing.T) {
 
 func TestAutoCandidatesUseAvailabilityInsteadOfPublishSelection(t *testing.T) {
 	newServer := func(p ProviderConfig) *Server {
-		return &Server{config: Config{AutoModel: AutoModelConfig{Enabled: true, Models: []string{"provider/model"}}, Providers: []ProviderConfig{p}}, autoFailedModels: map[string]map[string]bool{}}
+		return &Server{config: Config{AutoModel: AutoModelConfig{Enabled: true, Models: []string{"provider/model"}}, Providers: []ProviderConfig{p}}}
 	}
 	availableButUnpublished := ProviderConfig{
 		ID: "provider", Type: "openai", Enabled: true, Models: []string{"model"},
 		AvailableModels: []string{"model"}, AvailabilityCheckedAt: 1,
 		ProviderSpecificData: map[string]string{"manualPublishOverride": "true"},
 	}
-	if got := newServer(availableButUnpublished).autoChatCandidatesForOpenAI(t.Context(), false); len(got) != 1 {
+	if got := newServer(availableButUnpublished).autoChatCandidatesForOpenAI(t.Context(), false); len(got) != 0 {
 		t.Fatalf("available unpublished model was excluded from Auto: %#v", got)
 	}
 	publishedButUnavailable := availableButUnpublished
