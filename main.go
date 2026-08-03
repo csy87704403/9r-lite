@@ -1377,9 +1377,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "model is not allowed by this access key: " + requestedModel})
 			return
 		}
-		agentKey, clientLabel := autoAgentIdentity(r, scope)
-		hasImage := openAIChatLatestUserHasImage(raw)
-		visionMode := s.autoAgentVisionMode(agentKey, hasImage)
+		sessionKey, clientLabel := autoSessionIdentity(r, scope, raw)
+		latestHasImage := openAIChatLatestUserHasImage(raw)
+		anyImage := openAIChatHasImage(raw)
+		visionMode, _ := s.autoSessionRequestMode(sessionKey, latestHasImage, anyImage)
 		if !visionMode {
 			raw, err = stripOpenAIHistoricalImages(raw)
 			if err != nil {
@@ -1388,7 +1389,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		candidates := s.autoChatCandidatesForOpenAI(r.Context(), visionMode)
-		candidates = s.orderAutoCandidatesForAgent(agentKey, candidates, visionMode)
+		candidates = s.orderAutoCandidatesForAgent(sessionKey, candidates, visionMode)
 		if len(candidates) == 0 {
 			message := "auto model has no available target"
 			if visionMode {
@@ -1397,7 +1398,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": message})
 			return
 		}
-		s.proxyAutoChatCompletions(w, r, raw, candidates, agentKey, clientLabel, visionMode)
+		s.proxyAutoChatCompletions(w, r, raw, candidates, sessionKey, clientLabel, visionMode, latestHasImage)
 		return
 	}
 
@@ -1455,7 +1456,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request, raw []byte, candidates []string, agentKey, clientLabel string, vision bool) {
+func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request, raw []byte, candidates []string, agentKey, clientLabel string, vision, newImage bool) {
 	var request chatRequest
 	_ = json.Unmarshal(raw, &request)
 	var lastFailure *autoRetryWriter
@@ -1480,7 +1481,7 @@ func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request
 		if retryWriter.committed {
 			s.finishAutoRuntime(candidate, true, retryWriter.status, retryWriter.body.Bytes(), started)
 			s.clearAutoModelFailure(providerID, model)
-			s.commitAutoAgentSuccess(agentKey, candidate, vision)
+			s.commitAutoAgentSuccess(agentKey, candidate, vision, newImage)
 			return
 		}
 		if retryWriter.status >= 200 && retryWriter.status <= 299 {
@@ -1493,7 +1494,7 @@ func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request
 			s.finishAutoRuntime(candidate, true, retryWriter.status, retryWriter.body.Bytes(), started)
 			retryWriter.relay()
 			s.clearAutoModelFailure(providerID, model)
-			s.commitAutoAgentSuccess(agentKey, candidate, vision)
+			s.commitAutoAgentSuccess(agentKey, candidate, vision, newImage)
 			return
 		}
 		if isAutoFallbackError(retryWriter.status, retryWriter.body.Bytes()) {

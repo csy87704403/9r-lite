@@ -184,7 +184,7 @@ func (s *Server) beginUpstreamUsage(w http.ResponseWriter, r *http.Request, p Pr
 			usageStatus = http.StatusBadGateway
 			failureReason = usageFailureReason(status, responseBody)
 		}
-		s.recordUpstreamUsage(*info, p, model, usageStatus, usage, failureReason)
+		s.recordUpstreamUsage(*info, p, model, usageStatus, usage, failureReason, status)
 	}
 }
 
@@ -305,7 +305,10 @@ func usageFailureReason(status int, raw []byte) string {
 	if message == "" {
 		message = strings.TrimSpace(string(raw))
 	}
-	return truncateString(formatProbeFailure(status, message), 160)
+	if message == "" {
+		return formatProbeFailure(status, "")
+	}
+	return truncateString(message, 2000)
 }
 
 func extractUsageErrorMessage(raw []byte) string {
@@ -421,7 +424,7 @@ func (s *Server) recordClientUsage(info usageRequestInfo, status int) {
 	s.scheduleUsageSave()
 }
 
-func (s *Server) recordUpstreamUsage(info usageRequestInfo, p ProviderConfig, model string, status int, usage tokenUsage, failureReason string) {
+func (s *Server) recordUpstreamUsage(info usageRequestInfo, p ProviderConfig, model string, status int, usage tokenUsage, failureReason string, failureStatus int) {
 	s.usageMu.Lock()
 	group := s.usageGroupLocked(info)
 	key := p.ID + "/" + model
@@ -438,7 +441,7 @@ func (s *Server) recordUpstreamUsage(info usageRequestInfo, p ProviderConfig, mo
 	if failureReason != "" {
 		stats.LastFailure = failureReason
 		stats.LastFailureAt = time.Now().Unix()
-		stats.LastFailureStatus = status
+		stats.LastFailureStatus = failureStatus
 	}
 	s.usage.UpdatedAt = time.Now().Unix()
 	s.usageMu.Unlock()

@@ -88,7 +88,7 @@ func TestInternalProbeDoesNotCreateUsageGroup(t *testing.T) {
 
 func TestAdminIncludesUsageView(t *testing.T) {
 	html := adminHTMLLiteV2(`{"providers":[]}`)
-	for _, marker := range []string{"用量统计", "panel_usage", "loadUsageStats", "/api/admin/usage", "全部分组模型汇总", "成功调用", "失败尝试", "最后失败原因"} {
+	for _, marker := range []string{"用量统计", "panel_usage", "loadUsageStats", "/api/admin/usage", "全部分组模型汇总", "成功调用", "失败尝试", "最后失败原因", "usageLogModal", "查看日志", "复制日志"} {
 		if !strings.Contains(html, marker) {
 			t.Fatalf("admin usage view missing %q", marker)
 		}
@@ -105,7 +105,7 @@ func TestUsageConcurrentAccounting(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			s.recordClientUsage(info, http.StatusOK)
-			s.recordUpstreamUsage(info, p, "model", http.StatusOK, tokenUsage{Prompt: 2, Completion: 1, Total: 3, Found: true}, "")
+			s.recordUpstreamUsage(info, p, "model", http.StatusOK, tokenUsage{Prompt: 2, Completion: 1, Total: 3, Found: true}, "", 0)
 		}()
 	}
 	wg.Wait()
@@ -121,10 +121,11 @@ func TestUsageCountsExplicitErrorResponseAsFailure(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	req = req.WithContext(context.WithValue(req.Context(), usageRequestContextKey{}, &info))
 	w, finish := s.beginUpstreamUsage(httptest.NewRecorder(), req, ProviderConfig{ID: "provider", Name: "Provider"}, "model", false)
-	writeJSON(w, http.StatusOK, map[string]any{"success": false, "error": "empty response content"})
+	errorMessage := "invalid request: " + strings.Repeat("details-", 20) + "reasoning_content must be passed back"
+	writeJSON(w, http.StatusOK, map[string]any{"success": false, "error": errorMessage})
 	finish()
 	stats := s.usageSnapshot().Groups["agents"].Models["provider/model"]
-	if stats.Total.UpstreamSuccess != 0 || stats.Total.UpstreamFailed != 1 || !strings.Contains(stats.LastFailure, "empty response") {
+	if stats.Total.UpstreamSuccess != 0 || stats.Total.UpstreamFailed != 1 || stats.LastFailureStatus != http.StatusOK || stats.LastFailure != errorMessage {
 		t.Fatalf("explicit error usage stats = %#v", stats)
 	}
 }

@@ -95,6 +95,62 @@ func anthropicMessagesHaveImage(raw []byte) bool {
 	return false
 }
 
+func anthropicMessagesLatestUserHasImage(raw []byte) bool {
+	var request struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(raw, &request) != nil {
+		return false
+	}
+	for i := len(request.Messages) - 1; i >= 0; i-- {
+		if strings.EqualFold(strings.TrimSpace(request.Messages[i].Role), "user") {
+			return messageContentHasImage(request.Messages[i].Content, true)
+		}
+	}
+	return false
+}
+
+func stripAnthropicHistoricalImages(raw []byte) ([]byte, error) {
+	var request map[string]any
+	if err := json.Unmarshal(raw, &request); err != nil {
+		return nil, err
+	}
+	messages, _ := request["messages"].([]any)
+	changed := false
+	for _, value := range messages {
+		message, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		parts, ok := message["content"].([]any)
+		if !ok {
+			continue
+		}
+		kept := make([]any, 0, len(parts))
+		for _, partValue := range parts {
+			part := anyMap(partValue)
+			partType := strings.ToLower(strings.TrimSpace(anyString(part["type"])))
+			if partType == "image" || partType == "image_url" {
+				changed = true
+				continue
+			}
+			kept = append(kept, partValue)
+		}
+		if len(kept) == 0 {
+			message["content"] = "[Historical image omitted; refer to the prior assistant response.]"
+		} else {
+			message["content"] = kept
+		}
+	}
+	if !changed {
+		return raw, nil
+	}
+	return json.Marshal(request)
+}
+
 func messageContentHasImage(content any, anthropic bool) bool {
 	for _, value := range anySlice(content) {
 		part := anyMap(value)

@@ -29,6 +29,17 @@ func TestImageHistoryDetection(t *testing.T) {
 	if !anthropicMessagesHaveImage(anthropic) {
 		t.Fatal("Anthropic image history was not detected")
 	}
+	if !anthropicMessagesLatestUserHasImage(anthropic) {
+		t.Fatal("Anthropic latest user image was not detected")
+	}
+	anthropicHistory := []byte(`{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}},{"type":"text","text":"这是什么"}]},{"role":"assistant","content":"图片描述"},{"role":"user","content":"现在写代码"}]}`)
+	if anthropicMessagesLatestUserHasImage(anthropicHistory) {
+		t.Fatal("Anthropic historical image was treated as a new image")
+	}
+	strippedAnthropic, err := stripAnthropicHistoricalImages(anthropicHistory)
+	if err != nil || anthropicMessagesHaveImage(strippedAnthropic) {
+		t.Fatalf("Anthropic historical image was not stripped: err=%v body=%s", err, strippedAnthropic)
+	}
 	toolSchema := []byte(`{"messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"save","parameters":{"properties":{"image":{"type":"string"}}}}}]}`)
 	if openAIChatHasImage(toolSchema) {
 		t.Fatal("tool schema image field must not trigger multimodal routing")
@@ -67,15 +78,19 @@ func TestAutoImageConversationReturnsToGeneralCandidates(t *testing.T) {
 	if pureText.Code != http.StatusOK || !strings.Contains(pureText.Body.String(), `"content":"normal"`) {
 		t.Fatalf("text Auto route failed: %d %s", pureText.Code, pureText.Body.String())
 	}
-	image := call(`{"model":"auto","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}},{"type":"text","text":"describe"}]}]}`)
+	image := call(`{"model":"auto","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"normal"},{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}},{"type":"text","text":"describe"}]}]}`)
 	if image.Code != http.StatusOK || !strings.Contains(image.Body.String(), `"content":"vision"`) {
 		t.Fatalf("vision Auto route failed: %d %s", image.Code, image.Body.String())
 	}
-	textFollowUp := call(`{"model":"auto","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}},{"type":"text","text":"describe"}]},{"role":"assistant","content":"previous"},{"role":"user","content":"continue with text only"}]}`)
+	textFollowUp := call(`{"model":"auto","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"normal"},{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}},{"type":"text","text":"describe"}]},{"role":"assistant","content":"previous"},{"role":"user","content":"continue with text only"}]}`)
 	if textFollowUp.Code != http.StatusOK || !strings.Contains(textFollowUp.Body.String(), `"content":"vision"`) {
 		t.Fatalf("text follow-up did not continue the full candidate rotation: %d %s", textFollowUp.Code, textFollowUp.Body.String())
 	}
-	if normalCalls.Load() != 1 || visionCalls.Load() != 2 {
+	backToText := call(`{"model":"auto","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"normal"},{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}},{"type":"text","text":"describe"}]},{"role":"assistant","content":"previous"},{"role":"user","content":"continue with text only"},{"role":"assistant","content":"vision follow-up"},{"role":"user","content":"now write a function"}]}`)
+	if backToText.Code != http.StatusOK || !strings.Contains(backToText.Body.String(), `"content":"normal"`) {
+		t.Fatalf("Auto did not return to the primary model: %d %s", backToText.Code, backToText.Body.String())
+	}
+	if normalCalls.Load() != 2 || visionCalls.Load() != 2 {
 		t.Fatalf("unexpected route counts: normal=%d vision=%d", normalCalls.Load(), visionCalls.Load())
 	}
 }

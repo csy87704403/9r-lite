@@ -124,6 +124,10 @@ details{margin-top:22px}
 .usage-table th:first-child,.usage-table td:first-child{text-align:left}
 .usage-table th:last-child,.usage-table td:last-child{text-align:left;white-space:normal;min-width:180px;max-width:320px}
 .usage-group{margin:12px 0}
+.usage-log-modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;padding:20px;background:rgba(15,23,42,.45);z-index:1000}
+.usage-log-modal.open{display:flex}
+.usage-log-dialog{width:min(760px,100%);max-height:85vh;overflow:auto;background:#fff;border-radius:12px;padding:18px;box-shadow:0 20px 60px rgba(15,23,42,.3)}
+.usage-log-dialog textarea{width:100%;min-height:280px;margin-top:10px;font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap}
 </style>
 </head>
 <body>
@@ -277,6 +281,14 @@ details{margin-top:22px}
 <textarea id="cfg" spellcheck="false">` + escaped + `</textarea>
 </details>
 
+<div id="usageLogModal" class="usage-log-modal" role="dialog" aria-modal="true" aria-labelledby="usageLogTitle" onclick="if(event.target===this)closeUsageLog()">
+  <div class="usage-log-dialog">
+    <div class="card-title-row"><h3 id="usageLogTitle" style="margin:0">失败日志</h3><button class="small secondary" onclick="closeUsageLog()" type="button">关闭</button></div>
+    <textarea id="usageLogText" readonly spellcheck="false"></textarea>
+    <div class="bar"><button onclick="copyUsageLog()" type="button">复制日志</button><span id="usageLogStatus" class="muted"></span></div>
+  </div>
+</div>
+
 <script>
 const fixedAPIProviderIDs=['glm','groq','deepseek','mimo'];
 const publishProviderIDs=['oc','mmf','qoder','kilo','cline'];
@@ -288,6 +300,7 @@ let mimoProxySearchController=null;
 let uiToastTimer=null;
 let autoSortState=null;
 let autoRuntimeStatus={};
+let usageLogItems=[];
 function parseConfig(){ try { return JSON.parse(document.getElementById('cfg').value); } catch { return null; } }
 function showMainTab(name){
   ['api','oauth','auto','groups','usage'].forEach(id=>{
@@ -307,13 +320,14 @@ function usageModels(group){ return Object.values((group && group.models) || {})
 function usageFailureHTML(item){
   const reason=String((item && item.last_failure) || '').trim();
   if(!reason) return '<span class="muted">—</span>';
-  const at=Number(item.last_failure_at || 0);
-  const when=at ? new Date(at*1000).toLocaleString('zh-CN',{hour12:false}) : '';
-  return '<span class="err" title="'+esc(when ? reason+' · '+when : reason)+'">'+esc(reason)+'</span>'+(when?'<div class="muted">'+esc(when)+'</div>':'');
+  const index=usageLogItems.push(item)-1;
+  const summary=reason.length>42 ? reason.slice(0,42)+'…' : reason;
+  return '<span class="err">'+esc(summary)+'</span><div><button class="small secondary" onclick="showUsageLog('+index+')" type="button">查看日志</button></div>';
 }
 function usageModelRows(models){ return models.map(item=>'<tr><td>'+esc((item.provider_name || item.provider_id)+' / '+item.model)+'</td><td>'+usageNumber(item.today && item.today.upstream_success)+'</td><td class="'+(Number(item.today && item.today.upstream_failed)>0?'err':'')+'">'+usageNumber(item.today && item.today.upstream_failed)+'</td><td>'+usageNumber(item.today && item.today.prompt_tokens)+'</td><td>'+usageNumber(item.today && item.today.completion_tokens)+'</td><td>'+usageNumber(item.today && item.today.total_tokens)+'</td><td>'+usageNumber(item.total && item.total.total_tokens)+'</td><td>'+usageNumber(item.today && item.today.unreported_calls)+'</td><td>'+usageFailureHTML(item)+'</td></tr>').join(''); }
 function usageTable(rows){ return '<div class="usage-table-wrap"><table class="usage-table"><thead><tr><th>实际提供商 / 模型</th><th>成功调用</th><th>失败尝试</th><th>今日输入</th><th>今日输出</th><th>今日总计</th><th>累计总计</th><th>未报告</th><th>最后失败原因</th></tr></thead><tbody>'+rows+'</tbody></table></div>'; }
 function renderUsageStats(data){
+  usageLogItems=[];
   const groups=Array.isArray(data && data.groups)?data.groups:[];
   const today={}; const total={};
   groups.forEach(group=>{ addUsageCounters(today,group.today); addUsageCounters(total,group.total); });
@@ -335,6 +349,18 @@ function renderUsageStats(data){
     return '<div class="card usage-group"><div class="card-title-row"><h3>'+esc(group.name || group.id)+'</h3><span class="provider-badge">今日 '+usageNumber(group.today && group.today.total_tokens)+' / 累计 '+usageNumber(group.total && group.total.total_tokens)+' Token</span></div><div class="muted">客户端请求：今日 '+usageNumber(group.today && group.today.client_requests)+'，累计 '+usageNumber(group.total && group.total.client_requests)+'；上游调用：今日 '+usageNumber(group.today && group.today.upstream_calls)+'</div>'+usageTable(rows)+'</div>';
   }).join('');
 }
+function showUsageLog(index){
+  const item=usageLogItems[index]; if(!item) return;
+  const at=Number(item.last_failure_at || 0);
+  const when=at ? new Date(at*1000).toLocaleString('zh-CN',{hour12:false}) : '未知';
+  const provider=item.provider_name || item.provider_id || '未知提供商';
+  const status=Number(item.last_failure_status || 0);
+  document.getElementById('usageLogText').value='模型：'+provider+' / '+(item.model || '')+'\n时间：'+when+'\nHTTP 状态：'+(status || '未知')+'\n\n错误内容：\n'+String(item.last_failure || '');
+  setText('usageLogStatus','muted','');
+  document.getElementById('usageLogModal').classList.add('open');
+}
+function closeUsageLog(){ document.getElementById('usageLogModal').classList.remove('open'); }
+async function copyUsageLog(){ try{ await copyTextValue(document.getElementById('usageLogText').value); setText('usageLogStatus','ok','日志已复制'); }catch(e){ setText('usageLogStatus','err','复制失败：'+e.message); } }
 async function loadUsageStats(){
   try{
     setText('usageStatus','muted','正在加载...');
@@ -649,9 +675,9 @@ function autoRuntimeBadgeHTML(model){
   const status=autoRuntimeStatus[model];
   if(!status || Number(status.active_requests || 0)<=0) return '';
   const active=Number(status.active_requests || 0);
-  const ua=(status.last_user_agent || '未知客户端');
-  const title='当前调用客户端 User-Agent: '+ua;
-  return '<span class="auto-runtime-status running" title="'+esc(title)+'">调用中 '+active+' · '+esc(ua)+'</span>';
+  const client=(status.last_client || status.last_user_agent || '未知客户端');
+  const title='当前调用身份：'+client;
+  return '<span class="auto-runtime-status running" title="'+esc(title)+'">调用中 '+active+' · '+esc(client)+'</span>';
 }
 function renderAutoModels(cfg){
   const root=document.getElementById('autoModelList'); if(!root) return;

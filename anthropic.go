@@ -144,11 +144,19 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			writeAnthropicError(w, http.StatusForbidden, "model is not allowed by this access key: auto")
 			return
 		}
-		agentKey, clientLabel := autoAgentIdentity(r, scope)
-		hasImage := anthropicMessagesHaveImage(raw)
-		visionMode := s.autoAgentVisionMode(agentKey, hasImage)
+		sessionKey, clientLabel := autoSessionIdentity(r, scope, raw)
+		latestHasImage := anthropicMessagesLatestUserHasImage(raw)
+		anyImage := anthropicMessagesHaveImage(raw)
+		visionMode, _ := s.autoSessionRequestMode(sessionKey, latestHasImage, anyImage)
+		if !visionMode {
+			raw, err = stripAnthropicHistoricalImages(raw)
+			if err != nil {
+				writeAnthropicError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 		candidates := s.autoChatCandidates(r.Context(), visionMode)
-		candidates = s.orderAutoCandidatesForAgent(agentKey, candidates, visionMode)
+		candidates = s.orderAutoCandidatesForAgent(sessionKey, candidates, visionMode)
 		if len(candidates) == 0 {
 			message := "auto model has no available target"
 			if visionMode {
@@ -157,7 +165,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			writeAnthropicError(w, http.StatusServiceUnavailable, message)
 			return
 		}
-		s.proxyAutoAnthropicMessages(w, r, raw, candidates, agentKey, clientLabel, visionMode)
+		s.proxyAutoAnthropicMessages(w, r, raw, candidates, sessionKey, clientLabel, visionMode, latestHasImage)
 		return
 	}
 
@@ -189,7 +197,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	s.proxyOpenAIAsAnthropic(w, r, req, requestedModel)
 }
 
-func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Request, raw []byte, candidates []string, agentKey, clientLabel string, vision bool) {
+func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Request, raw []byte, candidates []string, agentKey, clientLabel string, vision, newImage bool) {
 	var request anthropicRequest
 	_ = json.Unmarshal(raw, &request)
 	var lastFailure *autoRetryWriter
@@ -214,7 +222,7 @@ func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Reque
 		if retryWriter.committed {
 			s.finishAutoRuntime(candidate, true, retryWriter.status, retryWriter.body.Bytes(), started)
 			s.clearAutoModelFailure(providerID, model)
-			s.commitAutoAgentSuccess(agentKey, candidate, vision)
+			s.commitAutoAgentSuccess(agentKey, candidate, vision, newImage)
 			return
 		}
 		if retryWriter.status >= 200 && retryWriter.status <= 299 {
@@ -227,7 +235,7 @@ func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Reque
 			retryWriter.relay()
 			s.finishAutoRuntime(candidate, true, retryWriter.status, retryWriter.body.Bytes(), started)
 			s.clearAutoModelFailure(providerID, model)
-			s.commitAutoAgentSuccess(agentKey, candidate, vision)
+			s.commitAutoAgentSuccess(agentKey, candidate, vision, newImage)
 			return
 		}
 		if isAutoFallbackError(retryWriter.status, retryWriter.body.Bytes()) {
