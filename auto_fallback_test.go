@@ -1,13 +1,88 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
+
+func TestAutoStopsAfterClientCancellation(t *testing.T) {
+	started := make(chan struct{}, 1)
+	var mu sync.Mutex
+	calls := map[string]int{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		if json.NewDecoder(r.Body).Decode(&body) != nil {
+			return
+		}
+		mu.Lock()
+		calls[body.Model]++
+		mu.Unlock()
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+
+	first := ProviderConfig{ID: "first", Name: "First", Type: "openai", Enabled: true, BaseURL: upstream.URL + "/v1", APIKey: "key", Models: []string{"first"}, EnabledModels: []string{"first"}}
+	second := ProviderConfig{ID: "second", Name: "Second", Type: "openai", Enabled: true, BaseURL: upstream.URL + "/v1", APIKey: "key", Models: []string{"second"}, EnabledModels: []string{"second"}}
+	s := &Server{
+		config: Config{
+			AccessKey: "gateway",
+			AutoModel: AutoModelConfig{Enabled: true, Models: []string{"first/first", "second/second"}},
+			Providers: []ProviderConfig{first, second},
+		},
+		usage: newUsageStore(), client: upstream.Client(), dataDir: t.TempDir(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"auto","messages":[{"role":"user","content":"hello"}]}`)).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer gateway")
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		s.handleChatCompletions(rr, req)
+		close(done)
+	}()
+	select {
+	case <-started:
+		cancel()
+	case <-time.After(2 * time.Second):
+		t.Fatal("first upstream request did not start")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Auto request did not stop after cancellation")
+	}
+	if rr.Code != statusClientClosedRequest {
+		t.Fatalf("response = %d %s", rr.Code, rr.Body.String())
+	}
+	mu.Lock()
+	if calls["first"] != 1 || calls["second"] != 0 {
+		t.Fatalf("upstream calls after cancellation = %#v", calls)
+	}
+	mu.Unlock()
+	runtime := s.autoRuntimeSnapshot()
+	if len(runtime) != 2 || runtime[0].LastResult != "canceled" || runtime[0].ActiveRequests != 0 || runtime[1].TotalAttempts != 0 {
+		t.Fatalf("Auto runtime after cancellation = %#v", runtime)
+	}
+	if s.autoModelFailed("first", "first") || s.autoModelFailed("second", "second") {
+		t.Fatal("client cancellation marked an Auto model unavailable")
+	}
+	group := s.usageSnapshot().Groups["_master"]
+	if group == nil || group.Total.UpstreamFailed != 0 || len(group.Models) != 0 {
+		t.Fatalf("client cancellation was counted as an upstream failure: %#v", group)
+	}
+}
 
 func probeTextResponse() map[string]any {
 	return map[string]any{

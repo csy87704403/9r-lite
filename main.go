@@ -36,6 +36,7 @@ const (
 	mimoFreeChatURL            = "https://api.xiaomimimo.com/api/free-ai/openai/chat"
 	mimoSystemMarker           = "You are MiMoCode, an interactive CLI tool that helps users with software engineering tasks."
 	defaultHTTPTimeout         = 60 * time.Second
+	statusClientClosedRequest  = 499
 	autoProbeFailureThreshold  = 3
 	multimodalProbeCode        = "9R7Q"
 	multimodalProbeImageBase64 = "iVBORw0KGgoAAAANSUhEUgAAAGAAAAAgCAYAAADtwH1UAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAIcSURBVGhD7ZiBbcIwEEWzDFuwBDOwAiuwQTZgAiZgARZgARZggFQf9ae/h88OrdSLq3uSRZQ4TnzPPjsMUxLKYE8kf0sKCCYFBJMCgkkBwaSAYFJAMCkgmEUCLpfLtN1up2EYnuVwOEyPx+Nbnd1uN18vlf1+P91ut7n+9Xp9qWML6ij3+/357M1mM9fBMc7hWo80BSD4NjAoEKISWgJYGKh3BZzP55frtqBObzQFcLQhwAi4ChnHca63VABGqwfaZz3MGIKZY9vxis6yHqgK0I4j8ATBwTnIIRSAXwtGvYr0YLsoOrsgjedxvwYZx3qfiuuBqgBNE5oOMPJ5nvxWgD7LphINvofOwJ6ovq03A3REUszSFHQ6neQJX3gC9R28e4GuET2loaoAwE5x0bX5+B0BNrhE27Sj35uFlqX11kZTQGv3wdFWE4D0UwuKziiLNwOQ1jAo2K620dOW9LXHBSBBc3gpYDaFYLZovdruh217ddgGAk4gQ9vmsb5TD/zobY/H47OjS3ZBGhzcZ/HWGaW0C4JgvocWT+JaaQpgYLG9s2tA6TvACsA9+uVqU5GmOC912HWnVuwX+tppCtAtpxbvS9gKALpAQobeV9rSlmitRSxorycJ9V5/gk7pKMbUt52sCQCaLjQVLRUAav8F6X9VOjPXTrvXHcGBYgfHmvlXAnokBQSTAoJJAcGkgGBSQDApIJgUEEwKCOYDKwJOOEG7cI8AAAAASUVORK5CYII="
@@ -1484,6 +1485,11 @@ func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request
 			s.commitAutoAgentSuccess(agentKey, candidate, vision, newImage)
 			return
 		}
+		if requestContextCanceled(r.Context()) {
+			s.finishAutoRuntimeCanceled(candidate, started)
+			writeJSON(w, statusClientClosedRequest, map[string]any{"error": "client request canceled"})
+			return
+		}
 		if retryWriter.status >= 200 && retryWriter.status <= 299 {
 			if probeResponseHasExplicitError(retryWriter.body.Bytes()) {
 				s.finishAutoRuntime(candidate, false, retryWriter.status, retryWriter.body.Bytes(), started)
@@ -2900,6 +2906,28 @@ func (s *Server) finishAutoRuntime(model string, success bool, statusCode int, b
 	}
 	status.LastResult = "failed"
 	status.LastError = formatAutoRuntimeError(statusCode, body)
+}
+
+func (s *Server) finishAutoRuntimeCanceled(model string, started time.Time) {
+	now := time.Now()
+	s.autoRuntimeMu.Lock()
+	defer s.autoRuntimeMu.Unlock()
+	status := s.autoRuntime[model]
+	if status == nil {
+		status = &autoRuntimeModelStatus{Model: model}
+		s.autoRuntime[model] = status
+	}
+	if status.ActiveRequests > 0 {
+		status.ActiveRequests--
+	}
+	status.LastFinishedAt = now.UnixMilli()
+	status.LastLatencyMS = now.Sub(started).Milliseconds()
+	status.LastResult = "canceled"
+	status.LastError = ""
+}
+
+func requestContextCanceled(ctx context.Context) bool {
+	return ctx != nil && ctx.Err() != nil
 }
 
 func formatAutoRuntimeError(status int, body []byte) string {

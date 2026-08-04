@@ -225,6 +225,11 @@ func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Reque
 			s.commitAutoAgentSuccess(agentKey, candidate, vision, newImage)
 			return
 		}
+		if requestContextCanceled(r.Context()) {
+			s.finishAutoRuntimeCanceled(candidate, started)
+			writeAnthropicError(w, statusClientClosedRequest, "client request canceled")
+			return
+		}
 		if retryWriter.status >= 200 && retryWriter.status <= 299 {
 			if probeResponseHasExplicitError(retryWriter.body.Bytes()) {
 				s.finishAutoRuntime(candidate, false, retryWriter.status, retryWriter.body.Bytes(), started)

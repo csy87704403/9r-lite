@@ -168,6 +168,9 @@ func (s *Server) beginUpstreamUsage(w http.ResponseWriter, r *http.Request, p Pr
 		if status == 0 {
 			status = http.StatusOK
 		}
+		if requestContextCanceled(r.Context()) && (status < 200 || status > 299) {
+			return
+		}
 		usage := tracked.usage
 		if !stream {
 			usage = extractTokenUsage(tracked.body.Bytes())
