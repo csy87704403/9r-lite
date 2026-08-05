@@ -310,6 +310,8 @@ let uiToastTimer=null;
 let autoSortState=null;
 let autoRuntimeStatus={};
 let selectedAutoModelID='auto';
+let autoConfigSaveChain=Promise.resolve();
+let autoConfigSaveRevision=0;
 let usageLogItems=[];
 function parseConfig(){ try { return JSON.parse(document.getElementById('cfg').value); } catch { return null; } }
 function showMainTab(name){
@@ -722,6 +724,17 @@ function selectAutoModel(id){
   renderAPIProviders();
   renderPublishProviders();
 }
+function persistAutoConfig(){
+  const snapshot=parseConfig(); if(!snapshot) return Promise.resolve();
+  const revision=++autoConfigSaveRevision;
+  setText('autoModelStatus','muted','正在自动保存...');
+  autoConfigSaveChain=autoConfigSaveChain.catch(()=>{}).then(()=>saveConfigObject(snapshot)).then(()=>{
+    if(revision===autoConfigSaveRevision) setText('autoModelStatus','ok','已自动保存');
+  }).catch(error=>{
+    if(revision===autoConfigSaveRevision) setText('autoModelStatus','err','自动保存失败：'+error.message);
+  });
+  return autoConfigSaveChain;
+}
 function createAutoModel(){
   const cfg=parseConfig(); if(!cfg) return;
   const id=String(prompt('请输入新的 Auto 模型名称，例如 auto-code') || '').trim();
@@ -734,7 +747,8 @@ function createAutoModel(){
   setConfig(cfg);
   renderAPIProviders();
   renderPublishProviders();
-  setText('autoModelStatus','ok','已新增 '+id+'，请添加候选模型并保存');
+  persistAutoConfig();
+  showToast('已新增并保存 '+id,'ok');
 }
 function deleteCurrentAutoModel(){
   if(selectedAutoModelID==='auto') return;
@@ -748,7 +762,8 @@ function deleteCurrentAutoModel(){
   setConfig(cfg);
   renderAPIProviders();
   renderPublishProviders();
-  setText('autoModelStatus','ok','已删除 '+removed+'，记得保存');
+  persistAutoConfig();
+  showToast('已删除并保存 '+removed,'ok');
 }
 function updateCurrentAutoEnabled(){
   const cfg=parseConfig(); if(!cfg) return;
@@ -756,6 +771,7 @@ function updateCurrentAutoEnabled(){
   current.enabled=!!document.getElementById('autoModelEnabled').checked;
   syncLegacyAutoConfig(cfg);
   setConfig(cfg);
+  persistAutoConfig();
 }
 function renderAutoModels(cfg){
   const root=document.getElementById('autoModelList'); if(!root) return;
@@ -815,8 +831,8 @@ function finishAutoSort(event,cancelled){
   if(cancelled){ renderAutoModels(parseConfig()); return; }
   const order=[...state.root.querySelectorAll('.auto-sort-item')].map(row=>row.getAttribute('data-auto-model'));
   updateAutoModels(models=>{ models.splice(0,models.length,...order); });
-  setText('autoModelStatus','ok','已调整顺序，记得保存');
-  showToast('Auto 顺序已调整，记得保存','ok');
+  setText('autoModelStatus','muted','顺序已调整，正在自动保存...');
+  showToast('Auto 顺序已调整','ok');
 }
 window.addEventListener('pointermove',autoSortPointerMove,{passive:false});
 window.addEventListener('pointerup',event=>finishAutoSort(event,false));
@@ -832,6 +848,7 @@ function updateAutoModels(mutator,autoID){
   setConfig(cfg);
   renderAPIProviders();
   renderPublishProviders();
+  persistAutoConfig();
 }
 function addAutoModel(){
   const input=document.getElementById('autoModelInput'); const value=(input && input.value || '').trim();
@@ -840,10 +857,10 @@ function addAutoModel(){
   if(autoModels(parseConfig()).includes(value)){ setText('autoModelStatus','err','该模型已在 '+selectedAutoModelID+' 列表中'); showToast('该模型已在 '+selectedAutoModelID+' 列表中','warn'); return; }
   updateAutoModels(models=>{ models.push(value); });
   if(input) input.value='';
-  setText('autoModelStatus','ok','已添加候选模型，记得保存');
+  setText('autoModelStatus','muted','已添加，正在自动保存...');
   showToast('已加入 '+selectedAutoModelID+'：'+value,'ok');
 }
-function removeAutoModel(index){ updateAutoModels(models=>{ models.splice(index,1); }); setText('autoModelStatus','ok','已移除候选模型，记得保存'); showToast('已从 Auto 列表移除','ok'); }
+function removeAutoModel(index){ updateAutoModels(models=>{ models.splice(index,1); }); setText('autoModelStatus','muted','已移除，正在自动保存...'); showToast('已从 Auto 列表移除','ok'); }
 function removeAutoModelValue(source){
   const value=(typeof source==='string' ? source : (source && source.getAttribute('data-model')) || '').trim();
   const autoID=(typeof source==='string' ? selectedAutoModelID : (source && source.getAttribute('data-auto-id')) || selectedAutoModelID);
@@ -851,7 +868,7 @@ function removeAutoModelValue(source){
   updateAutoModels(models=>{
     for(let i=models.length-1;i>=0;i--) if(models[i]===value) models.splice(i,1);
   },autoID);
-  setText('autoModelStatus','ok','已从 '+autoID+' 列表移除，记得保存');
+  setText('autoModelStatus','muted','已从 '+autoID+' 移除，正在自动保存...');
   showToast('已从 '+autoID+' 列表移除：'+value,'ok');
 }
 function flashAutoAddButton(value,state){
@@ -874,7 +891,7 @@ function addAutoModelValue(source){
   updateAutoModels(models=>{ models.push(value); });
   flashAutoAddButton(value,'added');
   showToast('已加入 '+selectedAutoModelID+'：'+value,'ok');
-  setText('autoModelStatus','ok','已加入 '+selectedAutoModelID+' 候选，记得保存');
+  setText('autoModelStatus','muted','已加入 '+selectedAutoModelID+'，正在自动保存...');
 }
 function publishedGroupModels(cfg){
   const out=[];
@@ -1341,7 +1358,7 @@ function applyGatewaySettings(cfg){
   syncLegacyAutoConfig(cfg);
   return cfg;
 }
-async function saveGateway(){ try{ const cfg=parseConfig(); if(!cfg) throw new Error('config is invalid'); applyGatewaySettings(cfg); ensureBlankCustomProvider(cfg); await saveConfigObject(cfg); await reloadConfig(); setText('status','ok','已保存'); }catch(e){ setText('status','err',e.message); } }
+async function saveGateway(){ try{ await autoConfigSaveChain.catch(()=>{}); const cfg=parseConfig(); if(!cfg) throw new Error('config is invalid'); applyGatewaySettings(cfg); ensureBlankCustomProvider(cfg); await saveConfigObject(cfg); await reloadConfig(); setText('status','ok','已保存'); setText('autoModelStatus','ok','已保存'); }catch(e){ setText('status','err',e.message); } }
 function toggleAdminPasswordFields(){
   ['adminCurrentPassword','adminNewPassword','adminConfirmPassword'].forEach(id=>{
     const el=document.getElementById(id); if(el) el.type=el.type==='password'?'text':'password';
