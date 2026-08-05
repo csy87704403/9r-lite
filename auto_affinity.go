@@ -55,6 +55,12 @@ func autoSessionIdentity(r *http.Request, scope accessScope, raw []byte) (string
 	return agentKey + "|session:" + fingerprint, label + " · 会话 " + fingerprint[:6]
 }
 
+func autoSessionIdentityForModel(r *http.Request, scope accessScope, raw []byte, autoID string) (string, string) {
+	key, label := autoSessionIdentity(r, scope, raw)
+	autoID = strings.TrimSpace(autoID)
+	return key + "|auto:" + autoID, label + " · " + autoID
+}
+
 func autoSessionHint(r *http.Request, raw []byte) string {
 	for _, header := range []string{"X-9Router-Session-ID", "X-Session-ID", "X-Conversation-ID"} {
 		if value := strings.TrimSpace(r.Header.Get(header)); value != "" {

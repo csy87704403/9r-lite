@@ -113,6 +113,10 @@ details{margin-top:22px}
 .tabs{display:flex;gap:8px;align-items:center;margin:18px 0 12px;flex-wrap:wrap}
 .tab-button{background:#fff;color:#111;border:1px solid #ddd}
 .tab-button.active{background:#111;color:#fff;border-color:#111}
+.auto-model-tabs{display:flex;gap:7px;align-items:center;flex:1 1 320px;flex-wrap:wrap}
+.auto-model-tab{background:#fff;color:#374151;border:1px solid #d1d5db;padding:7px 13px;border-radius:999px}
+.auto-model-tab:hover{border-color:#2563eb;color:#1d4ed8}
+.auto-model-tab.active{background:#2563eb;color:#fff;border-color:#2563eb;box-shadow:0 2px 7px rgba(37,99,235,.22)}
 .tab-panel{display:none}
 .tab-panel.active{display:block}
 .usage-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:12px 0}
@@ -225,7 +229,12 @@ details{margin-top:22px}
 <section id="panel_auto" class="tab-panel">
 <h2>Auto 模型</h2>
 <div class="card">
-<label class="toggle"><input type="checkbox" id="autoModelEnabled"> 启用 <code>auto</code> 模型</label>
+<div class="bar">
+<div id="autoModelSelector" class="auto-model-tabs" aria-label="Auto 模型切换"></div>
+<button class="secondary" onclick="createAutoModel()" type="button">新增 Auto</button>
+<button id="deleteAutoModelButton" class="secondary" onclick="deleteCurrentAutoModel()" type="button">删除当前 Auto</button>
+</div>
+<label class="toggle"><input type="checkbox" id="autoModelEnabled" onchange="updateCurrentAutoEnabled()"> 启用 <code id="autoModelName">auto</code> 模型</label>
 <div class="field">
 <label>候选模型列表</label>
 <div class="inline-field grow">
@@ -233,7 +242,7 @@ details{margin-top:22px}
 <button class="secondary" onclick="addAutoModel()" type="button">添加</button>
 </div>
 </div>
-<div class="muted">第三方 Agent 继续使用上面的 Base URL 和访问密钥，模型名填写 <code>auto</code>。</div>
+<div class="muted">第三方 Agent 继续使用上面的 Base URL 和访问密钥，模型名填写当前 Auto 名称。</div>
 <div class="muted">纯文本请求会在整个列表中轮询；请求包含图片时，只会在带“多模态”标签的模型中轮询。</div>
 <div class="muted">长按模型行约 300 毫秒后可以上下拖拽排序，调整后请点击保存。</div>
 <div class="muted">列表只显示当前正在处理请求的模型，请求结束后“调用中”标识会自动隐藏。</div>
@@ -300,6 +309,7 @@ let mimoProxySearchController=null;
 let uiToastTimer=null;
 let autoSortState=null;
 let autoRuntimeStatus={};
+let selectedAutoModelID='auto';
 let usageLogItems=[];
 function parseConfig(){ try { return JSON.parse(document.getElementById('cfg').value); } catch { return null; } }
 function showMainTab(name){
@@ -386,11 +396,28 @@ function pathWithKey(path,cfg){
   const key=(cfg && cfg.access_key) || '';
   return key ? path+(path.includes('?')?'&':'?')+'key='+encodeURIComponent(key) : path;
 }
+function syncLegacyAutoConfig(cfg){
+  const primary=((cfg && cfg.auto_models) || []).find(item=>item && item.id==='auto') || {enabled:false,models:[]};
+  cfg.auto_model={enabled:!!primary.enabled,models:unique(primary.models || [])};
+}
+function ensureAutoConfigs(cfg){
+  const legacy=(cfg && cfg.auto_model) || {enabled:false,models:[]};
+  let autos=Array.isArray(cfg && cfg.auto_models) ? cfg.auto_models.filter(item=>item && typeof item==='object') : [];
+  autos.forEach(item=>{ item.id=String(item.id || '').trim(); item.enabled=!!item.enabled; item.models=unique([...(item.models || []),...(item.vision_models || [])]); delete item.vision_models; });
+  if(!autos.length) autos=[{id:'auto',enabled:!!legacy.enabled,models:unique([...(legacy.models || []),...(legacy.vision_models || [])])}];
+  if(!autos.some(item=>item.id==='auto')) autos.unshift({id:'auto',enabled:!!legacy.enabled,models:unique([...(legacy.models || []),...(legacy.vision_models || [])])});
+  cfg.auto_models=autos;
+  syncLegacyAutoConfig(cfg);
+  return autos;
+}
+function autoConfigs(cfg){ return ensureAutoConfigs(cfg || {}); }
+function autoConfig(cfg,id){ return autoConfigs(cfg).find(item=>item.id===String(id || '').trim()) || null; }
+function currentAutoConfig(cfg){ return autoConfig(cfg,selectedAutoModelID) || autoConfigs(cfg)[0]; }
 function setConfig(cfg){
   ensureBlankCustomProvider(cfg);
-  if(!cfg.auto_model) cfg.auto_model={enabled:false,models:[]};
-  cfg.auto_model.models=unique([...(cfg.auto_model.models || []),...(cfg.auto_model.vision_models || [])]);
-  delete cfg.auto_model.vision_models;
+  const autos=ensureAutoConfigs(cfg);
+  if(!autos.some(item=>item.id===selectedAutoModelID)) selectedAutoModelID='auto';
+  const current=currentAutoConfig(cfg);
   if(!Array.isArray(cfg.model_groups)) cfg.model_groups=[];
   document.getElementById('cfg').value=JSON.stringify(cfg,null,2);
   document.getElementById('accessKey').value=cfg.access_key || '';
@@ -402,7 +429,11 @@ function setConfig(cfg){
   document.getElementById('programHealthUrl').value=location.origin+'/health?format=json';
   document.getElementById('autoProbeEnabled').checked=!!cfg.auto_probe_enabled;
   document.getElementById('autoProbeInterval').value=cfg.auto_probe_interval_minutes || 60;
-  document.getElementById('autoModelEnabled').checked=!!cfg.auto_model.enabled;
+  const selector=document.getElementById('autoModelSelector');
+  if(selector){ selector.innerHTML=autos.map(item=>'<button class="auto-model-tab '+(item.id===selectedAutoModelID?'active':'')+'" type="button" data-auto-id="'+esc(item.id)+'" onclick="selectAutoModel(this.getAttribute(\'data-auto-id\'))">'+esc(item.id)+'</button>').join(''); }
+  document.getElementById('autoModelEnabled').checked=!!current.enabled;
+  const autoName=document.getElementById('autoModelName'); if(autoName) autoName.textContent=current.id;
+  const deleteButton=document.getElementById('deleteAutoModelButton'); if(deleteButton) deleteButton.disabled=current.id==='auto';
   renderAutoModels(cfg);
   renderMediaCurlMenus(cfg);
   renderModelGroups(cfg);
@@ -656,7 +687,12 @@ function visibleModels(p){
 }
 function lockedModels(p){ return unique((p && p.locked_models) || []); }
 function isLockedModel(p,model){ return lockedModels(p).includes(model); }
-function autoModels(cfg){ return unique((cfg && cfg.auto_model && cfg.auto_model.models) || []); }
+function autoModels(cfg,autoID){ const item=autoConfig(cfg,autoID || selectedAutoModelID); return unique((item && item.models) || []); }
+function autoMemberships(cfg,ref){ return autoConfigs(cfg).filter(item=>autoModels(cfg,item.id).includes(ref)).map(item=>item.id); }
+function autoMembershipBadgeHTML(cfg,ref){
+  return autoMemberships(cfg,ref).map(id=>'<span class="auto-member-badge">'+esc(id)+'</span><button class="auto-remove-badge" type="button" title="从 '+esc(id)+' 删除" data-auto-id="'+esc(id)+'" data-model="'+esc(ref)+'" onclick="removeAutoModelValue(this)">×</button>').join('');
+}
+function autoMembershipLabelsHTML(cfg,ref){ return autoMemberships(cfg,ref).map(id=>'<span class="auto-member-badge">'+esc(id)+'</span>').join(''); }
 function providerModelQuotaBlocked(p,model){ return unique((p && p.quota_blocked_models) || []).includes(model); }
 function autoModelBadgeHTML(cfg,ref){
   const slash=String(ref || '').indexOf('/'); if(slash<1) return '';
@@ -678,6 +714,48 @@ function autoRuntimeBadgeHTML(model){
   const client=(status.last_client || status.last_user_agent || '未知客户端');
   const title='当前调用身份：'+client;
   return '<span class="auto-runtime-status running" title="'+esc(title)+'">调用中 '+active+' · '+esc(client)+'</span>';
+}
+function selectAutoModel(id){
+  const cfg=parseConfig(); if(!cfg || !autoConfig(cfg,id)) return;
+  selectedAutoModelID=id;
+  setConfig(cfg);
+  renderAPIProviders();
+  renderPublishProviders();
+}
+function createAutoModel(){
+  const cfg=parseConfig(); if(!cfg) return;
+  const id=String(prompt('请输入新的 Auto 模型名称，例如 auto-code') || '').trim();
+  if(!id) return;
+  if(!/^[A-Za-z0-9._-]{1,64}$/.test(id)){ setText('autoModelStatus','err','名称只能包含字母、数字、点、下划线和短横线'); return; }
+  if(autoConfig(cfg,id)){ setText('autoModelStatus','err','该 Auto 名称已经存在'); return; }
+  ensureAutoConfigs(cfg).push({id:id,enabled:true,models:[]});
+  selectedAutoModelID=id;
+  syncLegacyAutoConfig(cfg);
+  setConfig(cfg);
+  renderAPIProviders();
+  renderPublishProviders();
+  setText('autoModelStatus','ok','已新增 '+id+'，请添加候选模型并保存');
+}
+function deleteCurrentAutoModel(){
+  if(selectedAutoModelID==='auto') return;
+  const cfg=parseConfig(); if(!cfg || !autoConfig(cfg,selectedAutoModelID)) return;
+  const removed=selectedAutoModelID;
+  if(!confirm('确定删除 '+removed+' 吗？候选列表也会一并删除。')) return;
+  cfg.auto_models=autoConfigs(cfg).filter(item=>item.id!==removed);
+  (cfg.model_groups || []).forEach(group=>{ group.models=(group.models || []).filter(model=>model!==removed); });
+  selectedAutoModelID='auto';
+  syncLegacyAutoConfig(cfg);
+  setConfig(cfg);
+  renderAPIProviders();
+  renderPublishProviders();
+  setText('autoModelStatus','ok','已删除 '+removed+'，记得保存');
+}
+function updateCurrentAutoEnabled(){
+  const cfg=parseConfig(); if(!cfg) return;
+  const current=currentAutoConfig(cfg); if(!current) return;
+  current.enabled=!!document.getElementById('autoModelEnabled').checked;
+  syncLegacyAutoConfig(cfg);
+  setConfig(cfg);
 }
 function renderAutoModels(cfg){
   const root=document.getElementById('autoModelList'); if(!root) return;
@@ -743,13 +821,14 @@ function finishAutoSort(event,cancelled){
 window.addEventListener('pointermove',autoSortPointerMove,{passive:false});
 window.addEventListener('pointerup',event=>finishAutoSort(event,false));
 window.addEventListener('pointercancel',event=>finishAutoSort(event,true));
-function updateAutoModels(mutator){
+function updateAutoModels(mutator,autoID){
   const cfg=parseConfig(); if(!cfg) return;
-  if(!cfg.auto_model) cfg.auto_model={enabled:false,models:[]};
-  cfg.auto_model.enabled=!!document.getElementById('autoModelEnabled').checked;
-  cfg.auto_model.models=autoModels(cfg);
-  delete cfg.auto_model.vision_models;
-  mutator(cfg.auto_model.models);
+  const targetID=autoID || selectedAutoModelID;
+  const current=autoConfig(cfg,targetID); if(!current) return;
+  if(targetID===selectedAutoModelID) current.enabled=!!document.getElementById('autoModelEnabled').checked;
+  current.models=autoModels(cfg,targetID);
+  mutator(current.models);
+  syncLegacyAutoConfig(cfg);
   setConfig(cfg);
   renderAPIProviders();
   renderPublishProviders();
@@ -758,21 +837,22 @@ function addAutoModel(){
   const input=document.getElementById('autoModelInput'); const value=(input && input.value || '').trim();
   if(!value || value==='auto'){ setText('autoModelStatus','err','请输入真实模型 ID，例如 oc/big-pickle'); return; }
   if(!value.includes('/')){ setText('autoModelStatus','err','候选模型需要使用 provider/model 格式'); return; }
-  if(autoModels(parseConfig()).includes(value)){ setText('autoModelStatus','err','该模型已在 Auto 列表中'); showToast('该模型已在 Auto 列表中','warn'); return; }
+  if(autoModels(parseConfig()).includes(value)){ setText('autoModelStatus','err','该模型已在 '+selectedAutoModelID+' 列表中'); showToast('该模型已在 '+selectedAutoModelID+' 列表中','warn'); return; }
   updateAutoModels(models=>{ models.push(value); });
   if(input) input.value='';
   setText('autoModelStatus','ok','已添加候选模型，记得保存');
-  showToast('已加入 Auto：'+value,'ok');
+  showToast('已加入 '+selectedAutoModelID+'：'+value,'ok');
 }
 function removeAutoModel(index){ updateAutoModels(models=>{ models.splice(index,1); }); setText('autoModelStatus','ok','已移除候选模型，记得保存'); showToast('已从 Auto 列表移除','ok'); }
 function removeAutoModelValue(source){
   const value=(typeof source==='string' ? source : (source && source.getAttribute('data-model')) || '').trim();
+  const autoID=(typeof source==='string' ? selectedAutoModelID : (source && source.getAttribute('data-auto-id')) || selectedAutoModelID);
   if(!value) return;
   updateAutoModels(models=>{
     for(let i=models.length-1;i>=0;i--) if(models[i]===value) models.splice(i,1);
-  });
-  setText('autoModelStatus','ok','已从 Auto 列表移除，记得保存');
-  showToast('已从 Auto 列表移除：'+value,'ok');
+  },autoID);
+  setText('autoModelStatus','ok','已从 '+autoID+' 列表移除，记得保存');
+  showToast('已从 '+autoID+' 列表移除：'+value,'ok');
 }
 function flashAutoAddButton(value,state){
   document.querySelectorAll('button.add-auto-model').forEach(button=>{
@@ -787,21 +867,21 @@ function addAutoModelValue(source){
   if(!value.includes('/')){ setText('autoModelStatus','err','候选模型需要使用 provider/model 格式'); return; }
   if(autoModels(parseConfig()).includes(value)){
     flashAutoAddButton(value,'duplicate');
-    showToast('该模型已在 Auto 列表中','warn');
-    setText('autoModelStatus','err','该模型已在 Auto 列表中');
+    showToast('该模型已在 '+selectedAutoModelID+' 列表中','warn');
+    setText('autoModelStatus','err','该模型已在 '+selectedAutoModelID+' 列表中');
     return;
   }
   updateAutoModels(models=>{ models.push(value); });
   flashAutoAddButton(value,'added');
-  showToast('已加入 Auto：'+value,'ok');
-  setText('autoModelStatus','ok','已加入 Auto 候选，记得保存');
+  showToast('已加入 '+selectedAutoModelID+'：'+value,'ok');
+  setText('autoModelStatus','ok','已加入 '+selectedAutoModelID+' 候选，记得保存');
 }
 function publishedGroupModels(cfg){
   const out=[];
   ((cfg && cfg.providers) || []).filter(p=>p && p.enabled && !isClaudeCodeProvider(p)).forEach(p=>{
     visibleModels(p).filter(model=>!providerIsMediaModel(p,model)).forEach(model=>out.push(providerRouteID(p)+'/'+model));
   });
-  if(cfg && cfg.auto_model && cfg.auto_model.enabled) out.push('auto');
+  autoConfigs(cfg || {}).filter(item=>item.enabled).forEach(item=>out.push(item.id));
   return unique(out).sort();
 }
 function newGroupKey(){
@@ -946,9 +1026,10 @@ function providerTitleHTML(p,dotClass){
   return '<div class="card-title-row"><h3><span class="'+dotClass+'"></span>'+esc(p.name)+'</h3><span class="provider-badge">'+esc(providerCategory(p))+'</span></div>';
 }
 function modelRows(p, canProbeIndividually){
+  const cfg=parseConfig();
   const selected=new Set(selectedModels(p));
   const available=new Set(availableModels(p));
-  const autoSet=new Set(autoModels(parseConfig()));
+  const autoSet=new Set(autoModels(cfg));
   const checkedAt=!!p.availability_checked_at;
   const models=unique(p.models || []);
   return models.map(model=>{
@@ -961,12 +1042,12 @@ function modelRows(p, canProbeIndividually){
     const probe=canProbeIndividually && !providerIsMediaModel(p,model) ? '<button class="small secondary" type="button" title="单独探测模型有效性" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" onclick="probeAPIProviderModel(this)">探测</button>' : '';
     const autoRef=providerRouteID(p)+'/'+model;
     const autoMember=autoSet.has(autoRef);
-    const addAuto='<button class="add-auto-model secondary" type="button" title="'+(autoMember?'已在 Auto 列表中':'加入 Auto')+'" data-model="'+esc(autoRef)+'" onclick="addAutoModelValue(this)">+</button>';
+    const addAuto='<button class="add-auto-model secondary" type="button" title="'+(autoMember?'已在 '+esc(selectedAutoModelID)+' 列表中':'加入 '+esc(selectedAutoModelID))+'" data-model="'+esc(autoRef)+'" onclick="addAutoModelValue(this)">+</button>';
     const locked=isLockedModel(p,model);
     const lock='<button class="model-lock secondary '+(locked?'locked':'')+'" type="button" title="'+(locked?'已上锁：一键/定时探测会跳过':'未上锁：一键/定时探测会包含')+'" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" onclick="toggleModelLock(this)">'+(locked?'🔒':'🔓')+'</button>';
     const kind=providerModelKind(p,model);
     const kindSelect='<select class="model-kind-select" title="模型类型" data-provider="'+esc(p.id)+'" data-model="'+esc(model)+'" onchange="saveModelKind(this)">'+[['auto','自动'],['text','文本'],['image','图片'],['video','视频'],['audio','音频'],['tts','TTS']].map(item=>'<option value="'+item[0]+'" '+(kind===item[0]?'selected':'')+'>'+item[1]+'</option>').join('')+'</select>';
-    const autoBadge=autoMember?'<span class="auto-member-badge">Auto</span><button class="auto-remove-badge" type="button" title="从 Auto 列表删除" data-model="'+esc(autoRef)+'" onclick="removeAutoModelValue(this)">×</button>':'';
+    const autoBadge=autoMembershipBadgeHTML(cfg,autoRef);
     return '<div class="model-item '+(usable?'':'off')+'">'+toggle+remove+recover+probe+addAuto+lock+kindSelect+'<span class="model-name">'+autoBadge+esc(model)+modelMultimodalBadgeHTML(p,model)+note+latencyHTML(p,model)+(usable?'':modelErrorHTML(p,model))+'</span></div>';
   }).join('');
 }
@@ -980,7 +1061,7 @@ function renderProviderStatus(){
     const availableCount=p.availability_checked_at?available.length:loaded.length;
     const auth=authStatus(p); const authText=auth==='needs_login' ? '<div class="err">登录失效，需要重新登录。'+esc(authError(p))+'</div>' : '<div class="muted">已连接</div>';
     const publishedHTML=published.length
-      ? '<div class="published-model-list">'+published.map(model=>'<span class="published-model-tag">'+esc(model)+modelMultimodalBadgeHTML(p,model)+'</span>').join('')+'</div>'
+      ? '<div class="published-model-list">'+published.map(model=>'<span class="published-model-tag">'+autoMembershipLabelsHTML(cfg,providerRouteID(p)+'/'+model)+esc(model)+modelMultimodalBadgeHTML(p,model)+'</span>').join('')+'</div>'
       : '<div class="muted" style="margin-top:5px">暂无已发布模型</div>';
     return '<div class="card">'+providerTitleHTML(p,'green-dot')+authText+'<div class="muted">已加载 '+loaded.length+' 个模型，可用 '+availableCount+' 个，已发布 '+published.length+' 个</div><div class="published-model-title">已发布模型</div>'+publishedHTML+'</div>';
   });
@@ -1195,13 +1276,15 @@ function remapProviderRouteRefs(cfg,prev,next){
   const oldRoute=providerRouteID(prev); const newRoute=providerRouteID(next);
   if(!oldRoute || !newRoute || oldRoute===newRoute) return;
   const remap=value=>String(value || '').startsWith(oldRoute+'/') ? newRoute+String(value).slice(oldRoute.length) : value;
-  if(cfg.auto_model && Array.isArray(cfg.auto_model.models)) cfg.auto_model.models=unique(cfg.auto_model.models.map(remap));
+  autoConfigs(cfg).forEach(item=>{ item.models=unique((item.models || []).map(remap)); });
+  syncLegacyAutoConfig(cfg);
   (cfg.model_groups || []).forEach(group=>{ group.models=unique((group.models || []).map(remap)); });
 }
 function removeProviderRouteRefs(cfg,p){
   const routes=new Set([String((p && p.id) || '').trim(),providerRouteID(p)].filter(Boolean));
   const keep=value=>{ const text=String(value || ''); return ![...routes].some(route=>text.startsWith(route+'/')); };
-  if(cfg.auto_model && Array.isArray(cfg.auto_model.models)) cfg.auto_model.models=cfg.auto_model.models.filter(keep);
+  autoConfigs(cfg).forEach(item=>{ item.models=(item.models || []).filter(keep); });
+  syncLegacyAutoConfig(cfg);
   (cfg.model_groups || []).forEach(group=>{ group.models=(group.models || []).filter(keep); });
 }
 async function saveConfigObject(cfg){ const res=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(cfg)}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); return data; }
@@ -1253,7 +1336,9 @@ function applyGatewaySettings(cfg){
   cfg.access_key=document.getElementById('accessKey').value.trim();
   cfg.auto_probe_enabled=!!document.getElementById('autoProbeEnabled').checked;
   cfg.auto_probe_interval_minutes=parseInt(document.getElementById('autoProbeInterval').value || '60',10);
-  cfg.auto_model={enabled:!!document.getElementById('autoModelEnabled').checked,models:autoModels(cfg)};
+  const current=currentAutoConfig(cfg);
+  if(current){ current.enabled=!!document.getElementById('autoModelEnabled').checked; current.models=autoModels(cfg,current.id); }
+  syncLegacyAutoConfig(cfg);
   return cfg;
 }
 async function saveGateway(){ try{ const cfg=parseConfig(); if(!cfg) throw new Error('config is invalid'); applyGatewaySettings(cfg); ensureBlankCustomProvider(cfg); await saveConfigObject(cfg); await reloadConfig(); setText('status','ok','已保存'); }catch(e){ setText('status','err',e.message); } }

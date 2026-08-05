@@ -86,6 +86,29 @@ func TestInternalProbeDoesNotCreateUsageGroup(t *testing.T) {
 	}
 }
 
+func TestUsageDateRolloverClearsPreviousFailureLog(t *testing.T) {
+	store := newUsageStore()
+	store.Date = "2000-01-01"
+	store.Groups["agents"] = &UsageGroupStats{
+		ID: "agents",
+		Models: map[string]*UsageModelStats{
+			"provider/model": {
+				ProviderID: "provider", Model: "model",
+				Today: UsageCounters{UpstreamFailed: 1}, Total: UsageCounters{UpstreamFailed: 7, TotalTokens: 99},
+				LastFailure: "yesterday error", LastFailureAt: 123, LastFailureStatus: http.StatusBadGateway,
+			},
+		},
+	}
+	rollUsageDate(&store)
+	stats := store.Groups["agents"].Models["provider/model"]
+	if stats.Today.UpstreamFailed != 0 || stats.LastFailure != "" || stats.LastFailureAt != 0 || stats.LastFailureStatus != 0 {
+		t.Fatalf("daily failure state was not cleared: %#v", stats)
+	}
+	if stats.Total.UpstreamFailed != 7 || stats.Total.TotalTokens != 99 {
+		t.Fatalf("cumulative usage was cleared: %#v", stats.Total)
+	}
+}
+
 func TestAdminIncludesUsageView(t *testing.T) {
 	html := adminHTMLLiteV2(`{"providers":[]}`)
 	for _, marker := range []string{"用量统计", "panel_usage", "loadUsageStats", "/api/admin/usage", "全部分组模型汇总", "成功调用", "失败尝试", "最后失败原因", "usageLogModal", "查看日志", "复制日志"} {

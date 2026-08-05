@@ -43,16 +43,18 @@ const (
 )
 
 type Config struct {
-	AccessKey                string           `json:"access_key,omitempty"`
-	AutoProbeEnabled         bool             `json:"auto_probe_enabled,omitempty"`
-	AutoProbeIntervalMinutes int64            `json:"auto_probe_interval_minutes,omitempty"`
-	AutoModel                AutoModelConfig  `json:"auto_model,omitempty"`
-	ModelGroups              []ModelGroup     `json:"model_groups,omitempty"`
-	DeletedProviderIDs       []string         `json:"deleted_provider_ids,omitempty"`
-	Providers                []ProviderConfig `json:"providers"`
+	AccessKey                string            `json:"access_key,omitempty"`
+	AutoProbeEnabled         bool              `json:"auto_probe_enabled,omitempty"`
+	AutoProbeIntervalMinutes int64             `json:"auto_probe_interval_minutes,omitempty"`
+	AutoModel                AutoModelConfig   `json:"auto_model,omitempty"`
+	AutoModels               []AutoModelConfig `json:"auto_models,omitempty"`
+	ModelGroups              []ModelGroup      `json:"model_groups,omitempty"`
+	DeletedProviderIDs       []string          `json:"deleted_provider_ids,omitempty"`
+	Providers                []ProviderConfig  `json:"providers"`
 }
 
 type AutoModelConfig struct {
+	ID           string   `json:"id,omitempty"`
 	Enabled      bool     `json:"enabled,omitempty"`
 	Models       []string `json:"models,omitempty"`
 	VisionModels []string `json:"vision_models,omitempty"`
@@ -687,6 +689,7 @@ func normalizeConfigModelRefs(cfg *Config) {
 	if cfg == nil {
 		return
 	}
+	normalizeAutoModelConfigs(cfg)
 	normalize := func(ref string) string {
 		providerID, model, ok := strings.Cut(strings.TrimSpace(ref), "/")
 		if !ok || providerID == "" || model == "" {
@@ -699,14 +702,13 @@ func normalizeConfigModelRefs(cfg *Config) {
 		}
 		return strings.TrimSpace(ref)
 	}
-	for i, ref := range cfg.AutoModel.Models {
-		cfg.AutoModel.Models[i] = normalize(ref)
+	for autoIndex := range cfg.AutoModels {
+		for modelIndex, ref := range cfg.AutoModels[autoIndex].Models {
+			cfg.AutoModels[autoIndex].Models[modelIndex] = normalize(ref)
+		}
+		cfg.AutoModels[autoIndex].Models = uniqueStrings(cfg.AutoModels[autoIndex].Models)
 	}
-	for i, ref := range cfg.AutoModel.VisionModels {
-		cfg.AutoModel.VisionModels[i] = normalize(ref)
-	}
-	cfg.AutoModel.Models = uniqueStrings(append(cfg.AutoModel.Models, cfg.AutoModel.VisionModels...))
-	cfg.AutoModel.VisionModels = nil
+	syncLegacyAutoModel(cfg)
 	for i := range cfg.ModelGroups {
 		for j, ref := range cfg.ModelGroups[i].Models {
 			cfg.ModelGroups[i].Models[j] = normalize(ref)
@@ -1274,21 +1276,23 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	if target, ok := s.resolveAutoModelForOpenAI(ctx); ok {
-		if !isMediaModel(target) && scopeAllowsModel(scope, "auto") {
-			grouped["Auto"] = []string{target}
-			models = append(models, map[string]any{
-				"id":         "auto",
-				"object":     "model",
-				"created":    0,
-				"owned_by":   "auto",
-				"attachment": true,
-				"tool_call":  true,
-				"modalities": map[string]any{
-					"input":  []string{"text", "image"},
-					"output": []string{"text"},
-				},
-			})
+	for _, auto := range enabledAutoModelConfigs(s.currentConfig()) {
+		if target, ok := s.resolveAutoModelMatchingID(ctx, auto.ID, func(p ProviderConfig) bool { return !isClaudeCodeCompatibleProvider(p) }); ok {
+			if !isMediaModel(target) && scopeAllowsModel(scope, auto.ID) {
+				grouped["Auto"] = append(grouped["Auto"], auto.ID)
+				models = append(models, map[string]any{
+					"id":         auto.ID,
+					"object":     "model",
+					"created":    0,
+					"owned_by":   "auto",
+					"attachment": true,
+					"tool_call":  true,
+					"modalities": map[string]any{
+						"input":  []string{"text", "image"},
+						"output": []string{"text"},
+					},
+				})
+			}
 		}
 	}
 	sort.Slice(models, func(i, j int) bool {
@@ -1373,12 +1377,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	w, r, finishClientUsage := s.beginClientUsage(w, r, scope)
 	defer finishClientUsage()
 
-	if requestedModel == "auto" {
+	if _, isAuto := s.enabledAutoModelConfig(requestedModel); isAuto {
 		if !scopeAllowsModel(scope, requestedModel) {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "model is not allowed by this access key: " + requestedModel})
 			return
 		}
-		sessionKey, clientLabel := autoSessionIdentity(r, scope, raw)
+		sessionKey, clientLabel := autoSessionIdentityForModel(r, scope, raw, requestedModel)
 		latestHasImage := openAIChatLatestUserHasImage(raw)
 		anyImage := openAIChatHasImage(raw)
 		visionMode, _ := s.autoSessionRequestMode(sessionKey, latestHasImage, anyImage)
@@ -1389,12 +1393,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		candidates := s.autoChatCandidatesForOpenAI(r.Context(), visionMode)
+		candidates := s.autoChatCandidatesForOpenAIModel(r.Context(), requestedModel, visionMode)
 		candidates = s.orderAutoCandidatesForAgent(sessionKey, candidates, visionMode)
 		if len(candidates) == 0 {
-			message := "auto model has no available target"
+			message := requestedModel + " model has no available target"
 			if visionMode {
-				message = "auto model has no available multimodal target"
+				message = requestedModel + " model has no available multimodal target"
 			}
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": message})
 			return
@@ -1418,7 +1422,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "this provider only accepts native Claude Code requests; use the Anthropic Base URL"})
 		return
 	}
-	if requestedModel != "auto" && !scopeAllowsProviderModel(scope, p, upstreamModel) {
+	if !scopeAllowsProviderModel(scope, p, upstreamModel) {
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": "model is not allowed by this access key: " + requestedModel})
 		return
 	}
@@ -1983,6 +1987,7 @@ func pruneAutoModelsForProviderLocked(cfg *Config, p ProviderConfig) {
 	if cfg == nil {
 		return
 	}
+	normalizeAutoModelConfigs(cfg)
 	routes := uniqueStrings([]string{p.ID, providerPublicID(p)})
 	allowed := sliceSet(providerPublishedModelIDs(p))
 	filter := func(models []string) []string {
@@ -2007,8 +2012,11 @@ func pruneAutoModelsForProviderLocked(cfg *Config, p ProviderConfig) {
 		}
 		return out
 	}
-	cfg.AutoModel.Models = filter(cfg.AutoModel.Models)
-	cfg.AutoModel.VisionModels = filter(cfg.AutoModel.VisionModels)
+	for i := range cfg.AutoModels {
+		cfg.AutoModels[i].Models = filter(cfg.AutoModels[i].Models)
+		cfg.AutoModels[i].VisionModels = filter(cfg.AutoModels[i].VisionModels)
+	}
+	syncLegacyAutoModel(cfg)
 }
 
 func (s *Server) deleteProviderModel(providerID, model string) (ProviderConfig, error) {
@@ -2020,6 +2028,7 @@ func (s *Server) deleteProviderModel(providerID, model string) (ProviderConfig, 
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	normalizeAutoModelConfigs(&s.config)
 	for i, p := range s.config.Providers {
 		if p.ID != providerID {
 			continue
@@ -2052,8 +2061,11 @@ func (s *Server) deleteProviderModel(providerID, model string) (ProviderConfig, 
 
 		fullModel := providerModelRef(p, model)
 		legacyModel := providerID + "/" + model
-		s.config.AutoModel.Models = removeString(removeString(s.config.AutoModel.Models, fullModel), legacyModel)
-		s.config.AutoModel.VisionModels = removeString(removeString(s.config.AutoModel.VisionModels, fullModel), legacyModel)
+		for autoIndex := range s.config.AutoModels {
+			s.config.AutoModels[autoIndex].Models = removeString(removeString(s.config.AutoModels[autoIndex].Models, fullModel), legacyModel)
+			s.config.AutoModels[autoIndex].VisionModels = removeString(removeString(s.config.AutoModels[autoIndex].VisionModels, fullModel), legacyModel)
+		}
+		syncLegacyAutoModel(&s.config)
 		for groupIndex := range s.config.ModelGroups {
 			s.config.ModelGroups[groupIndex].Models = removeString(removeString(s.config.ModelGroups[groupIndex].Models, fullModel), legacyModel)
 		}
@@ -2760,11 +2772,16 @@ func (s *Server) resolveAutoModelForOpenAI(ctx context.Context) (string, bool) {
 }
 
 func (s *Server) resolveAutoModelMatching(ctx context.Context, accept func(ProviderConfig) bool) (string, bool) {
+	return s.resolveAutoModelMatchingID(ctx, "auto", accept)
+}
+
+func (s *Server) resolveAutoModelMatchingID(ctx context.Context, autoID string, accept func(ProviderConfig) bool) (string, bool) {
 	cfg := s.currentConfig()
-	if !cfg.AutoModel.Enabled {
+	auto, ok := autoModelConfigByID(cfg, autoID)
+	if !ok || !auto.Enabled {
 		return "", false
 	}
-	candidates := s.autoCandidatesMatching(ctx, cfg.AutoModel.Models, accept, false)
+	candidates := s.autoCandidatesMatching(ctx, auto.Models, accept, false)
 	if len(candidates) == 0 {
 		return "", false
 	}
@@ -2772,22 +2789,32 @@ func (s *Server) resolveAutoModelMatching(ctx context.Context, accept func(Provi
 }
 
 func (s *Server) autoChatCandidatesForOpenAI(ctx context.Context, hasImage bool) []string {
+	return s.autoChatCandidatesForOpenAIModel(ctx, "auto", hasImage)
+}
+
+func (s *Server) autoChatCandidatesForOpenAIModel(ctx context.Context, autoID string, hasImage bool) []string {
 	cfg := s.currentConfig()
-	if !cfg.AutoModel.Enabled {
+	auto, ok := autoModelConfigByID(cfg, autoID)
+	if !ok || !auto.Enabled {
 		return nil
 	}
-	candidates := s.autoCandidatesMatching(ctx, cfg.AutoModel.Models, func(p ProviderConfig) bool {
+	candidates := s.autoCandidatesMatching(ctx, auto.Models, func(p ProviderConfig) bool {
 		return !isClaudeCodeCompatibleProvider(p)
 	}, hasImage)
 	return candidates
 }
 
 func (s *Server) autoChatCandidates(ctx context.Context, hasImage bool) []string {
+	return s.autoChatCandidatesForModel(ctx, "auto", hasImage)
+}
+
+func (s *Server) autoChatCandidatesForModel(ctx context.Context, autoID string, hasImage bool) []string {
 	cfg := s.currentConfig()
-	if !cfg.AutoModel.Enabled {
+	auto, ok := autoModelConfigByID(cfg, autoID)
+	if !ok || !auto.Enabled {
 		return nil
 	}
-	candidates := s.autoCandidatesMatching(ctx, cfg.AutoModel.Models, nil, hasImage)
+	candidates := s.autoCandidatesMatching(ctx, auto.Models, nil, hasImage)
 	return candidates
 }
 
@@ -2944,10 +2971,14 @@ func formatAutoRuntimeError(status int, body []byte) string {
 func (s *Server) autoRuntimeSnapshot() []autoRuntimeModelStatus {
 	cfg := s.currentConfig()
 	set := map[string]bool{}
-	ordered := make([]string, 0, len(cfg.AutoModel.Models))
-	for _, model := range uniqueStrings(cfg.AutoModel.Models) {
-		set[model] = true
-		ordered = append(ordered, model)
+	var ordered []string
+	for _, auto := range configuredAutoModels(cfg) {
+		for _, model := range uniqueStrings(auto.Models) {
+			if !set[model] {
+				set[model] = true
+				ordered = append(ordered, model)
+			}
+		}
 	}
 	s.autoRuntimeMu.RLock()
 	defer s.autoRuntimeMu.RUnlock()
@@ -3711,6 +3742,17 @@ func wantsJSON(r *http.Request) bool {
 }
 
 func validateConfig(cfg Config) error {
+	autoIDs := map[string]bool{}
+	for _, auto := range configuredAutoModels(cfg) {
+		id := strings.TrimSpace(auto.ID)
+		if !validAutoModelID(id) {
+			return fmt.Errorf("invalid Auto model id: %s", id)
+		}
+		if autoIDs[id] {
+			return fmt.Errorf("duplicate Auto model id: %s", id)
+		}
+		autoIDs[id] = true
+	}
 	seen := map[string]bool{}
 	routeIDs := map[string]bool{}
 	for _, p := range cfg.Providers {

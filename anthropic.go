@@ -52,9 +52,9 @@ func (s *Server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Reque
 	}
 	model := strings.TrimSpace(anyString(body["model"]))
 	scope, _ := s.accessScopeForRequest(r)
-	if model == "auto" {
-		if !scopeAllowsModel(scope, "auto") {
-			writeAnthropicError(w, http.StatusForbidden, "model is not allowed by this access key: auto")
+	if _, isAuto := s.enabledAutoModelConfig(model); isAuto {
+		if !scopeAllowsModel(scope, model) {
+			writeAnthropicError(w, http.StatusForbidden, "model is not allowed by this access key: "+model)
 			return
 		}
 	} else if providerID, upstreamModel, ok := strings.Cut(model, "/"); ok {
@@ -97,10 +97,12 @@ func (s *Server) handleAnthropicModels(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	if _, ok := s.resolveAutoModel(ctx); ok && scopeAllowsModel(scope, "auto") {
-		models = append(models, map[string]any{
-			"id": "auto", "type": "model", "display_name": "auto", "created_at": "1970-01-01T00:00:00Z",
-		})
+	for _, auto := range enabledAutoModelConfigs(s.currentConfig()) {
+		if _, ok := s.resolveAutoModelMatchingID(ctx, auto.ID, nil); ok && scopeAllowsModel(scope, auto.ID) {
+			models = append(models, map[string]any{
+				"id": auto.ID, "type": "model", "display_name": auto.ID, "created_at": "1970-01-01T00:00:00Z",
+			})
+		}
 	}
 	firstID, lastID := "", ""
 	if len(models) > 0 {
@@ -139,12 +141,12 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}
 	w, r, finishClientUsage := s.beginClientUsage(w, r, scope)
 	defer finishClientUsage()
-	if requestedModel == "auto" {
-		if !scopeAllowsModel(scope, "auto") {
-			writeAnthropicError(w, http.StatusForbidden, "model is not allowed by this access key: auto")
+	if _, isAuto := s.enabledAutoModelConfig(requestedModel); isAuto {
+		if !scopeAllowsModel(scope, requestedModel) {
+			writeAnthropicError(w, http.StatusForbidden, "model is not allowed by this access key: "+requestedModel)
 			return
 		}
-		sessionKey, clientLabel := autoSessionIdentity(r, scope, raw)
+		sessionKey, clientLabel := autoSessionIdentityForModel(r, scope, raw, requestedModel)
 		latestHasImage := anthropicMessagesLatestUserHasImage(raw)
 		anyImage := anthropicMessagesHaveImage(raw)
 		visionMode, _ := s.autoSessionRequestMode(sessionKey, latestHasImage, anyImage)
@@ -155,12 +157,12 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 				return
 			}
 		}
-		candidates := s.autoChatCandidates(r.Context(), visionMode)
+		candidates := s.autoChatCandidatesForModel(r.Context(), requestedModel, visionMode)
 		candidates = s.orderAutoCandidatesForAgent(sessionKey, candidates, visionMode)
 		if len(candidates) == 0 {
-			message := "auto model has no available target"
+			message := requestedModel + " model has no available target"
 			if visionMode {
-				message = "auto model has no available multimodal target"
+				message = requestedModel + " model has no available multimodal target"
 			}
 			writeAnthropicError(w, http.StatusServiceUnavailable, message)
 			return
@@ -179,7 +181,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicError(w, http.StatusNotFound, "provider is not enabled: "+providerID)
 		return
 	}
-	if requestedModel != "auto" && !scopeAllowsProviderModel(scope, p, upstreamModel) {
+	if !scopeAllowsProviderModel(scope, p, upstreamModel) {
 		writeAnthropicError(w, http.StatusForbidden, "model is not allowed by this access key: "+requestedModel)
 		return
 	}

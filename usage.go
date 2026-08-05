@@ -124,6 +124,9 @@ func rollUsageDate(store *UsageStore) {
 		group.Today = UsageCounters{}
 		for _, model := range group.Models {
 			model.Today = UsageCounters{}
+			model.LastFailure = ""
+			model.LastFailureAt = 0
+			model.LastFailureStatus = 0
 		}
 	}
 }
