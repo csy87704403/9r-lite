@@ -1107,7 +1107,7 @@ func (s *Server) handleProviderProbeKey(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider not found"})
 		return
 	}
-	if p.Type != "openai" && p.Type != "anthropic" {
+	if p.Type != "openai" && p.Type != "anthropic" && p.Type != "opencode-free" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "key probe only supports API key providers"})
 		return
 	}
@@ -1435,7 +1435,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	switch p.Type {
 	case "opencode-free":
-		s.proxyOpenCode(w, r, req, upstreamModel)
+		s.proxyOpenCode(w, r, p, req, upstreamModel)
 	case "mimo-free":
 		s.proxyMimoFree(w, r, req, upstreamModel)
 	case "qoder":
@@ -1658,7 +1658,7 @@ func (s *Server) handleMedia(kind string) http.HandlerFunc {
 	}
 }
 
-func (s *Server) proxyOpenCode(w http.ResponseWriter, r *http.Request, req chatRequest, upstreamModel string) {
+func (s *Server) proxyOpenCode(w http.ResponseWriter, r *http.Request, p ProviderConfig, req chatRequest, upstreamModel string) {
 	body, err := replaceModel(req.Raw, upstreamModel)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -1667,7 +1667,6 @@ func (s *Server) proxyOpenCode(w http.ResponseWriter, r *http.Request, req chatR
 
 	headers := map[string]string{
 		"Content-Type":        "application/json",
-		"Authorization":       "Bearer public",
 		"x-opencode-client":   "desktop",
 		"Accept":              acceptHeader(req.Stream),
 		"User-Agent":          "9router-lite/0.1",
@@ -1677,7 +1676,21 @@ func (s *Server) proxyOpenCode(w http.ResponseWriter, r *http.Request, req chatR
 		"Transfer-Encoding":   "chunked",
 		"X-9Router-Lite-Mode": "opencode-free",
 	}
-	s.proxyRaw(w, r, openCodeBaseURL+"/zen/v1/chat/completions", body, headers)
+	target := openCodeChatURL(p)
+	keys := providerAPIKeys(p)
+	if len(keys) > 0 {
+		s.proxyPostRotating(w, r, target, body, p, keys, headers, upstreamModel)
+		return
+	}
+	headers["Authorization"] = "Bearer public"
+	s.proxyRaw(w, r, target, body, headers)
+}
+
+func openCodeChatURL(p ProviderConfig) string {
+	if baseURL := strings.TrimSpace(p.BaseURL); baseURL != "" {
+		return joinURL(baseURL, "/chat/completions")
+	}
+	return openCodeBaseURL + "/zen/v1/chat/completions"
 }
 
 func (s *Server) proxyMimoFree(w http.ResponseWriter, r *http.Request, req chatRequest, upstreamModel string) {
@@ -3397,6 +3410,9 @@ func (s *Server) probeSingleCompatibleModelWithKey(ctx context.Context, p Provid
 	}
 	body := openAIProbeRequest(model, probeMaxTokens(p))
 	target := joinURL(p.BaseURL, "/chat/completions")
+	if p.Type == "opencode-free" {
+		target = openCodeChatURL(p)
+	}
 	if isResponsesCompatibleProvider(p) {
 		target = joinURL(p.BaseURL, "/responses")
 	} else if p.Type == "anthropic" {
@@ -3416,6 +3432,10 @@ func (s *Server) probeSingleCompatibleModelWithKey(ctx context.Context, p Provid
 		"Authorization": "Bearer " + key,
 		"Accept":        "application/json",
 		"User-Agent":    "9router-lite/0.1",
+	}
+	if p.Type == "opencode-free" {
+		headers["x-opencode-client"] = "desktop"
+		headers["X-9Router-Lite-Mode"] = "opencode-free"
 	}
 	if p.Type == "anthropic" {
 		anthropicHeaders := make(http.Header)

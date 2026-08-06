@@ -1124,7 +1124,13 @@ function apiKeyValues(id){
 function apiKeyEditor(id,p){
   const keys=providerAPIKeys(p); if(!keys.length) keys.push('');
   const probeModel=(chatProbeModels(p)[0] || '');
-  return '<div class="field"><label>API Keys</label><div id="keyList_'+id+'" class="key-list">'+keys.map((key,index)=>apiKeyRowHTML(id,key,apiKeyStatusClass(p,index,keys.length))).join('')+'</div><div class="bar"><button class="small secondary" onclick="addAPIKeyInput(\''+id+'\')" type="button">新增 API Key</button><span class="muted">按顺序尝试；额度不足只会跳过当前模型的这个 key。</span></div><div class="field"><label>Key 测试模型</label><input id="keyProbeModel_'+id+'" value="'+esc(probeModel)+'" placeholder="填写要用这个 key 测试的文本模型"></div></div>';
+  const label=p && p.type==='opencode-free' ? 'OpenCode Zen API Keys（可选）' : 'API Keys';
+  const hint=p && p.type==='opencode-free' ? '填写后使用 Zen 认证；多个 Key 遇到额度不足或限流时按顺序切换。全部留空则使用匿名 public 模式。' : '按顺序尝试；额度不足只会跳过当前模型的这个 key。';
+  return '<div class="field"><label>'+esc(label)+'</label><div id="keyList_'+id+'" class="key-list">'+keys.map((key,index)=>apiKeyRowHTML(id,key,apiKeyStatusClass(p,index,keys.length))).join('')+'</div><div class="bar"><button class="small secondary" onclick="addAPIKeyInput(\''+id+'\')" type="button">新增 API Key</button><span class="muted">'+esc(hint)+'</span></div><div class="field"><label>Key 测试模型</label><input id="keyProbeModel_'+id+'" value="'+esc(probeModel)+'" placeholder="填写要用这个 key 测试的文本模型"></div></div>';
+}
+function openCodeKeyControls(p){
+  if(!p || p.type!=='opencode-free') return '';
+  return apiKeyEditor(p.id,p)+'<div class="bar"><button class="small" type="button" onclick="saveOpenCodeKeys(\''+p.id+'\')">保存 Zen Key</button></div>';
 }
 function hydrateCustomKeyEditors(cfg){
   (cfg.providers || []).forEach(p=>{
@@ -1242,7 +1248,7 @@ function renderPublishProviders(){
     const listControls=models.length ? '<div class="bar"><button class="small secondary" onclick="selectProviderModels(\''+p.id+'\',true)">全选</button><button class="small secondary" onclick="selectProviderModels(\''+p.id+'\',false)">取消所有选择</button><button class="small secondary" onclick="invertProviderModels(\''+p.id+'\')">反选</button></div>' : '';
     const rows=models.length ? '<div class="model-list">'+modelRows(p)+'</div>' : '<div class="muted">登录或拉取后会显示模型。</div>';
     const probeCount=chatProbeModels(p).length;
-    return '<div class="card">'+providerTitleHTML(p,connected?'green-dot':'gray-dot')+oauthControls(p)+mimoProxyControls(p)+authText+'<div class="muted">已加载 '+models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div><div class="bar">'+fetchOAuthModelsButton(p)+'<button id="probeStart_'+p.id+'" class="small" onclick="probeProvider(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!connected || !probeCount || providerProbeControllers.has(p.id)?'disabled':'')+'>探测可用</button><button id="probeStop_'+p.id+'" class="small secondary" onclick="stopProviderProbe(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(providerProbeControllers.has(p.id)?'':'disabled')+'>停止探测</button><button class="small secondary" onclick="saveModelSelection(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!models.length?'disabled':'')+'>保存发布列表</button><span id="publishStatus_'+p.id+'" class="muted"></span></div><div id="probeProgress_'+p.id+'" class="progress-wrap"><progress value="0" max="'+probeCount+'"></progress><span class="muted">0/'+probeCount+'</span></div>'+listControls+rows+'<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="disableProvider(\''+p.id+'\')">停用</button></div></div>';
+    return '<div class="card">'+providerTitleHTML(p,connected?'green-dot':'gray-dot')+oauthControls(p)+mimoProxyControls(p)+authText+openCodeKeyControls(p)+'<div class="muted">已加载 '+models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div><div class="bar">'+fetchOAuthModelsButton(p)+'<button id="probeStart_'+p.id+'" class="small" onclick="probeProvider(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!connected || !probeCount || providerProbeControllers.has(p.id)?'disabled':'')+'>探测可用</button><button id="probeStop_'+p.id+'" class="small secondary" onclick="stopProviderProbe(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(providerProbeControllers.has(p.id)?'':'disabled')+'>停止探测</button><button class="small secondary" onclick="saveModelSelection(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!models.length?'disabled':'')+'>保存发布列表</button><span id="publishStatus_'+p.id+'" class="muted"></span></div><div id="probeProgress_'+p.id+'" class="progress-wrap"><progress value="0" max="'+probeCount+'"></progress><span class="muted">0/'+probeCount+'</span></div>'+listControls+rows+'<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="disableProvider(\''+p.id+'\')">停用</button></div></div>';
   });
   root.innerHTML=items.join('') || '<div class="muted">还没有可发布的模型。</div>';
 }
@@ -1254,7 +1260,9 @@ function buildAPIProvider(id){
   const keys=apiKeyValues(id);
   const protocol=custom ? document.getElementById('protocol_'+id) : null;
   const protocolValue=protocol ? protocol.value : '';
-  const next={ ...prev, name:custom?(document.getElementById('name_'+id).value.trim() || prev.name || 'Custom Compatible'):prev.name, enabled:!!document.getElementById('enabled_'+id).checked, base_url:document.getElementById('base_'+id).value.trim(), api_key:keys[0] || '' };
+  const enabledInput=document.getElementById('enabled_'+id);
+  const baseInput=document.getElementById('base_'+id);
+  const next={ ...prev, name:custom?(document.getElementById('name_'+id).value.trim() || prev.name || 'Custom Compatible'):prev.name, enabled:enabledInput?!!enabledInput.checked:!!prev.enabled, base_url:baseInput?baseInput.value.trim():(prev.base_url || ''), api_key:keys[0] || '' };
   if(custom) next.type=protocolValue==='anthropic' ? 'anthropic' : 'openai';
   if(custom && next.name.includes('/')) throw new Error('自定义渠道名称不能包含 /');
   next.image_endpoint=mediaBaseInputValue(id,'image');
@@ -1402,8 +1410,20 @@ async function copyBaseURL(){ try{ await copyTextValue(document.getElementById('
 async function copyEndpoint(id, label){ try{ await copyTextValue(document.getElementById(id).value); setText('status','ok',(label || '地址')+'已复制'); }catch(e){ setText('status','err','复制失败：'+e.message); } }
 function openModelsPage(){ const key=document.getElementById('accessKey').value.trim(); if(!key){ setText('status','err','请先设置访问密钥'); return; } window.open('/v1/models?view=html&key='+encodeURIComponent(key),'_blank','noopener,noreferrer'); }
 async function saveAPIProvider(id){ try{ const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid'); applyGatewaySettings(cfg); const prev=cfg.providers.find(p=>p.id===id); const next=buildAPIProvider(id); remapProviderRouteRefs(cfg,prev,next); cfg.providers=cfg.providers.map(p=>p.id===id?next:p); ensureBlankCustomProvider(cfg); await saveConfigObject(cfg); await reloadConfig(); setText('apiStatus_'+id,'ok','已保存'); }catch(e){ setText('apiStatus_'+id,'err',e.message); } }
+async function saveOpenCodeKeys(id){
+  try{
+    const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid');
+    applyGatewaySettings(cfg);
+    const next=buildAPIProvider(id);
+    cfg.providers=cfg.providers.map(p=>p.id===id?next:p);
+    ensureBlankCustomProvider(cfg);
+    await saveConfigObject(cfg);
+    await reloadConfig();
+    setText('publishStatus_'+id,'ok',providerAPIKeys(next).length?'Zen Key 已保存':'已切换为匿名 public 模式');
+  }catch(e){ setText('publishStatus_'+id,'err',e.message); }
+}
 async function probeAPIKey(button,id){
-  let statusID='apiStatus_'+id;
+  let statusID=document.getElementById('apiStatus_'+id)?'apiStatus_'+id:'publishStatus_'+id;
   try{
     const row=button && button.closest ? button.closest('.key-row') : null;
     const rows=[...document.querySelectorAll('#keyList_'+id+' .key-row')];
