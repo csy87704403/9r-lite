@@ -10,27 +10,58 @@ import (
 	"testing"
 )
 
-func TestWithClineFreeModels(t *testing.T) {
-	models := withClineFreeModels([]string{"paid/model", "cline-free/glm-5.2"})
-	want := []string{
-		"deepseek/deepseek-v4-flash",
-		"cline-free/glm-5.2",
-		"stepfun/step-3.7-flash",
-		"paid/model",
-	}
-	if strings.Join(models, ",") != strings.Join(want, ",") {
-		t.Fatalf("models = %#v, want %#v", models, want)
-	}
-}
+type clineCatalogTransport func(*http.Request) (*http.Response, error)
+
+func (f clineCatalogTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestFetchClineModelsIncludesFreeModels(t *testing.T) {
-	s := &Server{}
-	models, err := s.fetchProviderModels(t.Context(), ProviderConfig{Type: "cline", Models: []string{"paid/model"}})
+	s := &Server{client: &http.Client{Transport: clineCatalogTransport(func(r *http.Request) (*http.Response, error) {
+		if r.URL.String() != clineRecommendedModelsURL || r.Method != http.MethodGet {
+			t.Fatalf("unexpected catalog request: %s %s", r.Method, r.URL)
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"free":[{"id":"cline-free/deepseek-v4.1-flash"},{"id":" stealth/union-alpha "},{"id":"cline-free/muse-spark-1.3-contributor"},{"id":"z-ai/glm-5.3-flash"},{"id":"cline-free/solar-pro4"},{"id":"poolside/laguna-s-2.1:free"},{"id":"stealth/union-alpha"},{"id":""}],"recommended":[{"id":"paid/model"}],"clinePass":[{"id":"subscription/model"}]}`))}, nil
+	})}}
+	p := ProviderConfig{Type: "cline", Models: []string{"cline-free/glm-5.2"}}
+	models, err := s.fetchProviderModels(t.Context(), p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sliceSet(models)["cline-free/glm-5.2"] {
-		t.Fatalf("free GLM model missing from %#v", models)
+	want := "cline-free/deepseek-v4.1-flash,stealth/union-alpha,cline-free/muse-spark-1.3-contributor,z-ai/glm-5.3-flash,cline-free/solar-pro4,poolside/laguna-s-2.1:free"
+	if strings.Join(models, ",") != want {
+		t.Fatalf("unexpected free models: %#v", models)
+	}
+	if strings.Join(s.modelsForProvider(t.Context(), p), ",") != "cline-free/glm-5.2" {
+		t.Fatal("cached model lookup must not inject hardcoded models")
+	}
+}
+
+func TestFetchClineModelsFailurePreservesList(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		status     int
+	}{
+		{"empty", `{"free":[]}`, 200},
+		{"missing", `{"recommended":[{"id":"paid/model"}]}`, 200},
+		{"invalid", `not json`, 200},
+		{"rate limited", `{}`, 429},
+		{"server error", `{}`, 500},
+		{"network failure", "", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Server{client: &http.Client{Transport: clineCatalogTransport(func(r *http.Request) (*http.Response, error) {
+				if tc.status == 0 {
+					return nil, io.ErrUnexpectedEOF
+				}
+				return &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+			})}}
+			p := ProviderConfig{Type: "cline", Models: []string{"existing/model"}}
+			if _, err := s.fetchProviderModels(t.Context(), p); err == nil {
+				t.Fatal("expected catalog error")
+			}
+			if strings.Join(p.Models, ",") != "existing/model" {
+				t.Fatal("failed fetch changed existing models")
+			}
+		})
 	}
 }
 

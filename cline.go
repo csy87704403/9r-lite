@@ -21,16 +21,42 @@ const (
 	clineChatURL          = "https://api.cline.bot/api/v1/chat/completions"
 )
 
-var clineFreeModels = []string{
-	"deepseek/deepseek-v4-flash",
-	"cline-free/glm-5.2",
-	"stepfun/step-3.7-flash",
-}
+const clineRecommendedModelsURL = "https://api.cline.bot/api/v1/ai/cline/recommended-models"
 
-func withClineFreeModels(models []string) []string {
-	merged := append([]string(nil), clineFreeModels...)
-	merged = append(merged, models...)
-	return uniqueStrings(merged)
+func fetchClineFreeModels(ctx context.Context, client *http.Client) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, clineRecommendedModelsURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("拉取 Cline 免费模型失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("拉取 Cline 免费模型失败: HTTP %d", resp.StatusCode)
+	}
+	var feed struct {
+		Free []struct {
+			ID string `json:"id"`
+		} `json:"free"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&feed); err != nil {
+		return nil, fmt.Errorf("解析 Cline 免费模型失败: %w", err)
+	}
+	var ids []string
+	for _, model := range feed.Free {
+		if id := strings.TrimSpace(model.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	ids = uniqueStrings(ids)
+	if len(ids) == 0 {
+		return nil, errors.New("Cline 未返回免费模型，已保留原模型列表")
+	}
+	return ids, nil
 }
 
 func clineProviderAccounts(p ProviderConfig) []ClineAccount {
@@ -205,7 +231,6 @@ func (s *Server) handleClineCallback(w http.ResponseWriter, r *http.Request) {
 			"kwaipilot/kat-coder-pro",
 		}
 	}
-	p.Models = withClineFreeModels(p.Models)
 	if err := s.updateProvider(p); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

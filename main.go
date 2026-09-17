@@ -1923,7 +1923,7 @@ func (s *Server) modelsForProvider(ctx context.Context, p ProviderConfig) []stri
 		}
 		return p.Models
 	case "cline":
-		return withClineFreeModels(p.Models)
+		return p.Models
 	case "openai", "anthropic":
 		if p.FetchModels && p.BaseURL != "" && len(providerAPIKeys(p)) > 0 {
 			ids, err := fetchOpenAIModels(ctx, s.client, p)
@@ -1961,7 +1961,7 @@ func (s *Server) fetchProviderModels(ctx context.Context, p ProviderConfig) ([]s
 	case "kilocode":
 		return fetchKiloFreeModels(ctx, s.client, p)
 	case "cline":
-		return withClineFreeModels(p.Models), nil
+		return fetchClineFreeModels(ctx, s.client)
 	case "openai", "anthropic":
 		if strings.TrimSpace(p.BaseURL) == "" {
 			return nil, errors.New("provider base_url is empty")
