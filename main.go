@@ -100,6 +100,7 @@ type ProviderConfig struct {
 	RefreshToken          string            `json:"refresh_token,omitempty"`
 	ClineAccounts         []ClineAccount    `json:"cline_accounts,omitempty"`
 	ActiveClineAccount    int               `json:"active_cline_account_index,omitempty"`
+	ClineModelSync        *ClineModelSync   `json:"cline_model_sync,omitempty"`
 	Email                 string            `json:"email,omitempty"`
 	DisplayName           string            `json:"display_name,omitempty"`
 	ExpiresIn             int64             `json:"expires_in,omitempty"`
@@ -345,6 +346,7 @@ func main() {
 	mux.HandleFunc("/api/admin/auto-status", srv.handleAutoRuntimeStatus)
 	mux.HandleFunc("/api/config", srv.handleConfig)
 	mux.HandleFunc("/api/provider/models", srv.handleProviderModels)
+	mux.HandleFunc("/api/provider/cline-model-sync", srv.handleClineModelSyncSettings)
 	mux.HandleFunc("/api/provider/probe", srv.handleProviderProbe)
 	mux.HandleFunc("/api/provider/probe-model", srv.handleProviderProbeModel)
 	mux.HandleFunc("/api/provider/probe-key", srv.handleProviderProbeKey)
@@ -377,6 +379,7 @@ func main() {
 	mux.HandleFunc("/v1/tts/models", srv.handleMediaModels("tts"))
 
 	go srv.autoProbeLoop()
+	go srv.clineModelSyncLoop()
 
 	addr := ":" + port
 	log.Printf("9router-lite listening on http://localhost%s", addr)
@@ -653,7 +656,7 @@ func mergeDefaultConfig(cfg Config) Config {
 		if p.BaseURL == "" {
 			p.BaseURL = d.BaseURL
 		}
-		if len(p.Models) == 0 {
+		if len(p.Models) == 0 && !(p.Type == "cline" && p.ClineModelSync != nil && p.ClineModelSync.LastRunAt > 0) {
 			p.Models = d.Models
 		}
 		if (p.Type == "openai" || p.Type == "anthropic") && p.FetchModels && len(providerAPIKeys(p)) > 0 && len(p.Models) > 0 {
@@ -846,11 +849,17 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
+		s.mu.Lock()
+		if clineModelSyncConfigStale(s.config, cfg) {
+			s.mu.Unlock()
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "Cline 模型已在后台更新，请刷新页面后重试，避免覆盖最新列表"})
+			return
+		}
 		if err := saveConfig(s.dataDir, cfg); err != nil {
+			s.mu.Unlock()
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
-		s.mu.Lock()
 		s.config = cfg
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -877,6 +886,20 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 	p, ok := s.providerByID(strings.TrimSpace(body.ID))
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider not found"})
+		return
+	}
+	if p.Type == "cline" {
+		result, err := s.syncClineModels(r.Context(), p.ID)
+		if err != nil {
+			status := http.StatusBadGateway
+			if errors.Is(err, errClineModelSyncBusy) {
+				status = http.StatusConflict
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		latest, _ := s.clineModelSyncSnapshot(p.ID)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "provider": latest, "count": len(latest.Models), "models": latest.Models, "sync": result})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
@@ -3500,6 +3523,8 @@ func formatProbeFailure(status int, body string) string {
 	body = strings.TrimSpace(body)
 	lower := strings.ToLower(body)
 	switch {
+	case strings.Contains(lower, "cline") && (strings.Contains(lower, "登录已失效") || strings.Contains(lower, "invalid_grant")):
+		return "登录已失效，请重新登录"
 	case status == http.StatusPaymentRequired || strings.Contains(lower, "insufficient_credits") || strings.Contains(lower, "insufficient credits") || strings.Contains(lower, "insufficient balance") || strings.Contains(lower, "out of credit"):
 		return "额度不足"
 	case strings.Contains(lower, "promotion has ended") || strings.Contains(lower, "quota"):
@@ -3623,6 +3648,9 @@ func (s *Server) probeAllProviders(ctx context.Context, autoPublish bool) {
 	s.probeMu.Lock()
 	defer s.probeMu.Unlock()
 	for _, p := range s.enabledProviders() {
+		if p.Type == "cline" && p.ClineModelSync != nil && p.ClineModelSync.Enabled {
+			continue // The Cline catalog task already probes, avoiding duplicate scheduled calls.
+		}
 		models := p.Models
 		if isClaudeCodeCompatibleProvider(p) {
 			models = s.visibleModelsForProvider(ctx, p)

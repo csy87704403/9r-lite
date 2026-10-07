@@ -23,6 +23,8 @@ const (
 
 const clineRecommendedModelsURL = "https://api.cline.bot/api/v1/ai/cline/recommended-models"
 
+var errClineLoginRequired = errors.New("Cline 登录已失效，请重新登录")
+
 func fetchClineFreeModels(ctx context.Context, client *http.Client) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -219,7 +221,9 @@ func (s *Server) handleClineCallback(w http.ResponseWriter, r *http.Request) {
 		account.ExpiresIn = 3600
 	}
 	p, _ = upsertClineAccount(p, account)
-	if len(p.Models) == 0 {
+	p.ProviderSpecificData["authStatus"] = "ok"
+	delete(p.ProviderSpecificData, "lastAuthError")
+	if len(p.Models) == 0 && (p.ClineModelSync == nil || p.ClineModelSync.LastRunAt == 0) {
 		p.Models = []string{
 			"anthropic/claude-opus-4.7",
 			"anthropic/claude-sonnet-4.6",
@@ -291,7 +295,8 @@ func (s *Server) exchangeClineToken(r *http.Request, code, redirectURI string) (
 
 func (s *Server) proxyCline(w http.ResponseWriter, r *http.Request, p ProviderConfig, req chatRequest, upstreamModel string) {
 	if len(clineProviderAccounts(p)) == 0 {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "cline is not logged in"})
+		s.markProviderAuthState(p.ID, "needs_login", errClineLoginRequired.Error())
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": errClineLoginRequired.Error()})
 		return
 	}
 	body, err := replaceModel(req.Raw, upstreamModel)
@@ -302,14 +307,43 @@ func (s *Server) proxyCline(w http.ResponseWriter, r *http.Request, p ProviderCo
 
 	resp, _, err := s.doClineRequest(r.Context(), p, req.Stream, body, true)
 	if err != nil {
+		if errors.Is(err, errClineLoginRequired) {
+			s.markProviderAuthState(p.ID, "needs_login", errClineLoginRequired.Error())
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": errClineLoginRequired.Error()})
+			return
+		}
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
-		s.markProviderAuthState(p.ID, "needs_login", fmt.Sprintf("Cline returned %d; please login again", resp.StatusCode))
+		s.markProviderAuthState(p.ID, "needs_login", errClineLoginRequired.Error())
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": errClineLoginRequired.Error()})
+		return
 	} else if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
 		s.markProviderAuthState(p.ID, "ok", "")
+	}
+	if !req.Stream && resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		responseBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+			return
+		}
+		// Cline wraps JSON completions in data; SSE must remain untouched.
+		var envelope struct {
+			Data    json.RawMessage `json:"data"`
+			Success *bool           `json:"success"`
+		}
+		if json.Unmarshal(responseBody, &envelope) == nil && (envelope.Success == nil || *envelope.Success) {
+			var completion struct {
+				Choices json.RawMessage `json:"choices"`
+			}
+			if json.Unmarshal(envelope.Data, &completion) == nil && len(completion.Choices) > 0 {
+				responseBody = envelope.Data
+				resp.Header.Del("Content-Length")
+			}
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(responseBody))
 	}
 
 	for k, values := range resp.Header {
@@ -436,7 +470,7 @@ func (s *Server) refreshClineAccount(ctx context.Context, p ProviderConfig, acco
 	}
 	account := accounts[accountIndex]
 	if strings.TrimSpace(account.RefreshToken) == "" {
-		return p, errors.New("Cline refresh token is empty; please login again")
+		return p, fmt.Errorf("%w: refresh token is empty", errClineLoginRequired)
 	}
 	reqBody := map[string]any{
 		"refreshToken": account.RefreshToken,
@@ -456,6 +490,10 @@ func (s *Server) refreshClineAccount(ctx context.Context, p ProviderConfig, acco
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		lower := strings.ToLower(string(b))
+		if resp.StatusCode == http.StatusUnauthorized || (resp.StatusCode == http.StatusBadRequest && (strings.Contains(lower, "invalid_grant") || strings.Contains(lower, "invalid_refresh_token"))) {
+			return p, fmt.Errorf("%w: refresh token rejected (HTTP %d)", errClineLoginRequired, resp.StatusCode)
+		}
 		return p, fmt.Errorf("Cline token refresh failed: %d %s", resp.StatusCode, truncateString(string(b), 240))
 	}
 	var raw map[string]any

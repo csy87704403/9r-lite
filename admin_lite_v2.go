@@ -1249,9 +1249,27 @@ function renderPublishProviders(){
     const rows=models.length ? '<div class="model-list">'+modelRows(p)+'</div>' : '<div class="muted">登录或拉取后会显示模型。</div>';
     const probeCount=chatProbeModels(p).length;
     const manualAdd=p.id==='cline' ? '<div class="field"><label>手动添加模型</label><div class="inline-field grow"><input id="manualModel_'+p.id+'" placeholder="例如 cline-free/kimi-k3"><button class="secondary" onclick="addAPIModel(\''+p.id+'\')" type="button">添加</button></div></div>' : '';
-    return '<div class="card">'+providerTitleHTML(p,connected?'green-dot':'gray-dot')+oauthControls(p)+mimoProxyControls(p)+authText+openCodeKeyControls(p)+manualAdd+'<div class="muted">已加载 '+models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div><div class="bar">'+fetchOAuthModelsButton(p)+'<button id="probeStart_'+p.id+'" class="small" onclick="probeProvider(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!connected || !probeCount || providerProbeControllers.has(p.id)?'disabled':'')+'>探测可用</button><button id="probeStop_'+p.id+'" class="small secondary" onclick="stopProviderProbe(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(providerProbeControllers.has(p.id)?'':'disabled')+'>停止探测</button><button class="small secondary" onclick="saveModelSelection(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!models.length?'disabled':'')+'>保存发布列表</button><span id="publishStatus_'+p.id+'" class="muted"></span></div><div id="probeProgress_'+p.id+'" class="progress-wrap"><progress value="0" max="'+probeCount+'"></progress><span class="muted">0/'+probeCount+'</span></div>'+listControls+rows+'<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="disableProvider(\''+p.id+'\')">停用</button></div></div>';
+    return '<div class="card">'+providerTitleHTML(p,connected?'green-dot':'gray-dot')+oauthControls(p)+mimoProxyControls(p)+authText+openCodeKeyControls(p)+manualAdd+clineModelSyncControls(p)+'<div class="muted">已加载 '+models.length+' 个模型，当前发布 '+visibleModels(p).length+' 个</div><div class="bar">'+fetchOAuthModelsButton(p)+'<button id="probeStart_'+p.id+'" class="small" onclick="probeProvider(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!connected || !probeCount || providerProbeControllers.has(p.id)?'disabled':'')+'>探测可用</button><button id="probeStop_'+p.id+'" class="small secondary" onclick="stopProviderProbe(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(providerProbeControllers.has(p.id)?'':'disabled')+'>停止探测</button><button class="small secondary" onclick="saveModelSelection(\''+p.id+'\',\'publishStatus_'+p.id+'\')" '+(!models.length?'disabled':'')+'>保存发布列表</button><span id="publishStatus_'+p.id+'" class="muted"></span></div><div id="probeProgress_'+p.id+'" class="progress-wrap"><progress value="0" max="'+probeCount+'"></progress><span class="muted">0/'+probeCount+'</span></div>'+listControls+rows+'<div class="bar" style="justify-content:flex-end"><button class="small secondary" onclick="disableProvider(\''+p.id+'\')">停用</button></div></div>';
   });
   root.innerHTML=items.join('') || '<div class="muted">还没有可发布的模型。</div>';
+}
+function clineModelSyncControls(p){
+  if(p.type!=='cline') return '';
+  const state=p.cline_model_sync || {};
+  const last=state.last_run_at ? new Date(state.last_run_at*1000).toLocaleString('zh-CN') : '尚未执行';
+  const message=state.last_error || state.last_summary || '';
+  const removed=(state.last_removed_models || []).length ? '<div class="muted">本轮删除：'+esc(state.last_removed_models.join('、'))+'</div>' : '';
+  return '<div class="field"><label class="toggle"><input id="clineSyncEnabled_'+p.id+'" type="checkbox" style="width:auto" '+(state.enabled?'checked':'')+'> 自动更新模型并探测清理</label><div class="bar"><label class="inline-field muted">间隔分钟 <input id="clineSyncInterval_'+p.id+'" type="number" min="1" max="10080" step="1" value="'+esc(state.interval_minutes || 60)+'"></label><button class="small secondary" onclick="saveClineModelSync(\''+p.id+'\')">保存自动更新设置</button><button class="small secondary" onclick="fetchOAuthProviderModels(\''+p.id+'\')" '+(!providerConnected(p)?'disabled':'')+'>立即更新并探测</button></div><div class="muted">最后更新：'+esc(last)+'</div><div class="'+(state.last_error?'err':'muted')+'">'+esc(message)+'</div>'+removed+'<div class="muted">明确失效直接删除；临时错误连续 3 轮才删除。账号失效或额度不足暂停清理；上锁模型不处理。</div><span id="clineSyncStatus_'+p.id+'" class="muted"></span></div>';
+}
+async function saveClineModelSync(id){
+  try{
+    const interval=Number(document.getElementById('clineSyncInterval_'+id).value);
+    if(!Number.isInteger(interval) || interval<1 || interval>10080) throw new Error('更新间隔必须是 1 到 10080 分钟');
+    setText('clineSyncStatus_'+id,'muted','正在保存...');
+    const res=await fetch('/api/provider/cline-model-sync',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id,enabled:!!document.getElementById('clineSyncEnabled_'+id).checked,interval_minutes:interval})});
+    const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText);
+    await reloadConfig(); setText('clineSyncStatus_'+id,'ok','自动更新设置已保存');
+  }catch(e){ setText('clineSyncStatus_'+id,'err',e.message); }
 }
 async function reloadConfig(){ const res=await fetch('/api/config'); const cfg=await res.json(); setConfig(cfg); renderProviderStatus(); renderAPIProviders(); renderPublishProviders(); }
 function buildAPIProvider(id){
@@ -1487,7 +1505,7 @@ async function deleteAPIProvider(id){
   }catch(e){ setText('apiStatus_'+id,'err',e.message); }
 }
 async function fetchAPIProviderModels(id){ try{ setText('apiStatus_'+id,'muted','正在保存...'); const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid'); applyGatewaySettings(cfg); const prev=cfg.providers.find(p=>p.id===id); const next=buildAPIProvider(id); remapProviderRouteRefs(cfg,prev,next); cfg.providers=cfg.providers.map(p=>p.id===id?next:p); ensureBlankCustomProvider(cfg); await saveConfigObject(cfg); setText('apiStatus_'+id,'muted','正在拉取模型...'); const res=await fetch('/api/provider/models',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id})}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); await reloadConfig(); setText('apiStatus_'+id,'ok','已拉取 '+(data.count || 0)+' 个模型'); }catch(e){ setText('apiStatus_'+id,'err',e.message); } }
-async function fetchOAuthProviderModels(id){ try{ const statusID='publishStatus_'+id; setText(statusID,'muted','正在拉取模型...'); const res=await fetch('/api/provider/models',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id})}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); await reloadConfig(); setText(statusID,'ok','已拉取 '+(data.count || 0)+' 个模型'); }catch(e){ setText('publishStatus_'+id,'err',e.message); } }
+async function fetchOAuthProviderModels(id){ try{ const statusID='publishStatus_'+id; setText(statusID,'muted',id==='cline'?'正在拉取、探测并清理模型...':'正在拉取模型...'); const res=await fetch('/api/provider/models',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id})}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); await reloadConfig(); setText(statusID,data.sync && data.sync.last_error?'err':'ok',data.sync?(data.sync.last_error || data.sync.last_summary):'已拉取 '+(data.count || 0)+' 个模型'); }catch(e){ await reloadConfig(); setText('publishStatus_'+id,'err',e.message); } }
 async function addAPIModel(id){
   try{
     const input=document.getElementById('manualModel_'+id); const model=(input && input.value || '').trim();
@@ -1501,6 +1519,7 @@ async function addAPIModel(id){
       p={...p};
       p.models=unique([...(p.models || []), model]);
       p.enabled_models=unique([...(p.enabled_models || []), model]);
+      if(p.type==='cline') p.cline_model_sync={...(p.cline_model_sync || {}),manual_models:unique([...((p.cline_model_sync || {}).manual_models || []),model])};
       p.provider_specific_data={...(p.provider_specific_data || {}), apiModelsFetched:'true', manualPublishOverride:'true'};
       return p;
     });

@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 type clineCatalogTransport func(*http.Request) (*http.Response, error)
@@ -215,5 +218,123 @@ func TestMergeDefaultConfigMigratesLegacyClineAccount(t *testing.T) {
 	}
 	if _, exists := cline.ModelMultimodal["old-wrong-false"]; exists {
 		t.Fatal("old false capability cache was not invalidated")
+	}
+}
+
+func TestProxyClineNormalizesOnlyWrappedNonStreamingCompletions(t *testing.T) {
+	completion := `{"id":"test","object":"chat.completion","model":"test/model","choices":[{"message":{"content":"OK","reasoning_content":"reason","tool_calls":[{"id":"call_1","type":"function","function":{"name":"test","arguments":"{}"}}]}}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7,"cost":0}}`
+	for _, tc := range []struct {
+		name, body, want string
+		stream           bool
+		status           int
+	}{
+		{"wrapped", `{"data":` + completion + `,"success":true}`, completion, false, 200},
+		{"wrapped without success flag", `{"data":` + completion + `}`, completion, false, 200},
+		{"flat", completion, completion, false, 200},
+		{"stream", "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n", "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n", true, 200},
+		{"error", `{"data":{"error":"rate limit"},"success":false}`, `{"data":{"error":"rate limit"},"success":false}`, false, 429},
+		{"unsuccessful envelope", `{"data":` + completion + `,"success":false}`, `{"data":` + completion + `,"success":false}`, false, 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := ProviderConfig{ID: "cline", Type: "cline", AccessToken: "test-token"}
+			s := &Server{config: Config{Providers: []ProviderConfig{p}}, dataDir: t.TempDir(), client: &http.Client{Transport: clineCatalogTransport(func(r *http.Request) (*http.Response, error) {
+				contentType := "application/json"
+				if tc.stream {
+					contentType = "text/event-stream"
+				}
+				return &http.Response{StatusCode: tc.status, Header: http.Header{"Content-Type": {contentType}, "Content-Length": {strconv.Itoa(len(tc.body))}}, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+			})}}
+			w := httptest.NewRecorder()
+			s.proxyCline(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), p, chatRequest{Stream: tc.stream, Raw: json.RawMessage(`{"model":"cline/test"}`)}, "test/model")
+			if w.Code != tc.status || w.Body.String() != tc.want {
+				t.Fatalf("status=%d body=%s, want status=%d body=%s", w.Code, w.Body.String(), tc.status, tc.want)
+			}
+			if length := w.Header().Get("Content-Length"); length != "" && length != strconv.Itoa(len(tc.want)) {
+				t.Fatalf("stale Content-Length: %s", length)
+			}
+		})
+	}
+}
+
+func TestProxyClineRefreshFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, refreshBody string
+		refreshStatus     int
+		missingRefresh    bool
+		wantStatus        int
+		wantLogin         bool
+	}{
+		{"invalid grant", `{"error":"failed to refresh token: invalid_grant"}`, 400, false, 401, true},
+		{"invalid refresh token", `{"error":"invalid_refresh_token"}`, 400, false, 401, true},
+		{"unauthorized refresh", `{"error":"unauthorized"}`, 401, false, 401, true},
+		{"missing refresh token", "", 0, true, 401, true},
+		{"temporary server error", `{"error":"temporarily unavailable"}`, 503, false, 502, false},
+		{"temporary network error", "", 0, false, 502, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := ProviderConfig{ID: "cline", Type: "cline", ClineAccounts: []ClineAccount{{AccessToken: "expired-one", RefreshToken: "refresh-one"}, {AccessToken: "expired-two", RefreshToken: "refresh-two"}}}
+			if tc.missingRefresh {
+				for i := range p.ClineAccounts {
+					p.ClineAccounts[i].RefreshToken = ""
+				}
+			}
+			var chatCalls int
+			s := &Server{config: Config{Providers: []ProviderConfig{p}}, dataDir: t.TempDir(), client: &http.Client{Transport: clineCatalogTransport(func(r *http.Request) (*http.Response, error) {
+				status, body := http.StatusUnauthorized, `{"error":"unauthorized"}`
+				if r.URL.String() == clineRefreshURL {
+					if tc.refreshStatus == 0 {
+						return nil, io.ErrUnexpectedEOF
+					}
+					status, body = tc.refreshStatus, tc.refreshBody
+				} else {
+					chatCalls++
+				}
+				return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
+			})}}
+			w := httptest.NewRecorder()
+			s.proxyCline(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), p, chatRequest{Raw: json.RawMessage(`{"model":"cline/test"}`)}, "test/model")
+			stored, _ := s.providerByID("cline")
+			if w.Code != tc.wantStatus || (stored.ProviderSpecificData["authStatus"] == "needs_login") != tc.wantLogin || chatCalls != 2 {
+				t.Fatalf("status=%d auth=%q calls=%d", w.Code, stored.ProviderSpecificData["authStatus"], chatCalls)
+			}
+			if tc.wantLogin && formatProbeFailure(w.Code, w.Body.String()) != "登录已失效，请重新登录" {
+				t.Fatalf("probe still hides login failure: %s", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestProxyClineInvalidAccountFallsBackToWorkingAccount(t *testing.T) {
+	p := ProviderConfig{ID: "cline", Type: "cline", ClineAccounts: []ClineAccount{{AccessToken: "expired", RefreshToken: "rejected"}, {AccessToken: "working"}}}
+	s := &Server{config: Config{Providers: []ProviderConfig{p}}, dataDir: t.TempDir(), client: &http.Client{Transport: clineCatalogTransport(func(r *http.Request) (*http.Response, error) {
+		status, body := http.StatusUnauthorized, `{"error":"unauthorized"}`
+		if r.URL.String() == clineRefreshURL {
+			status, body = http.StatusBadRequest, `{"error":"invalid_grant"}`
+		} else if r.Header.Get("Authorization") == "Bearer workos:working" {
+			status, body = http.StatusOK, `{"data":{"choices":[{"message":{"content":"OK"}}]},"success":true}`
+		}
+		return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}}
+	w := httptest.NewRecorder()
+	s.proxyCline(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), p, chatRequest{Raw: json.RawMessage(`{"model":"cline/test"}`)}, "test/model")
+	stored, _ := s.providerByID("cline")
+	if w.Code != http.StatusOK || stored.ActiveClineAccount != 1 || stored.ProviderSpecificData["authStatus"] != "ok" || w.Body.String() != `{"choices":[{"message":{"content":"OK"}}]}` {
+		t.Fatalf("status=%d active=%d auth=%q body=%s", w.Code, stored.ActiveClineAccount, stored.ProviderSpecificData["authStatus"], w.Body.String())
+	}
+}
+
+func TestClineReloginClearsExpiredAuthStatus(t *testing.T) {
+	p := ProviderConfig{ID: "cline", Type: "cline", ClineAccounts: []ClineAccount{{Email: "test@example.com", AccessToken: "old"}}, ProviderSpecificData: map[string]string{"authStatus": "needs_login", "lastAuthError": "expired"}}
+	s := &Server{config: Config{Providers: []ProviderConfig{p}}, dataDir: t.TempDir()}
+	code := base64.StdEncoding.EncodeToString(mustJSON(map[string]any{"accessToken": "new", "refreshToken": "refresh", "email": "test@example.com", "expiresAt": time.Now().Add(time.Hour).Format(time.RFC3339)}))
+	r := httptest.NewRequest(http.MethodGet, "/api/oauth/cline/callback", nil)
+	query := r.URL.Query()
+	query.Set("code", code)
+	r.URL.RawQuery = query.Encode()
+	w := httptest.NewRecorder()
+	s.handleClineCallback(w, r)
+	stored, _ := s.providerByID("cline")
+	if w.Code != http.StatusOK || stored.ProviderSpecificData["authStatus"] != "ok" || stored.ProviderSpecificData["lastAuthError"] != "" || len(stored.ClineAccounts) != 1 || stored.ClineAccounts[0].AccessToken != "new" {
+		t.Fatalf("status=%d auth=%q accounts=%d", w.Code, stored.ProviderSpecificData["authStatus"], len(stored.ClineAccounts))
 	}
 }
