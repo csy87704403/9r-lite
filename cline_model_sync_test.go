@@ -306,6 +306,7 @@ func TestClineModelSyncRejectsStaleConfigSave(t *testing.T) {
 		incoming.ClineModelSync.LastRunAt = timestamp
 		r := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(string(mustJSON(Config{Providers: []ProviderConfig{incoming}}))))
 		r.AddCookie(&http.Cookie{Name: "nr_admin", Value: s.adminCookieValue()})
+		r.Header.Set("If-Match", configVersion(s.currentConfig()))
 		w := httptest.NewRecorder()
 		s.handleConfig(w, r)
 		want := 200

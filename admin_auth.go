@@ -19,15 +19,19 @@ type adminAuthFile struct {
 }
 
 func loadAdminPasswordHash(dataDir string) ([]byte, error) {
-	b, err := os.ReadFile(path.Join(dataDir, adminAuthFileName))
+	var saved adminAuthFile
+	err := loadJSONFile(path.Join(dataDir, adminAuthFileName), func(b []byte) error {
+		saved = adminAuthFile{}
+		if err := json.Unmarshal(b, &saved); err != nil {
+			return err
+		}
+		_, err := bcrypt.Cost([]byte(strings.TrimSpace(saved.PasswordHash)))
+		return err
+	})
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
-	}
-	var saved adminAuthFile
-	if err := json.Unmarshal(b, &saved); err != nil {
 		return nil, err
 	}
 	hash := []byte(strings.TrimSpace(saved.PasswordHash))
@@ -45,7 +49,7 @@ func saveAdminPasswordHash(dataDir string, hash []byte) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path.Join(dataDir, adminAuthFileName), append(b, '\n'), 0600)
+	return saveJSONFile(path.Join(dataDir, adminAuthFileName), append(b, '\n'))
 }
 
 func (s *Server) bootstrapAdminPassword() string {

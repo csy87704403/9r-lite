@@ -77,11 +77,14 @@ type usageResponseWriter struct {
 	failureBody bytes.Buffer
 	pending     []byte
 	usage       tokenUsage
+	inspection  sseInspection
+	readErr     error
 }
 
 type usageClientWriter struct {
-	target http.ResponseWriter
-	status int
+	target     http.ResponseWriter
+	status     int
+	inspection sseInspection
 }
 
 func newUsageStore() UsageStore {
@@ -89,15 +92,19 @@ func newUsageStore() UsageStore {
 }
 
 func loadUsage(dataDir string) (UsageStore, error) {
-	b, err := os.ReadFile(path.Join(dataDir, usageFileName))
+	var store UsageStore
+	err := loadJSONFile(path.Join(dataDir, usageFileName), func(b []byte) error {
+		store = UsageStore{}
+		return json.Unmarshal(b, &store)
+	})
 	if errors.Is(err, os.ErrNotExist) {
 		return newUsageStore(), nil
 	}
 	if err != nil {
-		return UsageStore{}, err
-	}
-	var store UsageStore
-	if err := json.Unmarshal(b, &store); err != nil {
+		if errors.Is(err, errDamagedJSONFile) {
+			log.Printf("usage history damaged; recovery copy retained, starting fresh statistics")
+			return newUsageStore(), nil
+		}
 		return UsageStore{}, err
 	}
 	if store.Groups == nil {
@@ -155,6 +162,14 @@ func (s *Server) beginClientUsage(w http.ResponseWriter, r *http.Request, scope 
 		if status == 0 {
 			status = http.StatusOK
 		}
+		if requestContextCanceled(r.Context()) {
+			status = statusClientClosedRequest
+		} else if strings.Contains(strings.ToLower(tracked.Header().Get("Content-Type")), "text/event-stream") {
+			tracked.inspection.finish()
+			if len(tracked.inspection.failure) > 0 || !tracked.inspection.complete {
+				status = http.StatusBadGateway
+			}
+		}
 		s.recordClientUsage(info, status)
 	}
 }
@@ -171,7 +186,7 @@ func (s *Server) beginUpstreamUsage(w http.ResponseWriter, r *http.Request, p Pr
 		if status == 0 {
 			status = http.StatusOK
 		}
-		if requestContextCanceled(r.Context()) && (status < 200 || status > 299) {
+		if requestContextCanceled(r.Context()) {
 			return
 		}
 		usage := tracked.usage
@@ -186,9 +201,24 @@ func (s *Server) beginUpstreamUsage(w http.ResponseWriter, r *http.Request, p Pr
 		failureReason := ""
 		if status < 200 || status > 299 {
 			failureReason = usageFailureReason(status, responseBody)
+		} else if tracked.readErr != nil {
+			usageStatus = http.StatusBadGateway
+			failureReason = "upstream response interrupted"
+		} else if !stream && len(responseBody) < 8<<20 && !json.Valid(responseBody) {
+			usageStatus = http.StatusBadGateway
+			failureReason = "upstream returned incomplete or invalid JSON"
 		} else if !stream && probeResponseHasExplicitError(responseBody) {
 			usageStatus = http.StatusBadGateway
 			failureReason = usageFailureReason(status, responseBody)
+		} else if stream && strings.Contains(strings.ToLower(tracked.Header().Get("Content-Type")), "text/event-stream") {
+			tracked.inspection.finish()
+			if len(tracked.inspection.failure) == 0 && (!tracked.inspection.complete || !tracked.inspection.output) {
+				tracked.inspection.fail("upstream stream ended without a complete model response")
+			}
+			if len(tracked.inspection.failure) > 0 {
+				usageStatus = http.StatusBadGateway
+				failureReason = usageFailureReason(status, tracked.inspection.failure)
+			}
 		}
 		s.recordUpstreamUsage(*info, p, model, usageStatus, usage, failureReason, status)
 	}
@@ -207,6 +237,9 @@ func (w *usageClientWriter) WriteHeader(status int) {
 func (w *usageClientWriter) Write(body []byte) (int, error) {
 	if w.status == 0 {
 		w.status = http.StatusOK
+	}
+	if strings.Contains(strings.ToLower(w.Header().Get("Content-Type")), "text/event-stream") {
+		w.inspection.feed(body)
 	}
 	return w.target.Write(body)
 }
@@ -232,6 +265,9 @@ func (w *usageResponseWriter) Write(body []byte) (int, error) {
 		w.status = http.StatusOK
 	}
 	if w.stream {
+		if strings.Contains(strings.ToLower(w.Header().Get("Content-Type")), "text/event-stream") {
+			w.inspection.feed(body)
+		}
 		if (w.status < 200 || w.status > 299) && w.failureBody.Len() < 64<<10 {
 			remaining := 64<<10 - w.failureBody.Len()
 			_, _ = w.failureBody.Write(body[:min(len(body), remaining)])
@@ -481,7 +517,7 @@ func (s *Server) saveUsage() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path.Join(s.dataDir, usageFileName), append(b, '\n'), 0600)
+	return saveJSONFile(path.Join(s.dataDir, usageFileName), append(b, '\n'))
 }
 
 func (s *Server) usageSnapshot() UsageStore {

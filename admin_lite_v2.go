@@ -1,9 +1,15 @@
 package main
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+)
 
 func adminHTMLLiteV2(configJSON string) string {
 	escaped := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(configJSON)
+	var cfg Config
+	_ = json.Unmarshal([]byte(configJSON), &cfg)
+	revisionJSON, _ := json.Marshal(configVersion(cfg))
 	return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -299,6 +305,7 @@ details{margin-top:22px}
 </div>
 
 <script>
+let configRevision=` + string(revisionJSON) + `;
 const fixedAPIProviderIDs=['glm','groq','deepseek','mimo'];
 const publishProviderIDs=['oc','mmf','qoder','kilo','cline'];
 const statusProviderIDs=['oc','mmf','qoder','kilo','cline','glm','groq','deepseek','mimo'];
@@ -313,7 +320,7 @@ let selectedAutoModelID='auto';
 let autoConfigSaveChain=Promise.resolve();
 let autoConfigSaveRevision=0;
 let usageLogItems=[];
-function parseConfig(){ try { return JSON.parse(document.getElementById('cfg').value); } catch { return null; } }
+function parseConfig(){ try { const cfg=JSON.parse(document.getElementById('cfg').value); Object.defineProperty(cfg,'_configRevision',{value:configRevision}); return cfg; } catch { return null; } }
 function showMainTab(name){
   ['api','oauth','auto','groups','usage'].forEach(id=>{
     const panel=document.getElementById('panel_'+id); if(panel) panel.classList.toggle('active',id===name);
@@ -728,7 +735,7 @@ function persistAutoConfig(){
   const snapshot=parseConfig(); if(!snapshot) return Promise.resolve();
   const revision=++autoConfigSaveRevision;
   setText('autoModelStatus','muted','正在自动保存...');
-  autoConfigSaveChain=autoConfigSaveChain.catch(()=>{}).then(()=>saveConfigObject(snapshot)).then(()=>{
+  autoConfigSaveChain=autoConfigSaveChain.catch(()=>{}).then(()=>saveConfigObject(parseConfig())).then(()=>{
     if(revision===autoConfigSaveRevision) setText('autoModelStatus','ok','已自动保存');
   }).catch(error=>{
     if(revision===autoConfigSaveRevision) setText('autoModelStatus','err','自动保存失败：'+error.message);
@@ -1271,7 +1278,7 @@ async function saveClineModelSync(id){
     await reloadConfig(); setText('clineSyncStatus_'+id,'ok','自动更新设置已保存');
   }catch(e){ setText('clineSyncStatus_'+id,'err',e.message); }
 }
-async function reloadConfig(){ const res=await fetch('/api/config'); const cfg=await res.json(); setConfig(cfg); renderProviderStatus(); renderAPIProviders(); renderPublishProviders(); }
+async function reloadConfig(){ const res=await fetch('/api/config'); const cfg=await res.json(); if(!res.ok) throw new Error(cfg.error || res.statusText); configRevision=res.headers.get('ETag') || ''; setConfig(cfg); renderProviderStatus(); renderAPIProviders(); renderPublishProviders(); }
 function buildAPIProvider(id){
   const cfg=parseConfig(); if(!cfg || !Array.isArray(cfg.providers)) throw new Error('config is invalid');
   const prev=cfg.providers.find(x=>x.id===id); if(!prev) throw new Error('provider not found: '+id);
@@ -1331,7 +1338,16 @@ function removeProviderRouteRefs(cfg,p){
   syncLegacyAutoConfig(cfg);
   (cfg.model_groups || []).forEach(group=>{ group.models=(group.models || []).filter(keep); });
 }
-async function saveConfigObject(cfg){ const res=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(cfg)}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); return data; }
+async function saveConfigObject(cfg,options){
+  if(!cfg) throw new Error('config is invalid');
+  const expected=cfg._configRevision || configRevision;
+  const headers={'content-type':'application/json','If-Match':expected};
+  if(options && options.importConfig) headers['X-9Router-Config-Import']='true';
+  const res=await fetch('/api/config',{method:'POST',headers,body:JSON.stringify(cfg)});
+  const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText);
+  if(configRevision===expected || (options && options.importConfig)) configRevision=res.headers.get('ETag') || '';
+  return data;
+}
 async function loadImportConfigFile(){
   const input=document.getElementById('importConfigFile');
   const file=input && input.files && input.files[0];
@@ -1364,7 +1380,7 @@ async function importConfigJSON(){
     const cfg=parseImportConfig();
     if(!confirm('导入会覆盖当前服务器的 data/config.json，确定继续？')) return;
     ensureBlankCustomProvider(cfg);
-    await saveConfigObject(cfg);
+    await saveConfigObject(cfg,{importConfig:true});
     setText('importConfigStatus','ok','已导入，正在刷新...');
     try{
       await reloadConfig();
@@ -1723,7 +1739,7 @@ async function deleteProviderModel(button){
     setText(statusID,'err',e.message);
   }
 }
-async function save(){ try{ const body=JSON.parse(document.getElementById('cfg').value); applyGatewaySettings(body); ensureBlankCustomProvider(body); const res=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); const data=await res.json(); if(!res.ok) throw new Error(data.error || res.statusText); setText('status','ok','已保存'); renderProviderStatus(); renderAPIProviders(); renderPublishProviders(); }catch(e){ setText('status','err',e.message); } }
+async function save(){ try{ const body=parseConfig(); if(!body) throw new Error('config is invalid'); applyGatewaySettings(body); ensureBlankCustomProvider(body); await saveConfigObject(body); setText('status','ok','已保存'); renderProviderStatus(); renderAPIProviders(); renderPublishProviders(); }catch(e){ setText('status','err',e.message); } }
 async function startQoder(){ try{ const data=await (await fetch('/api/oauth/qoder/device-code')).json(); localStorage.setItem('qoder_flow', JSON.stringify(data)); window.open(data.verification_uri_complete, '_blank', 'noopener,noreferrer'); setText('qoderStatus','ok','已打开 Qoder 登录页，完成登录后点击轮询令牌。'); }catch(e){ setText('qoderStatus','err',e.message); } }
 async function pollQoder(){ try{ const flow=JSON.parse(localStorage.getItem('qoder_flow')||'{}'); if(!flow.device_code || !flow.codeVerifier) throw new Error('请先开始 Qoder 登录'); const res=await fetch('/api/oauth/qoder/poll',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({ deviceCode: flow.device_code, codeVerifier: flow.codeVerifier, extraData: {_qoderMachineId: flow._qoderMachineId, _qoderNonce: flow._qoderNonce, _qoderVerifier: flow.codeVerifier} })}); const data=await res.json(); if(data.pending){ setText('qoderStatus','muted','还在等待授权完成...'); return; } if(!res.ok || !data.success) throw new Error(data.errorDescription || data.error || 'poll failed'); localStorage.removeItem('qoder_flow'); await reloadConfig(); setText('qoderStatus','ok','Qoder 已连接。'); }catch(e){ setText('qoderStatus','err',e.message); } }
 async function startKilo(){ try{ const data=await (await fetch('/api/oauth/kilo/device-code')).json(); localStorage.setItem('kilo_flow', JSON.stringify(data)); window.open(data.verification_uri_complete, '_blank', 'noopener,noreferrer'); setText('kiloStatus','ok','已打开 Kilo 登录页，完成登录后点击轮询令牌。'); }catch(e){ setText('kiloStatus','err',e.message); } }

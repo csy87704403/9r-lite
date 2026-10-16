@@ -23,6 +23,10 @@ func openAIChatHasImage(raw []byte) bool {
 }
 
 func openAIChatLatestUserHasImage(raw []byte) bool {
+	return latestUserTurnHasImage(raw, false)
+}
+
+func latestUserTurnHasImage(raw []byte, anthropic bool) bool {
 	var request struct {
 		Messages []struct {
 			Role    string `json:"role"`
@@ -32,12 +36,15 @@ func openAIChatLatestUserHasImage(raw []byte) bool {
 	if json.Unmarshal(raw, &request) != nil {
 		return false
 	}
+	hasImage := false
 	for i := len(request.Messages) - 1; i >= 0; i-- {
-		if strings.EqualFold(strings.TrimSpace(request.Messages[i].Role), "user") {
-			return messageContentHasImage(request.Messages[i].Content, false)
+		message := request.Messages[i]
+		hasImage = hasImage || messageContentHasImage(message.Content, anthropic)
+		if strings.EqualFold(strings.TrimSpace(message.Role), "user") && (!anthropic || !anthropicToolResultOnlyContent(message.Content)) {
+			break
 		}
 	}
-	return false
+	return hasImage
 }
 
 func stripOpenAIHistoricalImages(raw []byte) ([]byte, error) {
@@ -52,25 +59,9 @@ func stripOpenAIHistoricalImages(raw []byte) ([]byte, error) {
 		if !ok {
 			continue
 		}
-		parts, ok := message["content"].([]any)
-		if !ok {
-			continue
-		}
-		kept := make([]any, 0, len(parts))
-		for _, partValue := range parts {
-			part, _ := partValue.(map[string]any)
-			partType := strings.ToLower(strings.TrimSpace(anyString(part["type"])))
-			if partType == "image_url" || partType == "input_image" {
-				changed = true
-				continue
-			}
-			kept = append(kept, partValue)
-		}
-		if len(kept) == 0 {
-			message["content"] = "[Historical image omitted; refer to the prior assistant response.]"
-		} else {
-			message["content"] = kept
-		}
+		content, stripped := stripMessageContentImages(message["content"], false)
+		message["content"] = content
+		changed = changed || stripped
 	}
 	if !changed {
 		return raw, nil
@@ -96,21 +87,7 @@ func anthropicMessagesHaveImage(raw []byte) bool {
 }
 
 func anthropicMessagesLatestUserHasImage(raw []byte) bool {
-	var request struct {
-		Messages []struct {
-			Role    string `json:"role"`
-			Content any    `json:"content"`
-		} `json:"messages"`
-	}
-	if json.Unmarshal(raw, &request) != nil {
-		return false
-	}
-	for i := len(request.Messages) - 1; i >= 0; i-- {
-		if strings.EqualFold(strings.TrimSpace(request.Messages[i].Role), "user") {
-			return messageContentHasImage(request.Messages[i].Content, true)
-		}
-	}
-	return false
+	return latestUserTurnHasImage(raw, true)
 }
 
 func stripAnthropicHistoricalImages(raw []byte) ([]byte, error) {
@@ -125,25 +102,9 @@ func stripAnthropicHistoricalImages(raw []byte) ([]byte, error) {
 		if !ok {
 			continue
 		}
-		parts, ok := message["content"].([]any)
-		if !ok {
-			continue
-		}
-		kept := make([]any, 0, len(parts))
-		for _, partValue := range parts {
-			part := anyMap(partValue)
-			partType := strings.ToLower(strings.TrimSpace(anyString(part["type"])))
-			if partType == "image" || partType == "image_url" {
-				changed = true
-				continue
-			}
-			kept = append(kept, partValue)
-		}
-		if len(kept) == 0 {
-			message["content"] = "[Historical image omitted; refer to the prior assistant response.]"
-		} else {
-			message["content"] = kept
-		}
+		content, stripped := stripMessageContentImages(message["content"], true)
+		message["content"] = content
+		changed = changed || stripped
 	}
 	if !changed {
 		return raw, nil
@@ -159,6 +120,9 @@ func messageContentHasImage(content any, anthropic bool) bool {
 			if partType == "image" || partType == "image_url" {
 				return true
 			}
+			if partType == "tool_result" && messageContentHasImage(part["content"], true) {
+				return true
+			}
 			continue
 		}
 		if partType == "image_url" || partType == "input_image" {
@@ -166,4 +130,49 @@ func messageContentHasImage(content any, anthropic bool) bool {
 		}
 	}
 	return false
+}
+
+func anthropicToolResultOnlyContent(content any) bool {
+	parts, ok := content.([]any)
+	if !ok || len(parts) == 0 {
+		return false
+	}
+	for _, value := range parts {
+		if !strings.EqualFold(strings.TrimSpace(anyString(anyMap(value)["type"])), "tool_result") {
+			return false
+		}
+	}
+	return true
+}
+
+func stripMessageContentImages(content any, anthropic bool) (any, bool) {
+	parts, ok := content.([]any)
+	if !ok {
+		return content, false
+	}
+	kept := make([]any, 0, len(parts))
+	changed := false
+	for _, value := range parts {
+		part := anyMap(value)
+		partType := strings.ToLower(strings.TrimSpace(anyString(part["type"])))
+		if partType == "image_url" || (!anthropic && partType == "input_image") || (anthropic && partType == "image") {
+			changed = true
+			continue
+		}
+		if anthropic && partType == "tool_result" {
+			stripped, nestedChanged := stripMessageContentImages(part["content"], true)
+			if nestedChanged {
+				part["content"] = stripped
+				changed = true
+			}
+		}
+		kept = append(kept, value)
+	}
+	if !changed {
+		return content, false
+	}
+	if len(kept) == 0 {
+		return "[Historical image omitted; refer to the prior assistant response.]", true
+	}
+	return kept, true
 }

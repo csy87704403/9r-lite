@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,6 +25,12 @@ const (
 const clineRecommendedModelsURL = "https://api.cline.bot/api/v1/ai/cline/recommended-models"
 
 var errClineLoginRequired = errors.New("Cline 登录已失效，请重新登录")
+
+type clineRefreshCall struct {
+	done    chan struct{}
+	err     error
+	account ClineAccount
+}
 
 func fetchClineFreeModels(ctx context.Context, client *http.Client) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -164,8 +171,11 @@ func (s *Server) handleClineAuthorize(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	redirectURI := publicURL(r, "/api/oauth/cline/callback")
+	state, redirectURI := s.beginClineLogin(r)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	params := url.Values{}
+	params.Set("state", state)
 	params.Set("client_type", "extension")
 	params.Set("callback_url", redirectURI)
 	params.Set("redirect_uri", redirectURI)
@@ -176,6 +186,11 @@ func (s *Server) handleClineAuthorize(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleClineCallback(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	if !s.requireAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -185,19 +200,16 @@ func (s *Server) handleClineCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing code", http.StatusBadRequest)
 		return
 	}
-	redirectURI := publicURL(r, "/api/oauth/cline/callback")
+	redirectURI, err := s.consumeClineLogin(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
 	tokens, err := s.exchangeClineToken(r, code, redirectURI)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	p, _ := s.providerByID("cline")
-	if p.ID == "" {
-		p = ProviderConfig{ID: "cline", Name: "Cline OAuth", Type: "cline", BaseURL: clineChatURL}
-	}
-	p.Type = "cline"
-	p.Enabled = true
-	p.BaseURL = firstNonEmpty(p.BaseURL, clineChatURL)
 	account := ClineAccount{
 		AccessToken:  firstNonEmpty(stringValue(tokens["access_token"]), stringValue(tokens["accessToken"])),
 		RefreshToken: firstNonEmpty(stringValue(tokens["refresh_token"]), stringValue(tokens["refreshToken"])),
@@ -207,11 +219,6 @@ func (s *Server) handleClineCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cline token exchange returned no access token", http.StatusBadGateway)
 		return
 	}
-	if p.ProviderSpecificData == nil {
-		p.ProviderSpecificData = map[string]string{}
-	}
-	p.ProviderSpecificData["firstName"] = stringValue(tokens["firstName"])
-	p.ProviderSpecificData["lastName"] = stringValue(tokens["lastName"])
 	if expiresAt := firstNonEmpty(stringValue(tokens["expires_at"]), stringValue(tokens["expiresAt"])); expiresAt != "" {
 		if t, err := time.Parse(time.RFC3339, expiresAt); err == nil {
 			account.ExpiresIn = int64(time.Until(t).Seconds())
@@ -220,28 +227,47 @@ func (s *Server) handleClineCallback(w http.ResponseWriter, r *http.Request) {
 	if account.ExpiresIn <= 0 {
 		account.ExpiresIn = 3600
 	}
-	p, _ = upsertClineAccount(p, account)
-	p.ProviderSpecificData["authStatus"] = "ok"
-	delete(p.ProviderSpecificData, "lastAuthError")
-	if len(p.Models) == 0 && (p.ClineModelSync == nil || p.ClineModelSync.LastRunAt == 0) {
-		p.Models = []string{
-			"anthropic/claude-opus-4.7",
-			"anthropic/claude-sonnet-4.6",
-			"anthropic/claude-opus-4.6",
-			"openai/gpt-5.3-codex",
-			"openai/gpt-5.4",
-			"google/gemini-3.1-pro-preview",
-			"google/gemini-3.1-flash-lite-preview",
-			"kwaipilot/kat-coder-pro",
-		}
-	}
-	if err := s.updateProvider(p); err != nil {
+	p, err := s.saveClineLogin(account, tokens)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	message := fmt.Sprintf("Cline connected: %s. %d account(s) saved.", htmlEscape(account.Email), len(p.ClineAccounts))
 	_, _ = w.Write([]byte("<!doctype html><meta charset=\"utf-8\"><title>Cline Connected</title><p>" + message + "</p><script>setTimeout(()=>window.close(),1200)</script>"))
+}
+
+func (s *Server) saveClineLogin(account ClineAccount, tokens map[string]any) (ProviderConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	index := -1
+	p := ProviderConfig{ID: "cline", Name: "Cline OAuth", Type: "cline", BaseURL: clineChatURL}
+	for i, stored := range s.config.Providers {
+		if stored.ID == "cline" {
+			index, p = i, cloneProviderConfig(stored)
+			break
+		}
+	}
+	p.Type, p.Enabled = "cline", true
+	p.BaseURL = firstNonEmpty(p.BaseURL, clineChatURL)
+	p, _ = upsertClineAccount(p, account)
+	if p.ProviderSpecificData == nil {
+		p.ProviderSpecificData = map[string]string{}
+	}
+	p.ProviderSpecificData["firstName"] = stringValue(tokens["firstName"])
+	p.ProviderSpecificData["lastName"] = stringValue(tokens["lastName"])
+	p.ProviderSpecificData["authStatus"] = "ok"
+	delete(p.ProviderSpecificData, "lastAuthError")
+	if len(p.Models) == 0 && (p.ClineModelSync == nil || p.ClineModelSync.LastRunAt == 0) {
+		p.Models = []string{"anthropic/claude-opus-4.7", "anthropic/claude-sonnet-4.6", "anthropic/claude-opus-4.6", "openai/gpt-5.3-codex", "openai/gpt-5.4", "google/gemini-3.1-pro-preview", "google/gemini-3.1-flash-lite-preview", "kwaipilot/kat-coder-pro"}
+	}
+	if index < 0 {
+		s.config.Providers = append(s.config.Providers, p)
+	} else {
+		s.config.Providers[index] = p
+	}
+	pruneAutoModelsForProviderLocked(&s.config, p)
+	return cloneProviderConfig(p), saveConfig(s.dataDir, s.config)
 }
 
 func (s *Server) exchangeClineToken(r *http.Request, code, redirectURI string) (map[string]any, error) {
@@ -359,12 +385,17 @@ func (s *Server) proxyCline(w http.ResponseWriter, r *http.Request, p ProviderCo
 }
 
 func (s *Server) doClineRequest(ctx context.Context, p ProviderConfig, stream bool, body []byte, allowRefresh bool) (*http.Response, ProviderConfig, error) {
+	if latest, ok := s.providerByID(p.ID); ok {
+		p = latest
+	}
 	order := clineAccountOrder(p)
 	if len(order) == 0 {
 		return nil, p, errors.New("Cline has no logged-in accounts")
 	}
+	// Keep the account identities stable while other requests change the active slot.
+	attempts := p
 	for position, accountIndex := range order {
-		resp, updated, authFailure, err := s.doClineAccountRequest(ctx, p, accountIndex, stream, body, allowRefresh)
+		resp, updated, authFailure, err := s.doClineAccountRequest(ctx, attempts, accountIndex, stream, body, allowRefresh)
 		p = updated
 		if err != nil {
 			if authFailure && position < len(order)-1 {
@@ -373,7 +404,7 @@ func (s *Server) doClineRequest(ctx context.Context, p ProviderConfig, stream bo
 			return nil, p, err
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
-			p = s.activateClineAccount(p, accountIndex)
+			p = s.activateClineAccount(attempts, accountIndex)
 			return resp, p, nil
 		}
 		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
@@ -393,6 +424,10 @@ func (s *Server) doClineRequest(ctx context.Context, p ProviderConfig, stream bo
 }
 
 func (s *Server) doClineAccountRequest(ctx context.Context, p ProviderConfig, accountIndex int, stream bool, body []byte, allowRefresh bool) (*http.Response, ProviderConfig, bool, error) {
+	p, accountIndex, err := s.latestClineAccount(p, accountIndex)
+	if err != nil {
+		return nil, p, true, err
+	}
 	accounts := clineProviderAccounts(p)
 	if accountIndex < 0 || accountIndex >= len(accounts) {
 		return nil, p, true, errors.New("Cline account index is invalid")
@@ -431,7 +466,8 @@ func (s *Server) doClineAccountRequest(ctx context.Context, p ProviderConfig, ac
 		if rerr != nil {
 			return nil, p, true, rerr
 		}
-		return s.doClineAccountRequest(ctx, refreshed, accountIndex, stream, body, false)
+		refreshedIndex := findClineAccount(clineProviderAccounts(refreshed), account, accountIndex)
+		return s.doClineAccountRequest(ctx, refreshed, refreshedIndex, stream, body, false)
 	}
 	return resp, p, resp.StatusCode == http.StatusUnauthorized, nil
 }
@@ -441,14 +477,55 @@ func (s *Server) activateClineAccount(p ProviderConfig, accountIndex int) Provid
 	if accountIndex < 0 || accountIndex >= len(accounts) {
 		return p
 	}
-	changed := p.ActiveClineAccount != accountIndex || len(p.ClineAccounts) != len(accounts)
-	p.ClineAccounts = accounts
-	p.ActiveClineAccount = accountIndex
-	syncClineLegacyAccount(&p)
-	if changed {
-		_ = s.updateProvider(p)
+	selected := accounts[accountIndex]
+	updated, err := s.mutateProvider(p.ID, func(latest *ProviderConfig) error {
+		index := findClineAccount(clineProviderAccounts(*latest), selected, accountIndex)
+		if index < 0 {
+			return errors.New("Cline account was removed")
+		}
+		latest.ActiveClineAccount = index
+		syncClineLegacyAccount(latest)
+		return nil
+	})
+	if err != nil {
+		return p
 	}
-	return p
+	return updated
+}
+
+func findClineAccount(accounts []ClineAccount, wanted ClineAccount, fallback int) int {
+	for i, account := range accounts {
+		if wanted.Email != "" && strings.EqualFold(account.Email, wanted.Email) {
+			return i
+		}
+		if wanted.Email == "" && ((wanted.RefreshToken != "" && account.RefreshToken == wanted.RefreshToken) || (wanted.AccessToken != "" && account.AccessToken == wanted.AccessToken)) {
+			return i
+		}
+	}
+	// Legacy imports may have no email; their stable array slot is the identity.
+	if wanted.Email == "" && fallback >= 0 && fallback < len(accounts) && accounts[fallback].Email == "" {
+		return fallback
+	}
+	return -1
+}
+
+func (s *Server) latestClineAccount(p ProviderConfig, accountIndex int) (ProviderConfig, int, error) {
+	accounts := clineProviderAccounts(p)
+	if accountIndex < 0 || accountIndex >= len(accounts) {
+		return p, accountIndex, errors.New("Cline account index is invalid")
+	}
+	latest, exists := s.providerByID(p.ID)
+	if !exists {
+		if p.ID == "" { // Standalone, unpersisted provider used by protocol helpers.
+			return p, accountIndex, nil
+		}
+		return p, accountIndex, errors.New("Cline provider was removed")
+	}
+	index := findClineAccount(clineProviderAccounts(latest), accounts[accountIndex], accountIndex)
+	if index < 0 {
+		return latest, accountIndex, errors.New("Cline account was removed")
+	}
+	return latest, index, nil
 }
 
 func (s *Server) refreshClineProvider(ctx context.Context, p ProviderConfig) (ProviderConfig, error) {
@@ -469,6 +546,69 @@ func (s *Server) refreshClineAccount(ctx context.Context, p ProviderConfig, acco
 		return p, errors.New("Cline account index is invalid")
 	}
 	account := accounts[accountIndex]
+	identity := strings.ToLower(account.Email)
+	if identity == "" {
+		identity = "slot:" + strconv.Itoa(accountIndex)
+	}
+	key := p.ID + "|" + identity
+	s.clineRefreshMu.Lock()
+	if call := s.clineRefreshes[key]; call != nil {
+		s.clineRefreshMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return p, ctx.Err()
+		case <-call.done:
+		}
+		latest, index, err := s.latestClineAccount(p, accountIndex)
+		if err != nil {
+			return latest, err
+		}
+		current := clineProviderAccounts(latest)[index]
+		if current.AccessToken != account.AccessToken || current.RefreshToken != account.RefreshToken {
+			return latest, nil
+		}
+		if call.err == nil && (call.account.AccessToken != account.AccessToken || call.account.RefreshToken != account.RefreshToken) {
+			return s.refreshClineAccount(ctx, latest, index)
+		}
+		if call.err != nil && ctx.Err() == nil && (errors.Is(call.err, context.Canceled) || errors.Is(call.err, context.DeadlineExceeded)) {
+			return s.refreshClineAccount(ctx, p, accountIndex)
+		}
+		return latest, call.err
+	}
+	if s.clineRefreshes == nil {
+		s.clineRefreshes = map[string]*clineRefreshCall{}
+	}
+	call := &clineRefreshCall{done: make(chan struct{}), account: account}
+	s.clineRefreshes[key] = call
+	s.clineRefreshMu.Unlock()
+	updated, err := s.refreshClineAccountOnce(ctx, p, accountIndex)
+	if err != nil {
+		if latest, index, latestErr := s.latestClineAccount(p, accountIndex); latestErr == nil {
+			current := clineProviderAccounts(latest)[index]
+			if current.AccessToken != account.AccessToken || current.RefreshToken != account.RefreshToken {
+				updated, err = latest, nil
+			}
+		}
+	}
+	s.clineRefreshMu.Lock()
+	call.err = err
+	delete(s.clineRefreshes, key)
+	close(call.done)
+	s.clineRefreshMu.Unlock()
+	return updated, err
+}
+
+func (s *Server) refreshClineAccountOnce(ctx context.Context, p ProviderConfig, accountIndex int) (ProviderConfig, error) {
+	original := clineProviderAccounts(p)[accountIndex]
+	latest, index, err := s.latestClineAccount(p, accountIndex)
+	if err != nil {
+		return p, err
+	}
+	p, accountIndex = latest, index
+	account := clineProviderAccounts(p)[accountIndex]
+	if account.AccessToken != original.AccessToken || account.RefreshToken != original.RefreshToken {
+		return p, nil // A queued request already refreshed this exact account.
+	}
 	if strings.TrimSpace(account.RefreshToken) == "" {
 		return p, fmt.Errorf("%w: refresh token is empty", errClineLoginRequired)
 	}
@@ -520,18 +660,26 @@ func (s *Server) refreshClineAccount(ctx context.Context, p ProviderConfig, acco
 	if account.ExpiresIn <= 0 {
 		account.ExpiresIn = 3600
 	}
-	accounts[accountIndex] = account
-	p.ClineAccounts = accounts
-	syncClineLegacyAccount(&p)
-	if p.ProviderSpecificData == nil {
-		p.ProviderSpecificData = map[string]string{}
-	}
-	p.ProviderSpecificData["authStatus"] = "ok"
-	delete(p.ProviderSpecificData, "lastAuthError")
-	if err := s.updateProvider(p); err != nil {
-		return p, err
-	}
-	return p, nil
+	return s.mutateProvider(p.ID, func(current *ProviderConfig) error {
+		accounts := clineProviderAccounts(*current)
+		index := findClineAccount(accounts, original, accountIndex)
+		if index < 0 {
+			return errors.New("Cline account was removed during refresh")
+		}
+		// A new OAuth login must win over an older in-flight refresh response.
+		if accounts[index].AccessToken != original.AccessToken || accounts[index].RefreshToken != original.RefreshToken {
+			return nil
+		}
+		accounts[index] = account
+		current.ClineAccounts = accounts
+		syncClineLegacyAccount(current)
+		if current.ProviderSpecificData == nil {
+			current.ProviderSpecificData = map[string]string{}
+		}
+		current.ProviderSpecificData["authStatus"] = "ok"
+		delete(current.ProviderSpecificData, "lastAuthError")
+		return nil
+	})
 }
 
 func decodeClineEmbeddedToken(code string) (map[string]any, error) {

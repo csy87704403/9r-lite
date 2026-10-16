@@ -360,15 +360,18 @@ func responsesStreamToChat(w http.ResponseWriter, r io.Reader, model string) {
 			roleSent = true
 		}
 	}
-	_ = scanSSE(r, func(event string, data []byte) error {
+	scanErr := scanSSE(r, func(event string, data []byte) error {
 		if string(data) == "[DONE]" {
-			return nil
+			return io.EOF
 		}
 		var payload map[string]any
 		if err := json.Unmarshal(data, &payload); err != nil {
-			return nil
+			return err
 		}
 		eventType := firstNonEmpty(anyString(payload["type"]), event)
+		if payload["error"] != nil {
+			eventType = "error"
+		}
 		switch eventType {
 		case "response.created", "response.in_progress":
 			response := anyMap(payload["response"])
@@ -412,35 +415,40 @@ func responsesStreamToChat(w http.ResponseWriter, r io.Reader, model string) {
 			emit(map[string]any{"tool_calls": []any{map[string]any{
 				"index": toolIndex, "function": map[string]any{"arguments": anyString(payload["delta"])},
 			}}}, nil, nil)
-		case "response.completed":
+		case "response.completed", "response.incomplete":
 			ensureRole()
 			response := anyMap(payload["response"])
 			finish := "stop"
-			if toolSeen {
-				finish = "tool_calls"
-			} else if anyString(response["status"]) == "incomplete" {
+			if eventType == "response.incomplete" || anyString(response["status"]) == "incomplete" {
 				finish = "length"
+			} else if toolSeen {
+				finish = "tool_calls"
 			}
 			emit(map[string]any{}, finish, responsesUsageToChat(anyMap(response["usage"])))
 			writeSSEDone(w, flusher)
 			completed = true
+			return io.EOF
 		case "response.failed", "error":
-			ensureRole()
-			message := firstNonEmpty(anyString(anyMap(payload["error"])["message"]), "upstream Responses request failed")
-			writeSSEData(w, map[string]any{"error": map[string]any{"message": message, "type": "upstream_error"}}, flusher)
-			writeSSEDone(w, flusher)
+			failure := anyMap(payload["error"])
+			if len(failure) == 0 {
+				failure = anyMap(anyMap(payload["response"])["error"])
+			}
+			if len(failure) == 0 {
+				failure = map[string]any{"message": "upstream Responses request failed", "type": "upstream_error"}
+			}
+			writeSSEData(w, map[string]any{"error": failure}, flusher)
 			completed = true
+			return io.EOF
 		}
 		return nil
 	})
 	if !completed {
-		ensureRole()
-		finish := "stop"
-		if toolSeen {
-			finish = "tool_calls"
+		if scanErr == nil {
+			scanErr = errors.New("Responses stream ended before response.completed")
 		}
-		emit(map[string]any{}, finish, nil)
-		writeSSEDone(w, flusher)
+		var failure map[string]any
+		_ = json.Unmarshal(incompleteStreamError(scanErr), &failure)
+		writeSSEData(w, failure, flusher)
 	}
 }
 

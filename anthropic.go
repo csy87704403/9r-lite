@@ -147,9 +147,10 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		sessionKey, clientLabel := autoSessionIdentityForModel(r, scope, raw, requestedModel)
+		requestStarted := time.Now()
+		ticket := s.beginAutoAgentRequest(sessionKey)
 		latestHasImage := anthropicMessagesLatestUserHasImage(raw)
-		anyImage := anthropicMessagesHaveImage(raw)
-		visionMode, _ := s.autoSessionRequestMode(sessionKey, latestHasImage, anyImage)
+		visionMode, _ := s.autoSessionRequestModeForTicket(sessionKey, raw, true, ticket)
 		if !visionMode {
 			raw, err = stripAnthropicHistoricalImages(raw)
 			if err != nil {
@@ -158,7 +159,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			}
 		}
 		candidates := s.autoChatCandidatesForModel(r.Context(), requestedModel, visionMode)
-		candidates = s.orderAutoCandidatesForAgent(sessionKey, candidates, visionMode)
+		candidates = s.orderAutoCandidatesForRequest(sessionKey, candidates, visionMode, ticket)
 		if len(candidates) == 0 {
 			message := requestedModel + " model has no available target"
 			if visionMode {
@@ -167,7 +168,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			writeAnthropicError(w, http.StatusServiceUnavailable, message)
 			return
 		}
-		s.proxyAutoAnthropicMessages(w, r, raw, candidates, sessionKey, clientLabel, visionMode, latestHasImage)
+		s.proxyAutoAnthropicMessages(w, r, raw, candidates, sessionKey, clientLabel, visionMode, latestHasImage, ticket, requestStarted)
 		return
 	}
 
@@ -199,7 +200,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	s.proxyOpenAIAsAnthropic(w, r, req, requestedModel)
 }
 
-func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Request, raw []byte, candidates []string, agentKey, clientLabel string, vision, newImage bool) {
+func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Request, raw []byte, candidates []string, agentKey, clientLabel string, vision, newImage bool, ticket uint64, requestStarted time.Time) {
 	var request anthropicRequest
 	_ = json.Unmarshal(raw, &request)
 	var lastFailure *autoRetryWriter
@@ -212,7 +213,7 @@ func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Reque
 			writeAnthropicError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		providerID, model, _ := strings.Cut(candidate, "/")
+		providerID, model := s.autoCandidateIDs(candidate)
 		internal := r.Clone(context.WithValue(r.Context(), internalBypassKey{}, true))
 		internal.Body = io.NopCloser(bytes.NewReader(body))
 		internal.ContentLength = int64(len(body))
@@ -221,33 +222,39 @@ func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Reque
 
 		retryWriter := newAutoRetryWriter(w, !request.Stream)
 		s.handleAnthropicMessages(retryWriter, internal)
-		if retryWriter.committed {
-			s.finishAutoRuntime(candidate, true, retryWriter.status, retryWriter.body.Bytes(), started)
-			s.clearAutoModelFailure(providerID, model)
-			s.commitAutoAgentSuccess(agentKey, candidate, vision, newImage)
-			return
-		}
+		retryWriter.finishResponse()
 		if requestContextCanceled(r.Context()) {
 			s.finishAutoRuntimeCanceled(candidate, started)
-			writeAnthropicError(w, statusClientClosedRequest, "client request canceled")
+			if !retryWriter.committed {
+				writeAnthropicError(w, statusClientClosedRequest, "client request canceled")
+			}
+			return
+		}
+		if retryWriter.committed {
+			if len(retryWriter.stream.failure) > 0 {
+				s.finishAutoRuntime(candidate, false, http.StatusBadGateway, retryWriter.stream.failure, started)
+				s.coolDownAutoFailure(providerID, model, retryWriter.stream.failure)
+				return
+			}
+			s.finishAutoRuntime(candidate, true, retryWriter.status, nil, started)
+			s.commitAutoRequestSuccess(agentKey, candidate, vision, newImage, ticket, requestStarted)
 			return
 		}
 		if retryWriter.status >= 200 && retryWriter.status <= 299 {
 			if probeResponseHasExplicitError(retryWriter.body.Bytes()) {
 				s.finishAutoRuntime(candidate, false, retryWriter.status, retryWriter.body.Bytes(), started)
-				s.markAutoModelFailed(providerID, model)
+				s.coolDownAutoFailure(providerID, model, retryWriter.body.Bytes())
 				lastFailure = retryWriter
 				continue
 			}
 			retryWriter.relay()
 			s.finishAutoRuntime(candidate, true, retryWriter.status, retryWriter.body.Bytes(), started)
-			s.clearAutoModelFailure(providerID, model)
-			s.commitAutoAgentSuccess(agentKey, candidate, vision, newImage)
+			s.commitAutoRequestSuccess(agentKey, candidate, vision, newImage, ticket, requestStarted)
 			return
 		}
 		if isAutoFallbackError(retryWriter.status, retryWriter.body.Bytes()) {
 			s.finishAutoRuntime(candidate, false, retryWriter.status, retryWriter.body.Bytes(), started)
-			s.markAutoModelFailed(providerID, model)
+			s.coolDownAutoFailure(providerID, model, retryWriter.body.Bytes())
 			lastFailure = retryWriter
 			continue
 		}
@@ -295,6 +302,7 @@ func (s *Server) proxyOpenAIAsAnthropic(w http.ResponseWriter, r *http.Request, 
 	}
 
 	pr, pw := io.Pipe()
+	defer pr.Close()
 	bridge := newPipeResponseWriter(pw)
 	go func() {
 		s.handleChatCompletions(bridge, internal)
@@ -547,19 +555,23 @@ func anthropicRequestToOpenAI(raw []byte) ([]byte, error) {
 			messages = append(messages, converted)
 			continue
 		}
-		var userParts []any
+		var userParts, toolImages []any
 		for _, blockValue := range blocks {
 			block := anyMap(blockValue)
 			if anyString(block["type"]) == "tool_result" {
-				if len(userParts) > 0 {
-					messages = append(messages, map[string]any{"role": "user", "content": openAIContentValue(userParts)})
-					userParts = nil
+				text, images := anthropicToolResultContentToOpenAI(block["content"])
+				messages = append(messages, map[string]any{"role": "tool", "tool_call_id": block["tool_use_id"], "content": text})
+				if len(images) > 0 {
+					toolImages = append(toolImages, map[string]any{"type": "text", "text": "Images returned by tool " + anyString(block["tool_use_id"]) + ":"})
+					toolImages = append(toolImages, images...)
 				}
-				messages = append(messages, map[string]any{"role": "tool", "tool_call_id": block["tool_use_id"], "content": contentAsText(block["content"])})
 				continue
 			}
 			userParts = append(userParts, block)
 		}
+		// Tool messages only support text. Attach images after all tool results,
+		// keeping parallel tool_call_id responses together before the user content.
+		userParts = append(toolImages, userParts...)
 		if len(userParts) > 0 {
 			messages = append(messages, map[string]any{"role": "user", "content": openAIContentValue(userParts)})
 		}
@@ -575,6 +587,29 @@ func anthropicRequestToOpenAI(raw []byte) ([]byte, error) {
 		out["stream_options"] = map[string]any{"include_usage": true}
 	}
 	return json.Marshal(out)
+}
+
+func anthropicToolResultContentToOpenAI(content any) (string, []any) {
+	if !messageContentHasImage(content, true) {
+		return contentAsText(content), nil
+	}
+	var texts []string
+	var images []any
+	for _, value := range anySlice(content) {
+		part := anyMap(value)
+		switch anyString(part["type"]) {
+		case "image":
+			images = append(images, anthropicContentToOpenAI([]any{part})...)
+		case "image_url":
+			images = append(images, part)
+		case "text":
+			texts = append(texts, anyString(part["text"]))
+		default:
+			texts = append(texts, contentAsText(value))
+		}
+	}
+	texts = append(texts, "[Images attached in the following user message.]")
+	return strings.Join(texts, "\n"), images
 }
 
 func anthropicResponseToOpenAI(raw []byte, model string) ([]byte, error) {
@@ -650,6 +685,7 @@ func anthropicStreamToOpenAI(w http.ResponseWriter, r io.Reader, model string) {
 	toolCount := 0
 	finished := false
 	doneSent := false
+	failed := false
 	emit := func(delta map[string]any, finish any, usage map[string]any) {
 		chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
 		if usage != nil {
@@ -657,10 +693,33 @@ func anthropicStreamToOpenAI(w http.ResponseWriter, r io.Reader, model string) {
 		}
 		writeSSEData(w, chunk, flusher)
 	}
-	_ = scanSSE(r, func(event string, data []byte) error {
-		var payload map[string]any
-		if len(data) == 0 || json.Unmarshal(data, &payload) != nil {
+	fail := func(detail map[string]any) {
+		if !failed {
+			writeSSEData(w, map[string]any{"error": detail}, flusher)
+			failed = true
+		}
+	}
+	scanErr := scanSSE(r, func(event string, data []byte) error {
+		if failed || doneSent {
+			return io.EOF
+		}
+		if len(data) == 0 {
 			return nil
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(data, &payload); err != nil {
+			if event == "error" {
+				fail(map[string]any{"type": "upstream_error", "message": string(data)})
+				return io.EOF
+			}
+			return fmt.Errorf("invalid Anthropic stream event: %w", err)
+		}
+		if event == "error" || anyString(payload["type"]) == "error" || payload["error"] != nil {
+			fail(anthropicBridgeStreamError(payload, "upstream stream error"))
+			return io.EOF
+		}
+		if event == "" {
+			event = anyString(payload["type"])
 		}
 		switch event {
 		case "message_start":
@@ -697,8 +756,12 @@ func anthropicStreamToOpenAI(w http.ResponseWriter, r io.Reader, model string) {
 			usage := anyMap(payload["usage"])
 			outputTokens = numberValue(usage["output_tokens"])
 			oaiUsage := map[string]any{"prompt_tokens": inputTokens, "completion_tokens": outputTokens, "total_tokens": inputTokens + outputTokens}
-			emit(map[string]any{}, anthropicStopToOpenAI(anyString(delta["stop_reason"])), oaiUsage)
-			finished = true
+			if reason := anyString(delta["stop_reason"]); reason != "" {
+				emit(map[string]any{}, anthropicStopToOpenAI(reason), oaiUsage)
+				finished = true
+			} else {
+				emit(map[string]any{}, nil, oaiUsage)
+			}
 		case "message_stop":
 			if !finished {
 				emit(map[string]any{}, "stop", map[string]any{"prompt_tokens": inputTokens, "completion_tokens": outputTokens, "total_tokens": inputTokens + outputTokens})
@@ -706,11 +769,20 @@ func anthropicStreamToOpenAI(w http.ResponseWriter, r io.Reader, model string) {
 			}
 			writeSSEDone(w, flusher)
 			doneSent = true
+			return io.EOF
 		}
 		return nil
 	})
+	if failed || doneSent {
+		return
+	}
+	if scanErr != nil {
+		fail(map[string]any{"type": "upstream_error", "message": scanErr.Error()})
+		return
+	}
 	if !finished {
-		emit(map[string]any{}, "stop", map[string]any{"prompt_tokens": inputTokens, "completion_tokens": outputTokens, "total_tokens": inputTokens + outputTokens})
+		fail(map[string]any{"type": "upstream_error", "message": "upstream stream ended before completion"})
+		return
 	}
 	if !doneSent {
 		writeSSEDone(w, flusher)
@@ -730,6 +802,8 @@ func openAIStreamToAnthropic(w http.ResponseWriter, r io.Reader, model string) {
 	finishReason := "end_turn"
 	inputTokens, outputTokens := 0, 0
 	closed := false
+	completed := false
+	failed := false
 	start := func() {
 		if started {
 			return
@@ -757,14 +831,35 @@ func openAIStreamToAnthropic(w http.ResponseWriter, r io.Reader, model string) {
 		writeAnthropicEvent(w, "message_stop", map[string]any{"type": "message_stop"}, flusher)
 		closed = true
 	}
-	_ = scanSSE(r, func(_ string, data []byte) error {
-		if string(data) == "[DONE]" {
-			finish()
+	fail := func(detail map[string]any) {
+		if !failed {
+			writeAnthropicEvent(w, "error", map[string]any{"type": "error", "error": detail}, flusher)
+			failed = true
+		}
+	}
+	scanErr := scanSSE(r, func(event string, data []byte) error {
+		if failed || closed {
+			return io.EOF
+		}
+		if len(data) == 0 {
 			return nil
 		}
+		if string(data) == "[DONE]" {
+			completed = true
+			finish()
+			return io.EOF
+		}
 		var payload map[string]any
-		if len(data) == 0 || json.Unmarshal(data, &payload) != nil {
-			return nil
+		if err := json.Unmarshal(data, &payload); err != nil {
+			if event == "error" {
+				fail(map[string]any{"type": "api_error", "message": string(data)})
+				return io.EOF
+			}
+			return fmt.Errorf("invalid OpenAI stream event: %w", err)
+		}
+		if event == "error" || anyString(payload["type"]) == "error" || payload["error"] != nil {
+			fail(anthropicBridgeStreamError(payload, "upstream stream error"))
+			return io.EOF
 		}
 		if value := anyString(payload["id"]); value != "" {
 			id = value
@@ -806,10 +901,30 @@ func openAIStreamToAnthropic(w http.ResponseWriter, r io.Reader, model string) {
 		}
 		if reason := anyString(choice["finish_reason"]); reason != "" {
 			finishReason = openAIStopToAnthropic(reason)
+			completed = true
 		}
 		return nil
 	})
+	if failed || closed {
+		return
+	}
+	if scanErr != nil {
+		fail(map[string]any{"type": "api_error", "message": scanErr.Error()})
+		return
+	}
+	if !completed {
+		fail(map[string]any{"type": "api_error", "message": "upstream stream ended before completion"})
+		return
+	}
 	finish()
+}
+
+func anthropicBridgeStreamError(payload map[string]any, fallback string) map[string]any {
+	if detail := anyMap(payload["error"]); len(detail) > 0 {
+		return detail
+	}
+	message := firstNonEmpty(anyString(payload["error"]), anyString(payload["message"]), fallback)
+	return map[string]any{"type": "api_error", "message": message}
 }
 
 type pipeResponseWriter struct {

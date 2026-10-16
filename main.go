@@ -193,6 +193,10 @@ type Server struct {
 	autoFailedModels       map[string]map[string]time.Time
 	autoAgentMu            sync.Mutex
 	autoAgents             map[string]*autoAgentBinding
+	clineRefreshMu         sync.Mutex
+	clineRefreshes         map[string]*clineRefreshCall
+	clineLoginMu           sync.Mutex
+	clineLogins            map[string]clineLoginAttempt
 	autoRuntimeMu          sync.RWMutex
 	autoRuntime            map[string]*autoRuntimeModelStatus
 	probeMu                sync.Mutex
@@ -234,12 +238,16 @@ type mediaRequest struct {
 type internalBypassKey struct{}
 
 type autoRetryWriter struct {
-	target    http.ResponseWriter
-	header    http.Header
-	status    int
-	body      bytes.Buffer
-	committed bool
-	bufferOK  bool
+	target       http.ResponseWriter
+	header       http.Header
+	status       int
+	body         bytes.Buffer
+	committed    bool
+	bufferOK     bool
+	stream       sseInspection
+	writeErr     error
+	readErr      error
+	validateJSON bool
 }
 
 // modelFailureTrackingWriter forwards the upstream response immediately while
@@ -279,7 +287,7 @@ func (w *modelFailureTrackingWriter) Flush() {
 }
 
 func newAutoRetryWriter(target http.ResponseWriter, bufferOK bool) *autoRetryWriter {
-	return &autoRetryWriter{target: target, header: make(http.Header), bufferOK: bufferOK}
+	return &autoRetryWriter{target: target, header: make(http.Header), bufferOK: bufferOK, validateJSON: true}
 }
 
 func (w *autoRetryWriter) Header() http.Header {
@@ -291,19 +299,49 @@ func (w *autoRetryWriter) WriteHeader(status int) {
 		return
 	}
 	w.status = status
-	if status >= http.StatusOK && status <= 299 && !w.bufferOK {
-		copyResponseHeaders(w.target.Header(), w.header)
-		w.target.WriteHeader(status)
-		w.committed = true
-	}
 }
 
 func (w *autoRetryWriter) Write(body []byte) (int, error) {
 	if w.status == 0 {
 		w.WriteHeader(http.StatusOK)
 	}
+	if w.bufferOK || w.status < 200 || w.status > 299 || !strings.Contains(strings.ToLower(w.header.Get("Content-Type")), "text/event-stream") {
+		if w.body.Len()+len(body) > maxBufferedResponseBytes {
+			w.body.Reset()
+			w.status = http.StatusBadGateway
+			w.header.Del("Content-Length")
+			w.header.Set("Content-Type", "application/json; charset=utf-8")
+			_, _ = w.body.Write(mustJSON(map[string]any{"error": errResponseTooLarge.Error()}))
+			return 0, errResponseTooLarge
+		}
+		return w.body.Write(body)
+	}
+	w.stream.feed(body)
+	if w.stream.terminated && !w.stream.output {
+		w.stream.fail("upstream stream completed without model output")
+	}
 	if w.committed {
-		return w.target.Write(body)
+		return w.writeStream(body)
+	}
+	if len(w.stream.failure) > 0 {
+		return len(body), errAutoStreamRejected
+	}
+	if w.stream.output && len(w.stream.failure) == 0 {
+		copyResponseHeaders(w.target.Header(), w.header)
+		w.target.WriteHeader(w.status)
+		w.committed = true
+		if w.body.Len() > 0 {
+			_, w.writeErr = w.target.Write(w.body.Bytes())
+			w.body.Reset()
+		}
+		if w.writeErr != nil {
+			return 0, w.writeErr
+		}
+		return w.writeStream(body)
+	}
+	if w.body.Len()+len(body) > maxSSEPreludeBytes {
+		w.stream.fail("upstream stream prelude exceeded limit")
+		return len(body), errAutoStreamRejected
 	}
 	return w.body.Write(body)
 }
@@ -317,6 +355,9 @@ func (w *autoRetryWriter) Flush() {
 }
 
 func (w *autoRetryWriter) relay() {
+	if w.committed {
+		return
+	}
 	copyResponseHeaders(w.target.Header(), w.header)
 	status := w.status
 	if status == 0 {
@@ -488,16 +529,16 @@ func newHTTPClient(proxyAddress string) (*http.Client, error) {
 
 func loadConfig(dataDir string) (Config, error) {
 	file := path.Join(dataDir, "config.json")
-	b, err := os.ReadFile(file)
+	var cfg Config
+	err := loadJSONFile(file, func(b []byte) error {
+		cfg = Config{}
+		return json.Unmarshal(b, &cfg)
+	})
 	if errors.Is(err, os.ErrNotExist) {
 		cfg := defaultConfig()
 		return cfg, saveConfig(dataDir, cfg)
 	}
 	if err != nil {
-		return Config{}, err
-	}
-	var cfg Config
-	if err := json.Unmarshal(b, &cfg); err != nil {
 		return Config{}, err
 	}
 	if len(cfg.Providers) == 0 {
@@ -514,7 +555,7 @@ func saveConfig(dataDir string, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path.Join(dataDir, "config.json"), append(b, '\n'), 0600)
+	return saveJSONFile(path.Join(dataDir, "config.json"), append(b, '\n'))
 }
 
 func defaultConfig() Config {
@@ -834,7 +875,10 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.currentConfig())
+		cfg := s.currentConfig()
+		w.Header().Set("ETag", configVersion(cfg))
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusOK, cfg)
 	case http.MethodPost:
 		var cfg Config
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&cfg); err != nil {
@@ -850,9 +894,10 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.mu.Lock()
-		if clineModelSyncConfigStale(s.config, cfg) {
+		isImport := r.Header.Get("X-9Router-Config-Import") == "true"
+		if !isImport && (r.Header.Get("If-Match") != configVersion(s.config) || clineModelSyncConfigStale(s.config, cfg)) {
 			s.mu.Unlock()
-			writeJSON(w, http.StatusConflict, map[string]any{"error": "Cline 模型已在后台更新，请刷新页面后重试，避免覆盖最新列表"})
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "配置已在后台更新或页面版本缺失，请刷新页面后重试，避免覆盖最新账号和模型"})
 			return
 		}
 		if err := saveConfig(s.dataDir, cfg); err != nil {
@@ -861,6 +906,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.config = cfg
+		w.Header().Set("ETag", configVersion(cfg))
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	default:
@@ -909,30 +955,58 @@ func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 		return
 	}
-	oldEnabled := append([]string(nil), p.EnabledModels...)
-	manual := providerManualPublishOverride(p)
-	p.Models = uniqueStrings(ids)
-	retainKnownModelMultimodal(&p)
-	if manual {
-		p.EnabledModels = orderedIntersection(p.Models, oldEnabled)
-	} else {
-		p.EnabledModels = append([]string(nil), p.Models...)
-	}
-	p.AvailableModels = nil
-	p.ModelLatencyMS = nil
-	p.ModelErrors = nil
-	p.ModelFailureCounts = nil
-	p.AvailabilityCheckedAt = 0
-	p.FetchModels = true
-	if p.ProviderSpecificData == nil {
-		p.ProviderSpecificData = map[string]string{}
-	}
-	p.ProviderSpecificData["apiModelsFetched"] = "true"
-	if !manual {
-		clearManualPublishOverride(&p)
-	}
-	if err := s.updateProvider(p); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+	before := p
+	p, err = s.mutateProvider(p.ID, func(latest *ProviderConfig) error {
+		if !sameProviderProbeTarget(before, *latest) {
+			return errors.New("provider changed during model fetch; please retry")
+		}
+		beforeModels, currentModels := sliceSet(before.Models), sliceSet(latest.Models)
+		var models []string
+		for _, model := range ids {
+			if !beforeModels[model] || currentModels[model] {
+				models = append(models, model) // Do not restore a model deleted while fetching.
+			}
+		}
+		for _, model := range latest.Models {
+			if !beforeModels[model] {
+				models = append(models, model) // Preserve concurrent manual additions.
+			}
+		}
+		latest.Models = uniqueStrings(models)
+		retainKnownModelMultimodal(latest)
+		if providerManualPublishOverride(*latest) {
+			latest.EnabledModels = orderedIntersection(latest.Models, latest.EnabledModels)
+		} else {
+			latest.EnabledModels = append([]string(nil), latest.Models...)
+		}
+		// Existing measurements belong to unchanged models and remain valid.
+		latest.AvailableModels = orderedIntersection(latest.Models, latest.AvailableModels)
+		latest.QuotaBlockedModels = orderedIntersection(latest.Models, latest.QuotaBlockedModels)
+		retained := sliceSet(latest.Models)
+		for model := range latest.ModelLatencyMS {
+			if !retained[model] {
+				delete(latest.ModelLatencyMS, model)
+			}
+		}
+		for model := range latest.ModelErrors {
+			if !retained[model] {
+				delete(latest.ModelErrors, model)
+			}
+		}
+		for model := range latest.ModelFailureCounts {
+			if !retained[model] {
+				delete(latest.ModelFailureCounts, model)
+			}
+		}
+		latest.FetchModels = true
+		if latest.ProviderSpecificData == nil {
+			latest.ProviderSpecificData = map[string]string{}
+		}
+		latest.ProviderSpecificData["apiModelsFetched"] = "true"
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -978,42 +1052,46 @@ func (s *Server) handleProviderProbe(w http.ResponseWriter, r *http.Request) {
 	}
 	s.clearNegativeModelMultimodal(p.ID, probeModels)
 	available, failures, latencies := s.probeProviderModels(r.Context(), p, probeModels)
-	latest, exists := s.providerByID(p.ID)
-	if !exists {
-		writeJSON(w, http.StatusConflict, map[string]any{"error": "provider was removed during probe"})
-		return
-	}
-	p = latest
-	availableSet := sliceSet(available)
-	knownAvailable := sliceSet(p.AvailableModels)
-	if p.ModelLatencyMS == nil {
-		p.ModelLatencyMS = map[string]int64{}
-	}
-	if p.ModelErrors == nil {
-		p.ModelErrors = map[string]string{}
-	}
-	for _, model := range probeModels {
-		if latency, ok := latencies[model]; ok {
-			p.ModelLatencyMS[model] = latency
+	before := p
+	p, err := s.mutateProvider(p.ID, func(latest *ProviderConfig) error {
+		if r.Context().Err() != nil {
+			return r.Context().Err()
 		}
-		if availableSet[model] {
-			p = setModelQuotaBlocked(p, model, false)
-			knownAvailable[model] = true
-			delete(p.ModelErrors, model)
-			continue
+		if !latest.Enabled || !sameProviderProbeTarget(before, *latest) {
+			return errors.New("provider changed during probe; please retry")
 		}
-		delete(knownAvailable, model)
-		p.ModelErrors[model] = failures[model]
-	}
-	p.AvailableModels = orderedIntersection(p.Models, keysFromSet(knownAvailable))
-	p.AvailabilityCheckedAt = time.Now().Unix()
-	for _, model := range p.AvailableModels {
-		if !modelQuotaBlocked(p, model) {
-			s.clearAutoModelFailure(p.ID, model)
+		availableSet, knownAvailable := sliceSet(available), sliceSet(latest.AvailableModels)
+		if latest.ModelLatencyMS == nil {
+			latest.ModelLatencyMS = map[string]int64{}
 		}
-	}
-	if err := s.updateProvider(p); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		if latest.ModelErrors == nil {
+			latest.ModelErrors = map[string]string{}
+		}
+		currentModels := sliceSet(unlockedModelIDs(chatModelIDs(*latest, latest.Models), latest.LockedModels))
+		for _, model := range probeModels {
+			if !currentModels[model] {
+				continue
+			}
+			if latency, ok := latencies[model]; ok {
+				latest.ModelLatencyMS[model] = latency
+			}
+			if availableSet[model] {
+				*latest = setModelQuotaBlocked(*latest, model, false)
+				knownAvailable[model] = true
+				delete(latest.ModelErrors, model)
+				delete(latest.ModelFailureCounts, model)
+				s.clearAutoModelFailure(latest.ID, model)
+			} else {
+				delete(knownAvailable, model)
+				latest.ModelErrors[model] = failures[model]
+			}
+		}
+		latest.AvailableModels = orderedIntersection(latest.Models, keysFromSet(knownAvailable))
+		latest.AvailabilityCheckedAt = time.Now().Unix()
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -1068,31 +1146,35 @@ func (s *Server) handleProviderProbeModel(w http.ResponseWriter, r *http.Request
 	probeCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	err, latency := s.probeSingleModelWithLatency(probeCtx, p.ID, model)
 	cancel()
-	latest, exists := s.providerByID(p.ID)
-	if !exists {
-		writeJSON(w, http.StatusConflict, map[string]any{"error": "provider was removed during probe"})
-		return
-	}
-	p = latest
-	if err == nil && body.RecoverQuota {
-		p = setModelQuotaBlocked(p, model, false)
-	}
-	p = updateProbeResult(p, model, err, latency, body.AutoPublish)
-	if err == nil && !modelQuotaBlocked(p, model) {
-		s.clearAutoModelFailure(p.ID, model)
-	}
-	if body.DropUnavailable && err != nil {
-		if len(p.EnabledModels) == 0 {
-			p.EnabledModels = append([]string(nil), p.Models...)
+	before := p
+	p, saveErr := s.mutateProvider(p.ID, func(latest *ProviderConfig) error {
+		if r.Context().Err() != nil {
+			return r.Context().Err()
 		}
-		p.EnabledModels = removeString(p.EnabledModels, model)
-		if p.ProviderSpecificData == nil {
-			p.ProviderSpecificData = map[string]string{}
+		if !latest.Enabled || !sameProviderProbeTarget(before, *latest) || !sliceSet(latest.Models)[model] || sliceSet(latest.LockedModels)[model] {
+			return errors.New("provider or model changed during probe; please retry")
 		}
-		p.ProviderSpecificData["manualPublishOverride"] = "true"
-	}
-	if err := s.updateProvider(p); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		if err == nil && body.RecoverQuota {
+			*latest = setModelQuotaBlocked(*latest, model, false)
+		}
+		*latest = updateProbeResult(*latest, model, err, latency, body.AutoPublish && sameProviderPublishSelection(before, *latest))
+		if err == nil && !modelQuotaBlocked(*latest, model) {
+			s.clearAutoModelFailure(latest.ID, model)
+		}
+		if body.DropUnavailable && err != nil {
+			if len(latest.EnabledModels) == 0 && !providerManualPublishOverride(*latest) {
+				latest.EnabledModels = append([]string(nil), latest.Models...)
+			}
+			latest.EnabledModels = removeString(latest.EnabledModels, model)
+			if latest.ProviderSpecificData == nil {
+				latest.ProviderSpecificData = map[string]string{}
+			}
+			latest.ProviderSpecificData["manualPublishOverride"] = "true"
+		}
+		return nil
+	})
+	if saveErr != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": saveErr.Error()})
 		return
 	}
 	resp := map[string]any{
@@ -1158,38 +1240,38 @@ func (s *Server) handleProviderProbeKey(w http.ResponseWriter, r *http.Request) 
 	status, respBody, err := s.probeSingleCompatibleModelWithKey(probeCtx, p, model, keys[body.KeyIndex])
 	latency := time.Since(start).Milliseconds()
 	cancel()
-	if err == nil {
-		s.markProviderKeyActive(p.ID, body.KeyIndex, model)
-		var exists bool
-		p, exists = s.providerByID(p.ID)
-		if !exists {
-			writeJSON(w, http.StatusConflict, map[string]any{"error": "provider was removed during probe"})
-			return
+	before := p
+	p, saveErr := s.mutateProvider(p.ID, func(latest *ProviderConfig) error {
+		if r.Context().Err() != nil {
+			return r.Context().Err()
 		}
-		p = updateProbeResult(p, model, nil, latency, false)
-		s.clearAutoModelFailure(p.ID, model)
-		_ = s.updateProvider(p)
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": p.ID, "model": model, "key_index": body.KeyIndex, "latency_ms": latency, "provider": p})
+		if !latest.Enabled || !sameProviderProbeTarget(before, *latest) || !sliceSet(latest.Models)[model] || sliceSet(latest.LockedModels)[model] {
+			return errors.New("provider, key or model changed during probe; please retry")
+		}
+		if err == nil {
+			applyProviderKeyStatus(latest, body.KeyIndex, model, false, false)
+			s.clearAutoModelFailure(latest.ID, model)
+		} else if isQuotaKeyError(status, respBody) {
+			applyProviderKeyStatus(latest, body.KeyIndex, model, true, false)
+			if len(keys) == 1 {
+				*latest = setModelQuotaBlocked(*latest, model, true)
+				s.markAutoModelFailed(latest.ID, model)
+			}
+		} else if isCredentialKeyError(status, respBody) {
+			applyProviderKeyStatus(latest, body.KeyIndex, "", true, true)
+		}
+		*latest = updateProbeResult(*latest, model, err, latency, false)
+		return nil
+	})
+	if saveErr != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": saveErr.Error()})
 		return
 	}
-	if isQuotaKeyError(status, respBody) {
-		s.markProviderKeyFailed(p.ID, body.KeyIndex, model, false)
-	} else if isCredentialKeyError(status, respBody) {
-		s.markProviderKeyFailed(p.ID, body.KeyIndex, "", true)
+	response := map[string]any{"ok": err == nil, "id": p.ID, "model": model, "key_index": body.KeyIndex, "latency_ms": latency, "provider": p}
+	if err != nil {
+		response["error"] = err.Error()
 	}
-	var exists bool
-	p, exists = s.providerByID(p.ID)
-	if !exists {
-		writeJSON(w, http.StatusConflict, map[string]any{"error": "provider was removed during probe"})
-		return
-	}
-	if len(keys) == 1 && isQuotaKeyError(status, respBody) {
-		p = setModelQuotaBlocked(p, model, true)
-		s.markAutoModelFailed(p.ID, model)
-	}
-	p = updateProbeResult(p, model, err, latency, false)
-	_ = s.updateProvider(p)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": false, "id": p.ID, "model": model, "key_index": body.KeyIndex, "latency_ms": latency, "error": err.Error(), "provider": p})
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleProviderSelection(w http.ResponseWriter, r *http.Request) {
@@ -1213,19 +1295,15 @@ func (s *Server) handleProviderSelection(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider not found"})
 		return
 	}
-	allowed := sliceSet(p.Models)
-	var selected []string
-	for _, id := range uniqueStrings(body.EnabledModels) {
-		if allowed[id] {
-			selected = append(selected, id)
+	p, err := s.mutateProvider(p.ID, func(latest *ProviderConfig) error {
+		latest.EnabledModels = orderedIntersection(latest.Models, uniqueStrings(body.EnabledModels))
+		if latest.ProviderSpecificData == nil {
+			latest.ProviderSpecificData = map[string]string{}
 		}
-	}
-	p.EnabledModels = selected
-	if p.ProviderSpecificData == nil {
-		p.ProviderSpecificData = map[string]string{}
-	}
-	p.ProviderSpecificData["manualPublishOverride"] = "true"
-	if err := s.updateProvider(p); err != nil {
+		latest.ProviderSpecificData["manualPublishOverride"] = "true"
+		return nil
+	})
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -1406,9 +1484,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sessionKey, clientLabel := autoSessionIdentityForModel(r, scope, raw, requestedModel)
+		requestStarted := time.Now()
+		ticket := s.beginAutoAgentRequest(sessionKey)
 		latestHasImage := openAIChatLatestUserHasImage(raw)
-		anyImage := openAIChatHasImage(raw)
-		visionMode, _ := s.autoSessionRequestMode(sessionKey, latestHasImage, anyImage)
+		visionMode, _ := s.autoSessionRequestModeForTicket(sessionKey, raw, false, ticket)
 		if !visionMode {
 			raw, err = stripOpenAIHistoricalImages(raw)
 			if err != nil {
@@ -1417,7 +1496,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		candidates := s.autoChatCandidatesForOpenAIModel(r.Context(), requestedModel, visionMode)
-		candidates = s.orderAutoCandidatesForAgent(sessionKey, candidates, visionMode)
+		candidates = s.orderAutoCandidatesForRequest(sessionKey, candidates, visionMode, ticket)
 		if len(candidates) == 0 {
 			message := requestedModel + " model has no available target"
 			if visionMode {
@@ -1426,7 +1505,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": message})
 			return
 		}
-		s.proxyAutoChatCompletions(w, r, raw, candidates, sessionKey, clientLabel, visionMode, latestHasImage)
+		s.proxyAutoChatCompletions(w, r, raw, candidates, sessionKey, clientLabel, visionMode, latestHasImage, ticket, requestStarted)
 		return
 	}
 
@@ -1484,7 +1563,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request, raw []byte, candidates []string, agentKey, clientLabel string, vision, newImage bool) {
+func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request, raw []byte, candidates []string, agentKey, clientLabel string, vision, newImage bool, ticket uint64, requestStarted time.Time) {
 	var request chatRequest
 	_ = json.Unmarshal(raw, &request)
 	var lastFailure *autoRetryWriter
@@ -1497,7 +1576,7 @@ func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
-		providerID, model, _ := strings.Cut(candidate, "/")
+		providerID, model := s.autoCandidateIDs(candidate)
 		internal := r.Clone(context.WithValue(r.Context(), internalBypassKey{}, true))
 		internal.Body = io.NopCloser(bytes.NewReader(body))
 		internal.ContentLength = int64(len(body))
@@ -1506,33 +1585,39 @@ func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request
 
 		retryWriter := newAutoRetryWriter(w, !request.Stream)
 		s.handleChatCompletions(retryWriter, internal)
-		if retryWriter.committed {
-			s.finishAutoRuntime(candidate, true, retryWriter.status, retryWriter.body.Bytes(), started)
-			s.clearAutoModelFailure(providerID, model)
-			s.commitAutoAgentSuccess(agentKey, candidate, vision, newImage)
-			return
-		}
+		retryWriter.finishResponse()
 		if requestContextCanceled(r.Context()) {
 			s.finishAutoRuntimeCanceled(candidate, started)
-			writeJSON(w, statusClientClosedRequest, map[string]any{"error": "client request canceled"})
+			if !retryWriter.committed {
+				writeJSON(w, statusClientClosedRequest, map[string]any{"error": "client request canceled"})
+			}
+			return
+		}
+		if retryWriter.committed {
+			if len(retryWriter.stream.failure) > 0 {
+				s.finishAutoRuntime(candidate, false, http.StatusBadGateway, retryWriter.stream.failure, started)
+				s.coolDownAutoFailure(providerID, model, retryWriter.stream.failure)
+				return
+			}
+			s.finishAutoRuntime(candidate, true, retryWriter.status, nil, started)
+			s.commitAutoRequestSuccess(agentKey, candidate, vision, newImage, ticket, requestStarted)
 			return
 		}
 		if retryWriter.status >= 200 && retryWriter.status <= 299 {
 			if probeResponseHasExplicitError(retryWriter.body.Bytes()) {
 				s.finishAutoRuntime(candidate, false, retryWriter.status, retryWriter.body.Bytes(), started)
-				s.markAutoModelFailed(providerID, model)
+				s.coolDownAutoFailure(providerID, model, retryWriter.body.Bytes())
 				lastFailure = retryWriter
 				continue
 			}
 			s.finishAutoRuntime(candidate, true, retryWriter.status, retryWriter.body.Bytes(), started)
 			retryWriter.relay()
-			s.clearAutoModelFailure(providerID, model)
-			s.commitAutoAgentSuccess(agentKey, candidate, vision, newImage)
+			s.commitAutoRequestSuccess(agentKey, candidate, vision, newImage, ticket, requestStarted)
 			return
 		}
 		if isAutoFallbackError(retryWriter.status, retryWriter.body.Bytes()) {
 			s.finishAutoRuntime(candidate, false, retryWriter.status, retryWriter.body.Bytes(), started)
-			s.markAutoModelFailed(providerID, model)
+			s.coolDownAutoFailure(providerID, model, retryWriter.body.Bytes())
 			lastFailure = retryWriter
 			continue
 		}
@@ -1806,21 +1891,63 @@ func (s *Server) proxyPostRotating(w http.ResponseWriter, r *http.Request, targe
 			headers[k] = v
 		}
 		headers["Authorization"] = "Bearer " + key
-		status, header, respBody, err := s.postUpstreamBuffered(r.Context(), target, body, headers)
-		lastStatus, lastHeader, lastBody, lastErr = status, header, respBody, err
+		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
+		if err != nil {
+			lastErr = err
+			break
+		}
+		for k, v := range headers {
+			upReq.Header.Set(k, v)
+		}
+		resp, err := s.client.Do(upReq)
+		lastErr = err
 		if err != nil {
 			break
 		}
-		if status >= 200 && status <= 299 {
-			s.markProviderKeyActive(p.ID, keyIndex, upstreamModel)
-			writeBufferedUpstream(w, status, header, respBody)
-			return
+		lastStatus, lastHeader = resp.StatusCode, resp.Header.Clone()
+		if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+			// Gate only the prelude. Once useful output arrives, relay every
+			// chunk immediately; never buffer a whole stream just to rotate keys.
+			gate := newAutoRetryWriter(w, false)
+			gate.validateJSON = strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json")
+			copyResponseHeaders(gate.Header(), resp.Header)
+			gate.WriteHeader(resp.StatusCode)
+			_, readErr := copyFlush(gate, resp.Body)
+			reportUpstreamReadError(gate, readErr)
+			_ = resp.Body.Close()
+			gate.finishResponse()
+			if gate.committed {
+				if (readErr == nil || errors.Is(readErr, errAutoStreamComplete)) && len(gate.stream.failure) == 0 && !requestContextCanceled(r.Context()) {
+					s.markProviderKeyActive(p.ID, keyIndex, upstreamModel)
+				}
+				return
+			}
+			lastStatus, lastHeader, lastBody = gate.status, gate.header, append([]byte(nil), gate.body.Bytes()...)
+			if requestContextCanceled(r.Context()) {
+				lastErr = r.Context().Err()
+				break
+			}
+			if readErr != nil && !errors.Is(readErr, errAutoStreamRejected) {
+				lastErr = readErr
+				break
+			}
+			if lastStatus >= 200 && lastStatus <= 299 && !probeResponseHasExplicitError(lastBody) {
+				s.markProviderKeyActive(p.ID, keyIndex, upstreamModel)
+				gate.relay()
+				return
+			}
+		} else {
+			lastBody, lastErr = io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+			_ = resp.Body.Close()
+			if lastErr != nil {
+				break
+			}
 		}
-		if isQuotaKeyError(status, respBody) {
+		if isQuotaKeyError(lastStatus, lastBody) {
 			s.markProviderKeyFailed(p.ID, keyIndex, upstreamModel, false)
-		} else if isRateLimitKeyError(status, respBody) {
+		} else if isRateLimitKeyError(lastStatus, lastBody) {
 			// A rate limit is temporary. Try the next key without persisting a failure.
-		} else if isCredentialKeyError(status, respBody) {
+		} else if isCredentialKeyError(lastStatus, lastBody) {
 			s.markProviderKeyFailed(p.ID, keyIndex, "", true)
 		} else {
 			break
@@ -1904,7 +2031,8 @@ func (s *Server) proxyRawWithClient(w http.ResponseWriter, r *http.Request, clie
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = copyFlush(w, resp.Body)
+	_, readErr := copyFlush(w, resp.Body)
+	reportUpstreamReadError(w, readErr)
 	return resp.StatusCode
 }
 
@@ -2007,13 +2135,13 @@ func (s *Server) updateProvider(next ProviderConfig) error {
 	found := false
 	for i, p := range s.config.Providers {
 		if p.ID == next.ID {
-			s.config.Providers[i] = next
+			s.config.Providers[i] = cloneProviderConfig(next)
 			found = true
 			break
 		}
 	}
 	if !found {
-		s.config.Providers = append(s.config.Providers, next)
+		s.config.Providers = append(s.config.Providers, cloneProviderConfig(next))
 	}
 	pruneAutoModelsForProviderLocked(&s.config, next)
 	return saveConfig(s.dataDir, s.config)
@@ -2409,7 +2537,7 @@ func jwtExpiry(jwt string) time.Time {
 func (s *Server) currentConfig() Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.config
+	return cloneConfig(s.config)
 }
 
 func (s *Server) requireAccessKey(w http.ResponseWriter, r *http.Request) bool {
@@ -2515,23 +2643,27 @@ func (s *Server) enabledProviders() []ProviderConfig {
 }
 
 func (s *Server) providerByID(id string) (ProviderConfig, bool) {
-	cfg := s.currentConfig()
-	for _, p := range cfg.Providers {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, p := range s.config.Providers {
 		if p.ID == id {
-			return p, true
+			return cloneProviderConfig(p), true
 		}
 	}
 	return ProviderConfig{}, false
 }
 
 func (s *Server) providerByRouteID(id string) (ProviderConfig, bool) {
-	if p, ok := s.providerByID(id); ok {
-		return p, true
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, p := range s.config.Providers {
+		if p.ID == id {
+			return cloneProviderConfig(p), true
+		}
 	}
-	cfg := s.currentConfig()
-	for _, p := range cfg.Providers {
+	for _, p := range s.config.Providers {
 		if providerPublicID(p) == id {
-			return p, true
+			return cloneProviderConfig(p), true
 		}
 	}
 	return ProviderConfig{}, false
@@ -2697,46 +2829,7 @@ func (s *Server) updateProviderKeyStatus(id string, index int, model string, fai
 		if p.ID != id {
 			continue
 		}
-		if p.ProviderSpecificData == nil {
-			p.ProviderSpecificData = map[string]string{}
-		}
-		if failed {
-			key := "failed_key_indexes"
-			if !global {
-				key = modelFailedKeyIndexesDataKey(model)
-			}
-			if key == "" {
-				key = "failed_key_indexes"
-			}
-			failedSet := intSetFromCSV(p.ProviderSpecificData[key])
-			failedSet[index] = true
-			if global && parseProviderInt(p.ProviderSpecificData["active_key_index"], -1) == index {
-				delete(p.ProviderSpecificData, "active_key_index")
-			}
-			if csv := csvFromIntSet(failedSet); csv != "" {
-				p.ProviderSpecificData[key] = csv
-			} else {
-				delete(p.ProviderSpecificData, key)
-			}
-		} else {
-			p.ProviderSpecificData["active_key_index"] = strconv.Itoa(index)
-			failedSet := intSetFromCSV(p.ProviderSpecificData["failed_key_indexes"])
-			delete(failedSet, index)
-			if csv := csvFromIntSet(failedSet); csv != "" {
-				p.ProviderSpecificData["failed_key_indexes"] = csv
-			} else {
-				delete(p.ProviderSpecificData, "failed_key_indexes")
-			}
-			if key := modelFailedKeyIndexesDataKey(model); key != "" {
-				failedSet = intSetFromCSV(p.ProviderSpecificData[key])
-				delete(failedSet, index)
-				if csv := csvFromIntSet(failedSet); csv != "" {
-					p.ProviderSpecificData[key] = csv
-				} else {
-					delete(p.ProviderSpecificData, key)
-				}
-			}
-		}
+		applyProviderKeyStatus(&p, index, model, failed, global)
 		s.config.Providers[i] = p
 		_ = saveConfig(s.dataDir, s.config)
 		return
@@ -2856,6 +2949,18 @@ func (s *Server) autoChatCandidatesForModel(ctx context.Context, autoID string, 
 
 func (s *Server) autoCandidatesMatching(ctx context.Context, candidates []string, accept func(ProviderConfig) bool, multimodalOnly bool) []string {
 	_ = ctx
+	// One detached snapshot per selection, rather than copying every provider
+	// and model map again for each candidate.
+	cfg := s.currentConfig()
+	providers := make(map[string]ProviderConfig, len(cfg.Providers)*2)
+	for _, p := range cfg.Providers {
+		if _, exists := providers[providerPublicID(p)]; !exists {
+			providers[providerPublicID(p)] = p
+		}
+	}
+	for _, p := range cfg.Providers {
+		providers[p.ID] = p
+	}
 	var out []string
 	for _, candidate := range uniqueStrings(candidates) {
 		if candidate == "auto" {
@@ -2865,7 +2970,7 @@ func (s *Server) autoCandidatesMatching(ctx context.Context, candidates []string
 		if !ok || providerID == "" || model == "" {
 			continue
 		}
-		p, ok := s.providerByRouteID(providerID)
+		p, ok := providers[providerID]
 		if !ok || !p.Enabled {
 			continue
 		}
@@ -3057,21 +3162,31 @@ func (s *Server) markModelUnavailableAfterQuotaError(p ProviderConfig, model str
 	if len(providerAPIKeys(p)) != 1 || !isQuotaKeyError(status, body) {
 		return
 	}
-	p = setModelQuotaBlocked(p, model, true)
-	available := sliceSet(p.AvailableModels)
-	delete(available, model)
-	p.AvailableModels = orderedIntersection(p.Models, keysFromSet(available))
-	if p.ModelErrors == nil {
-		p.ModelErrors = map[string]string{}
+	blocked := false
+	_, _ = s.mutateProvider(p.ID, func(latest *ProviderConfig) error {
+		keys := providerAPIKeys(*latest)
+		if len(keys) != 1 || keys[0] != providerAPIKeys(p)[0] || !containsString(latest.Models, model) {
+			return nil
+		}
+		*latest = setModelQuotaBlocked(*latest, model, true)
+		available := sliceSet(latest.AvailableModels)
+		delete(available, model)
+		latest.AvailableModels = orderedIntersection(latest.Models, keysFromSet(available))
+		if latest.ModelErrors == nil {
+			latest.ModelErrors = map[string]string{}
+		}
+		latest.ModelErrors[model] = formatProbeFailure(status, string(body))
+		if latest.ModelFailureCounts == nil {
+			latest.ModelFailureCounts = map[string]int{}
+		}
+		latest.ModelFailureCounts[model] = autoProbeFailureThreshold
+		latest.AvailabilityCheckedAt = time.Now().Unix()
+		blocked = true
+		return nil
+	})
+	if blocked {
+		s.markAutoModelFailed(p.ID, model)
 	}
-	p.ModelErrors[model] = formatProbeFailure(status, string(body))
-	if p.ModelFailureCounts == nil {
-		p.ModelFailureCounts = map[string]int{}
-	}
-	p.ModelFailureCounts[model] = autoProbeFailureThreshold
-	p.AvailabilityCheckedAt = time.Now().Unix()
-	s.markAutoModelFailed(p.ID, model)
-	_ = s.updateProvider(p)
 }
 
 func (s *Server) probeProviderModels(ctx context.Context, p ProviderConfig, models []string) ([]string, map[string]string, map[string]int64) {
@@ -3661,17 +3776,26 @@ func (s *Server) probeAllProviders(ctx context.Context, autoPublish bool) {
 			continue
 		}
 		available, failures, latencies := s.probeProviderModels(ctx, p, models)
-		latest, exists := s.providerByID(p.ID)
-		if !exists || !latest.Enabled {
-			continue
+		if ctx.Err() != nil {
+			return
 		}
-		p = latest
-		p = s.applyAutoProbeResults(p, models, available, failures, latencies)
-		if autoPublish {
-			p.EnabledModels = append([]string(nil), p.AvailableModels...)
-			clearManualPublishOverride(&p)
-		}
-		_ = s.updateProvider(p)
+		before := p
+		_, _ = s.mutateProvider(p.ID, func(latest *ProviderConfig) error {
+			if !latest.Enabled || !sameProviderProbeTarget(before, *latest) {
+				return errors.New("provider changed during probe")
+			}
+			currentModels := orderedIntersection(unlockedModelIDs(chatModelIDs(*latest, latest.Models), latest.LockedModels), models)
+			if len(currentModels) == 0 {
+				return nil
+			}
+			selectionUnchanged := sameProviderPublishSelection(before, *latest)
+			*latest = s.applyAutoProbeResults(*latest, currentModels, available, failures, latencies)
+			if autoPublish && selectionUnchanged {
+				latest.EnabledModels = append([]string(nil), latest.AvailableModels...)
+				clearManualPublishOverride(latest)
+			}
+			return nil
+		})
 	}
 }
 

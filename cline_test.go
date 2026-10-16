@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -328,8 +330,11 @@ func TestClineReloginClearsExpiredAuthStatus(t *testing.T) {
 	s := &Server{config: Config{Providers: []ProviderConfig{p}}, dataDir: t.TempDir()}
 	code := base64.StdEncoding.EncodeToString(mustJSON(map[string]any{"accessToken": "new", "refreshToken": "refresh", "email": "test@example.com", "expiresAt": time.Now().Add(time.Hour).Format(time.RFC3339)}))
 	r := httptest.NewRequest(http.MethodGet, "/api/oauth/cline/callback", nil)
+	r.AddCookie(&http.Cookie{Name: "nr_admin", Value: s.adminCookieValue()})
+	state, _ := s.beginClineLogin(r)
 	query := r.URL.Query()
 	query.Set("code", code)
+	query.Set("login_state", state)
 	r.URL.RawQuery = query.Encode()
 	w := httptest.NewRecorder()
 	s.handleClineCallback(w, r)
@@ -337,4 +342,135 @@ func TestClineReloginClearsExpiredAuthStatus(t *testing.T) {
 	if w.Code != http.StatusOK || stored.ProviderSpecificData["authStatus"] != "ok" || stored.ProviderSpecificData["lastAuthError"] != "" || len(stored.ClineAccounts) != 1 || stored.ClineAccounts[0].AccessToken != "new" {
 		t.Fatalf("status=%d auth=%q accounts=%d", w.Code, stored.ProviderSpecificData["authStatus"], len(stored.ClineAccounts))
 	}
+}
+
+func TestClineStaleActivationPreservesNewCredentialsAndAvailability(t *testing.T) {
+	p := ProviderConfig{ID: "cline", Type: "cline", Models: []string{"a", "b"}, AvailableModels: []string{"a", "b"}, ClineAccounts: []ClineAccount{
+		{Email: "first@example.invalid", AccessToken: "expired", RefreshToken: "old-refresh"},
+		{Email: "second@example.invalid", AccessToken: "second", RefreshToken: "second-refresh"},
+	}}
+	s := &Server{config: Config{Providers: []ProviderConfig{cloneProviderConfig(p)}}, dataDir: t.TempDir()}
+	stale, _ := s.providerByID("cline")
+	if _, err := s.mutateProvider("cline", func(latest *ProviderConfig) error {
+		latest.ClineAccounts[0].AccessToken, latest.ClineAccounts[0].RefreshToken = "new-access", "new-refresh"
+		latest.AvailableModels = []string{"b"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.activateClineAccount(stale, 1)
+	stored, _ := s.providerByID("cline")
+	if stored.ActiveClineAccount != 1 || stored.AccessToken != "second" || stored.ClineAccounts[0].AccessToken != "new-access" || stored.ClineAccounts[0].RefreshToken != "new-refresh" || strings.Join(stored.AvailableModels, ",") != "b" {
+		t.Fatal("stale activation overwrote newer credentials or availability")
+	}
+}
+
+func TestConcurrentClineRefreshUsesOneRotatingRefreshToken(t *testing.T) {
+	p := ProviderConfig{ID: "cline", Type: "cline", ClineAccounts: []ClineAccount{{Email: "first@example.invalid", AccessToken: "expired", RefreshToken: "rotate-once"}, {Email: "second@example.invalid", AccessToken: "second", RefreshToken: "second-refresh"}}}
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	s := &Server{config: Config{Providers: []ProviderConfig{cloneProviderConfig(p)}}, dataDir: t.TempDir(), client: &http.Client{Transport: clineCatalogTransport(func(r *http.Request) (*http.Response, error) {
+		if r.URL.String() != clineRefreshURL {
+			t.Error("unexpected non-refresh request")
+		}
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"accessToken":"fresh","refreshToken":"rotated"}`))}, nil
+	})}}
+	errors := make(chan error, 8)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := s.refreshClineAccount(t.Context(), cloneProviderConfig(p), 0)
+			errors <- err
+		}()
+	}
+	<-started
+	close(release)
+	wg.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	stored, _ := s.providerByID("cline")
+	if calls.Load() != 1 || stored.ClineAccounts[0].AccessToken != "fresh" || stored.ClineAccounts[0].RefreshToken != "rotated" || stored.ClineAccounts[1].RefreshToken != "second-refresh" {
+		t.Fatalf("refresh was duplicated or changed another account: refresh calls=%d", calls.Load())
+	}
+}
+
+func TestClineInFlightRefreshCannotOverwriteNewLogin(t *testing.T) {
+	p := ProviderConfig{ID: "cline", Type: "cline", ClineAccounts: []ClineAccount{{Email: "user@example.invalid", AccessToken: "expired", RefreshToken: "old-refresh"}}}
+	started, release := make(chan struct{}), make(chan struct{})
+	s := &Server{config: Config{Providers: []ProviderConfig{cloneProviderConfig(p)}}, dataDir: t.TempDir(), client: &http.Client{Transport: clineCatalogTransport(func(r *http.Request) (*http.Response, error) {
+		close(started)
+		<-release
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"accessToken":"older-refresh-result","refreshToken":"older-rotated-result"}`))}, nil
+	})}}
+	done := make(chan error, 1)
+	go func() { _, err := s.refreshClineAccount(t.Context(), p, 0); done <- err }()
+	<-started
+	if _, err := s.saveClineLogin(ClineAccount{Email: "user@example.invalid", AccessToken: "new-login", RefreshToken: "new-login-refresh"}, nil); err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := s.providerByID("cline")
+	if stored.AccessToken != "new-login" || stored.ClineAccounts[0].RefreshToken != "new-login-refresh" {
+		t.Fatal("older in-flight refresh overwrote a newer OAuth login")
+	}
+}
+
+func TestClineRefreshUpdatesSameAccountAfterReorder(t *testing.T) {
+	p := ProviderConfig{ID: "cline", Type: "cline", ClineAccounts: []ClineAccount{{Email: "first@example.invalid", AccessToken: "old-first", RefreshToken: "first-refresh"}, {Email: "second@example.invalid", AccessToken: "second", RefreshToken: "second-refresh"}}}
+	started, release := make(chan struct{}), make(chan struct{})
+	s := &Server{config: Config{Providers: []ProviderConfig{cloneProviderConfig(p)}}, dataDir: t.TempDir(), client: &http.Client{Transport: clineCatalogTransport(func(r *http.Request) (*http.Response, error) {
+		close(started)
+		<-release
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"accessToken":"fresh-first","refreshToken":"rotated-first"}`))}, nil
+	})}}
+	done := make(chan error, 1)
+	go func() { _, err := s.refreshClineAccount(t.Context(), p, 0); done <- err }()
+	<-started
+	if _, err := s.mutateProvider("cline", func(latest *ProviderConfig) error {
+		latest.ClineAccounts[0], latest.ClineAccounts[1] = latest.ClineAccounts[1], latest.ClineAccounts[0]
+		return nil
+	}); err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := s.providerByID("cline")
+	if stored.ClineAccounts[0].AccessToken != "second" || stored.ClineAccounts[1].AccessToken != "fresh-first" {
+		t.Fatal("refresh used an outdated account slot instead of account identity")
+	}
+}
+
+func TestClineStaleRequestUsesLatestCredentialWithoutRefreshing(t *testing.T) {
+	p := ProviderConfig{ID: "cline", Type: "cline", ClineAccounts: []ClineAccount{{Email: "user@example.invalid", AccessToken: "old", RefreshToken: "old-refresh"}}}
+	s := &Server{config: Config{Providers: []ProviderConfig{cloneProviderConfig(p)}}, dataDir: t.TempDir(), client: &http.Client{Transport: clineCatalogTransport(func(r *http.Request) (*http.Response, error) {
+		if r.URL.String() == clineRefreshURL || r.Header.Get("Authorization") != "Bearer workos:fresh" {
+			t.Error("stale request sent an old credential or redundantly refreshed")
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"choices":[]}`))}, nil
+	})}}
+	if _, err := s.mutateProvider("cline", func(latest *ProviderConfig) error { latest.ClineAccounts[0].AccessToken = "fresh"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	resp, _, err := s.doClineRequest(t.Context(), p, false, []byte(`{"model":"test"}`), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
 }

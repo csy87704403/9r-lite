@@ -46,6 +46,39 @@ func TestImageHistoryDetection(t *testing.T) {
 	}
 }
 
+func TestAnthropicToolResultImagesFollowCurrentUserTurn(t *testing.T) {
+	start := `{"role":"user","content":"inspect the screenshot"}`
+	toolCall := `{"role":"assistant","content":[{"type":"tool_use","id":"screen","name":"screenshot","input":{}}]}`
+	result := `{"role":"user","content":[{"type":"tool_result","tool_use_id":"screen","is_error":false,"content":[{"type":"text","text":"screenshot result"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]}]}`
+	body := []byte(`{"messages":[` + start + `,` + toolCall + `,` + result + `]}`)
+	if !anthropicMessagesHaveImage(body) || !anthropicMessagesLatestUserHasImage(body) {
+		t.Fatal("a current-turn tool screenshot must select a vision model")
+	}
+	withAnotherTool := []byte(`{"messages":[` + start + `,` + toolCall + `,` + result + `,` + toolCall + `,{"role":"user","content":[{"type":"tool_result","tool_use_id":"screen","content":"done"}]}]}`)
+	if !anthropicMessagesLatestUserHasImage(withAnotherTool) {
+		t.Fatal("a later tool result in the same user turn must retain the screenshot")
+	}
+	newTurn := []byte(`{"messages":[` + start + `,` + toolCall + `,` + result + `,{"role":"assistant","content":"description"},{"role":"user","content":"write a function now"}]}`)
+	if anthropicMessagesLatestUserHasImage(newTurn) || !anthropicMessagesHaveImage(newTurn) {
+		t.Fatal("a historical tool screenshot must not be treated as a new screenshot")
+	}
+	stripped, err := stripAnthropicHistoricalImages(newTurn)
+	if err != nil || anthropicMessagesHaveImage(stripped) {
+		t.Fatalf("historical nested screenshot was not stripped: %v %s", err, stripped)
+	}
+	if !strings.Contains(string(stripped), `"tool_use_id":"screen"`) || !strings.Contains(string(stripped), "screenshot result") || !strings.Contains(string(stripped), `"is_error":false`) {
+		t.Fatalf("stripping images damaged the tool result: %s", stripped)
+	}
+}
+
+func TestAnthropicImageOnlyToolResultKeepsToolWrapperWhenStripped(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"screen","is_error":true,"content":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]}]}]}`)
+	stripped, err := stripAnthropicHistoricalImages(body)
+	if err != nil || anthropicMessagesHaveImage(stripped) || !strings.Contains(string(stripped), `"type":"tool_result"`) || !strings.Contains(string(stripped), `"is_error":true`) || !strings.Contains(string(stripped), "Historical image omitted") {
+		t.Fatalf("image-only tool result was damaged: err=%v body=%s", err, stripped)
+	}
+}
+
 func TestAutoImageConversationReturnsToGeneralCandidates(t *testing.T) {
 	var normalCalls atomic.Int32
 	var visionCalls atomic.Int32
