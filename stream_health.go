@@ -15,12 +15,13 @@ type StreamHealthBucket struct {
 }
 
 type StreamHealthStats struct {
-	ProviderID        string               `json:"provider_id"`
-	ProviderName      string               `json:"provider_name"`
-	Model             string               `json:"model"`
-	Buckets           []StreamHealthBucket `json:"buckets"`
-	LastInterruption  string               `json:"last_interruption,omitempty"`
-	LastInterruptedAt int64                `json:"last_interrupted_at,omitempty"`
+	ProviderID        string                `json:"provider_id"`
+	ProviderName      string                `json:"provider_name"`
+	Model             string                `json:"model"`
+	Buckets           []StreamHealthBucket  `json:"buckets"`
+	LastInterruption  string                `json:"last_interruption,omitempty"`
+	LastInterruptedAt int64                 `json:"last_interrupted_at,omitempty"`
+	Guard             *autoStreamGuardState `json:"auto_guard,omitempty"`
 }
 
 type StreamHealthRank struct {
@@ -45,6 +46,11 @@ func (w *usageResponseWriter) streamInterrupted() bool {
 }
 
 func (s *Server) recordStreamHealth(p ProviderConfig, model string, interrupted bool, reason string, now time.Time) {
+	epoch := s.autoStreamEpoch(p.ID, model)
+	s.recordStreamHealthObservation(p, model, interrupted, !interrupted, reason, epoch, now)
+}
+
+func (s *Server) recordStreamHealthObservation(p ProviderConfig, model string, interrupted, healthy bool, reason string, epoch uint64, now time.Time) {
 	s.usageMu.Lock()
 	if s.usage.StreamHealth == nil {
 		s.usage.StreamHealth = map[string]*StreamHealthStats{}
@@ -72,6 +78,7 @@ func (s *Server) recordStreamHealth(p ProviderConfig, model string, interrupted 
 		}
 	}
 	pruneStreamHealthBuckets(stats, now)
+	updateAutoStreamGuard(stats, epoch, interrupted, healthy, now)
 	s.usage.UpdatedAt = now.Unix()
 	s.usageMu.Unlock()
 	s.scheduleUsageSave()
@@ -93,7 +100,7 @@ func pruneStreamHealth(store *UsageStore, now time.Time) {
 			continue
 		}
 		pruneStreamHealthBuckets(stats, now)
-		if len(stats.Buckets) == 0 {
+		if len(stats.Buckets) == 0 && (stats.Guard == nil || stats.Guard.Until == 0) {
 			delete(store.StreamHealth, key)
 		} else if stats.LastInterruptedAt < now.Add(-streamHealthRetention).Truncate(time.Minute).Unix() {
 			stats.LastInterruption, stats.LastInterruptedAt = "", 0

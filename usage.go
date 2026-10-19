@@ -183,6 +183,7 @@ func (s *Server) beginUpstreamUsage(w http.ResponseWriter, r *http.Request, p Pr
 		return w, func() {}
 	}
 	tracked := &usageResponseWriter{target: w, stream: stream}
+	epoch := s.autoStreamEpoch(p.ID, model)
 	return tracked, func() {
 		tracked.finishStream()
 		interrupted := tracked.streamInterrupted()
@@ -238,7 +239,8 @@ func (s *Server) beginUpstreamUsage(w http.ResponseWriter, r *http.Request, p Pr
 			if tracked.readErr != nil {
 				failureReason = "上游流读取中断：" + truncateString(tracked.readErr.Error(), 1000)
 			}
-			s.recordStreamHealth(p, model, interrupted, failureReason, time.Now())
+			healthy := usageStatus >= 200 && usageStatus <= 299 && tracked.inspection.complete && tracked.inspection.output
+			s.recordStreamHealthObservation(p, model, interrupted, healthy, failureReason, epoch, time.Now())
 		}
 	}
 }

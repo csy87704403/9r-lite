@@ -161,7 +161,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		candidates := s.autoChatCandidatesForModel(r.Context(), requestedModel, visionMode)
 		candidates = s.orderAutoCandidatesForRequest(sessionKey, candidates, visionMode, ticket)
 		if len(candidates) == 0 {
-			message := requestedModel + " model has no available target"
+			message := requestedModel + "：" + autoStreamNoTarget
 			if visionMode {
 				message = requestedModel + " model has no available multimodal target"
 			}
@@ -205,16 +205,24 @@ func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Reque
 	_ = json.Unmarshal(raw, &request)
 	var lastFailure *autoRetryWriter
 	for _, candidate := range candidates {
+		providerID, model := s.autoCandidateIDs(candidate)
+		trial, admitted := s.admitAutoStreamCandidate(providerID, model, request.Stream, time.Now())
+		if !admitted {
+			continue
+		}
+		if trial != nil {
+			defer s.finishAutoStreamTrial(trial, nil, r.Context(), time.Now())
+		}
 		started := time.Now()
 		s.beginAutoRuntime(candidate, r.UserAgent(), clientLabel)
 		body, err := replaceModel(raw, candidate)
 		if err != nil {
+			s.finishAutoStreamTrial(trial, nil, r.Context(), time.Now())
 			s.finishAutoRuntime(candidate, false, http.StatusBadRequest, []byte(err.Error()), started)
 			writeAnthropicError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		providerID, model := s.autoCandidateIDs(candidate)
-		internal := r.Clone(context.WithValue(r.Context(), internalBypassKey{}, true))
+		internal := r.Clone(context.WithValue(autoStreamTrialContext(r.Context(), trial), internalBypassKey{}, true))
 		internal.Body = io.NopCloser(bytes.NewReader(body))
 		internal.ContentLength = int64(len(body))
 		internal.Header = r.Header.Clone()
@@ -223,6 +231,7 @@ func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Reque
 		retryWriter := newAutoRetryWriter(w, !request.Stream)
 		s.handleAnthropicMessages(retryWriter, internal)
 		retryWriter.finishResponse()
+		s.finishAutoStreamTrial(trial, retryWriter, r.Context(), time.Now())
 		if requestContextCanceled(r.Context()) {
 			s.finishAutoRuntimeCanceled(candidate, started)
 			if !retryWriter.committed {
@@ -266,7 +275,7 @@ func (s *Server) proxyAutoAnthropicMessages(w http.ResponseWriter, r *http.Reque
 		lastFailure.relay()
 		return
 	}
-	writeAnthropicError(w, http.StatusServiceUnavailable, "auto model has no available target")
+	writeAnthropicError(w, http.StatusServiceUnavailable, autoStreamNoTarget)
 }
 
 func (s *Server) proxyOpenAIAsAnthropic(w http.ResponseWriter, r *http.Request, req anthropicRequest, responseModel string) {

@@ -148,16 +148,17 @@ type HealthAutoModel struct {
 }
 
 type autoRuntimeModelStatus struct {
-	Model          string `json:"model"`
-	ActiveRequests int    `json:"active_requests"`
-	TotalAttempts  uint64 `json:"total_attempts"`
-	LastUserAgent  string `json:"last_user_agent,omitempty"`
-	LastClient     string `json:"last_client,omitempty"`
-	LastStartedAt  int64  `json:"last_started_at,omitempty"`
-	LastFinishedAt int64  `json:"last_finished_at,omitempty"`
-	LastLatencyMS  int64  `json:"last_latency_ms,omitempty"`
-	LastResult     string `json:"last_result,omitempty"`
-	LastError      string `json:"last_error,omitempty"`
+	Model          string                  `json:"model"`
+	ActiveRequests int                     `json:"active_requests"`
+	TotalAttempts  uint64                  `json:"total_attempts"`
+	LastUserAgent  string                  `json:"last_user_agent,omitempty"`
+	LastClient     string                  `json:"last_client,omitempty"`
+	LastStartedAt  int64                   `json:"last_started_at,omitempty"`
+	LastFinishedAt int64                   `json:"last_finished_at,omitempty"`
+	LastLatencyMS  int64                   `json:"last_latency_ms,omitempty"`
+	LastResult     string                  `json:"last_result,omitempty"`
+	LastError      string                  `json:"last_error,omitempty"`
+	StreamHealth   *autoStreamHealthStatus `json:"stream_health,omitempty"`
 }
 
 type HealthMediaTemplate struct {
@@ -204,6 +205,7 @@ type Server struct {
 	multimodalProbing      map[string]bool
 	usageMu                sync.Mutex
 	usage                  UsageStore
+	autoStreamTrials       map[string]*autoStreamTrial // protected by usageMu
 	usageSaveCh            chan struct{}
 	client                 *http.Client
 	mimo                   *MimoAuth
@@ -774,6 +776,7 @@ func (s *Server) handleAutoRuntimeStatus(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{"models": s.autoRuntimeSnapshot(), "updated_at": time.Now().UnixMilli()})
 }
 
@@ -1499,7 +1502,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		candidates := s.autoChatCandidatesForOpenAIModel(r.Context(), requestedModel, visionMode)
 		candidates = s.orderAutoCandidatesForRequest(sessionKey, candidates, visionMode, ticket)
 		if len(candidates) == 0 {
-			message := requestedModel + " model has no available target"
+			message := requestedModel + "：" + autoStreamNoTarget
 			if visionMode {
 				message = requestedModel + " model has no available multimodal target"
 			}
@@ -1569,16 +1572,24 @@ func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request
 	_ = json.Unmarshal(raw, &request)
 	var lastFailure *autoRetryWriter
 	for _, candidate := range candidates {
+		providerID, model := s.autoCandidateIDs(candidate)
+		trial, admitted := s.admitAutoStreamCandidate(providerID, model, request.Stream, time.Now())
+		if !admitted {
+			continue
+		}
+		if trial != nil {
+			defer s.finishAutoStreamTrial(trial, nil, r.Context(), time.Now())
+		}
 		started := time.Now()
 		s.beginAutoRuntime(candidate, r.UserAgent(), clientLabel)
 		body, err := replaceModel(raw, candidate)
 		if err != nil {
+			s.finishAutoStreamTrial(trial, nil, r.Context(), time.Now())
 			s.finishAutoRuntime(candidate, false, http.StatusBadRequest, []byte(err.Error()), started)
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
-		providerID, model := s.autoCandidateIDs(candidate)
-		internal := r.Clone(context.WithValue(r.Context(), internalBypassKey{}, true))
+		internal := r.Clone(context.WithValue(autoStreamTrialContext(r.Context(), trial), internalBypassKey{}, true))
 		internal.Body = io.NopCloser(bytes.NewReader(body))
 		internal.ContentLength = int64(len(body))
 		internal.Header = r.Header.Clone()
@@ -1587,6 +1598,7 @@ func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request
 		retryWriter := newAutoRetryWriter(w, !request.Stream)
 		s.handleChatCompletions(retryWriter, internal)
 		retryWriter.finishResponse()
+		s.finishAutoStreamTrial(trial, retryWriter, r.Context(), time.Now())
 		if requestContextCanceled(r.Context()) {
 			s.finishAutoRuntimeCanceled(candidate, started)
 			if !retryWriter.committed {
@@ -1630,7 +1642,7 @@ func (s *Server) proxyAutoChatCompletions(w http.ResponseWriter, r *http.Request
 		lastFailure.relay()
 		return
 	}
-	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "auto model has no available target"})
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": autoStreamNoTarget})
 }
 
 func (s *Server) handleMediaModels(kind string) http.HandlerFunc {
@@ -2991,6 +3003,9 @@ func (s *Server) autoCandidatesMatching(ctx context.Context, candidates []string
 		if s.autoModelFailed(p.ID, model) {
 			continue
 		}
+		if s.autoStreamBlocked(p.ID, model, time.Now()) {
+			continue
+		}
 		out = append(out, providerModelRef(p, model))
 	}
 	return out
@@ -3124,7 +3139,6 @@ func (s *Server) autoRuntimeSnapshot() []autoRuntimeModelStatus {
 		}
 	}
 	s.autoRuntimeMu.RLock()
-	defer s.autoRuntimeMu.RUnlock()
 	out := make([]autoRuntimeModelStatus, 0, len(ordered))
 	for _, model := range ordered {
 		if status := s.autoRuntime[model]; status != nil {
@@ -3132,6 +3146,11 @@ func (s *Server) autoRuntimeSnapshot() []autoRuntimeModelStatus {
 		} else if set[model] {
 			out = append(out, autoRuntimeModelStatus{Model: model, LastResult: "idle"})
 		}
+	}
+	s.autoRuntimeMu.RUnlock()
+	for i := range out {
+		id, model := s.autoCandidateIDs(out[i].Model)
+		out[i].StreamHealth = s.autoStreamHealthSnapshot(id, model, time.Now())
 	}
 	return out
 }

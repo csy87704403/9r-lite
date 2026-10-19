@@ -134,6 +134,10 @@ details{margin-top:22px}
 .usage-table th:first-child,.usage-table td:first-child{text-align:left}
 .usage-table th:last-child,.usage-table td:last-child{text-align:left;white-space:normal;min-width:180px;max-width:320px}
 .usage-group{margin:12px 0}
+.auto-health-alert{display:none;margin:12px 0;padding:12px;border:1px solid #f59e0b;border-radius:8px;background:#fffbeb;color:#92400e}
+.auto-health-badge{display:inline-block;margin-left:6px;padding:2px 6px;border-radius:5px;background:#fff7ed;color:#9a3412;font-size:12px}
+.auto-health-badge.isolated{background:#fee2e2;color:#991b1b}
+.auto-health-log{margin-left:5px}
 .usage-log-modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;padding:20px;background:rgba(15,23,42,.45);z-index:1000}
 .usage-log-modal.open{display:flex}
 .usage-log-dialog{width:min(760px,100%);max-height:85vh;overflow:auto;background:#fff;border-radius:12px;padding:18px;box-shadow:0 20px 60px rgba(15,23,42,.3)}
@@ -223,6 +227,7 @@ details{margin-top:22px}
 </div>
 <div id="probeAllProgress" class="progress-wrap"><progress value="0" max="1"></progress><span class="muted">0/0</span></div>
 <div id="providerStatus" class="panel-grid"></div>
+<div id="autoHealthAlert" class="auto-health-alert" role="status" aria-live="polite"></div>
 
 <div class="tabs">
 <button id="tab_api" class="tab-button active" onclick="showMainTab('api')" type="button">API 密钥提供商</button>
@@ -251,7 +256,8 @@ details{margin-top:22px}
 <div class="muted">第三方 Agent 继续使用上面的 Base URL 和访问密钥，模型名填写当前 Auto 名称。</div>
 <div class="muted">纯文本请求会在整个列表中轮询；请求包含图片时，只会在带“多模态”标签的模型中轮询。</div>
 <div class="muted">长按模型行约 300 毫秒后可以上下拖拽排序，调整后请点击保存。</div>
-<div class="muted">列表只显示当前正在处理请求的模型，请求结束后“调用中”标识会自动隐藏。</div>
+<div class="muted">请求结束后“调用中”标识会自动隐藏；断流告警和隔离状态会继续显示，并可查看、复制日志。</div>
+<div class="muted">连续 2 次真实断流，或近 15 分钟至少 10 次有效流式调用且断流率达到 20%，自动隔离 15 分钟。到期后仅允许一个真实流式请求试恢复；短文本探测不解除隔离，不额外调用上游。临时图片切换、会话固定和手动排序保持不变。</div>
 <div id="autoModelList" class="model-list"></div>
 <div class="bar"><button class="secondary" onclick="saveGateway()">保存 Auto 设置</button><span id="autoModelStatus" class="muted"></span></div>
 </div>
@@ -321,6 +327,7 @@ let mimoProxySearchController=null;
 let uiToastTimer=null;
 let autoSortState=null;
 let autoRuntimeStatus={};
+let autoRuntimeLoading=false;
 let selectedAutoModelID='auto';
 let autoConfigSaveChain=Promise.resolve();
 let autoConfigSaveRevision=0;
@@ -752,6 +759,34 @@ function autoRuntimeBadgeHTML(model){
   const title='当前调用身份：'+client;
   return '<span class="auto-runtime-status running" title="'+esc(title)+'">调用中 '+active+' · '+esc(client)+'</span>';
 }
+function autoStreamBadgeHTML(model){
+  const h=autoRuntimeStatus[model] && autoRuntimeStatus[model].stream_health;
+  if(!h || !h.state) return '';
+  const labels={recent:'近期断流',isolated:'断流隔离中',awaiting_trial:'等待试恢复',recovering:'单请求试恢复中'};
+  const label=labels[h.state]; if(!label) return '';
+  const until=h.until?new Date(h.until*1000).toLocaleString('zh-CN',{hour12:false}):'';
+  const detail=(h.reason || '')+(h.state==='isolated'?'；最早试恢复时间：'+until:'');
+  return '<span class="auto-health-badge '+(h.state==='isolated'?'isolated':'')+'" title="'+esc(detail)+'">'+esc(label)+'</span><button class="small secondary auto-health-log" onclick="showAutoStreamLog('+esc(JSON.stringify(model))+')" type="button">查看断流日志</button>';
+}
+function renderAutoHealthAlert(){
+  const root=document.getElementById('autoHealthAlert'); if(!root) return;
+  const uniqueStates=new Map();
+  Object.values(autoRuntimeStatus).forEach(item=>{ const h=item.stream_health; if(h && h.state) uniqueStates.set(h.provider_id && h.model ? h.provider_id+'/'+h.model : item.model,h); });
+  const states=[...uniqueStates.values()];
+  if(!states.length){ root.style.display='none'; root.textContent=''; return; }
+  const isolated=states.filter(item=>item.state==='isolated').length;
+  const pending=states.filter(item=>item.state==='awaiting_trial' || item.state==='recovering').length;
+  const recent=states.filter(item=>item.state==='recent').length;
+  root.style.display='block';
+  root.innerHTML='<strong>Auto 断流告警：'+states.length+' 个模型需关注</strong> · 隔离 '+isolated+'，待恢复／试恢复 '+pending+'，近期断流 '+recent+'。健康会话不强制换模型。 <button class="small secondary" onclick="showMainTab(\'auto\')" type="button">查看 Auto 列表</button>';
+}
+function showAutoStreamLog(model){
+  const h=autoRuntimeStatus[model] && autoRuntimeStatus[model].stream_health; if(!h) return;
+  const slash=model.indexOf('/');
+  const item={provider_id:model.slice(0,slash),model:model.slice(slash+1),last_failure:h.last_interruption || h.reason || '暂无断流详情',last_failure_at:h.last_interrupted_at,last_failure_status:200,log_title:'断流日志'};
+  if(h.reason) item.last_failure+='\n\nAuto 处理：'+h.reason;
+  const index=usageLogItems.push(item)-1; showUsageLog(index);
+}
 function selectAutoModel(id){
   const cfg=parseConfig(); if(!cfg || !autoConfig(cfg,id)) return;
   selectedAutoModelID=id;
@@ -809,20 +844,24 @@ function updateCurrentAutoEnabled(){
   persistAutoConfig();
 }
 function renderAutoModels(cfg){
+  renderAutoHealthAlert();
   const root=document.getElementById('autoModelList'); if(!root) return;
   const models=autoModels(cfg);
-  root.innerHTML=models.length ? models.map((model,i)=>'<div class="model-item auto-sort-item" data-auto-sort-index="'+i+'" data-auto-model="'+esc(model)+'"><span class="auto-drag-handle" title="长按后拖拽排序">⋮⋮</span><span class="model-name">'+esc(model)+autoModelBadgeHTML(cfg,model)+autoRuntimeBadgeHTML(model)+'</span><button class="small secondary" onclick="removeAutoModel('+i+')">删除</button></div>').join('') : '<div class="muted">还没有候选模型。</div>';
+  root.innerHTML=models.length ? models.map((model,i)=>'<div class="model-item auto-sort-item" data-auto-sort-index="'+i+'" data-auto-model="'+esc(model)+'"><span class="auto-drag-handle" title="长按后拖拽排序">⋮⋮</span><span class="model-name">'+esc(model)+autoModelBadgeHTML(cfg,model)+autoRuntimeBadgeHTML(model)+autoStreamBadgeHTML(model)+'</span><button class="small secondary" onclick="removeAutoModel('+i+')">删除</button></div>').join('') : '<div class="muted">还没有候选模型。</div>';
   root.querySelectorAll('.auto-sort-item').forEach(row=>row.addEventListener('pointerdown',autoSortPointerDown));
 }
 async function loadAutoRuntimeStatus(){
+  if(autoRuntimeLoading) return;
+  autoRuntimeLoading=true;
   try{
-    const res=await fetch('/api/admin/auto-status');
+    const res=await fetch('/api/admin/auto-status',{cache:'no-store'});
     if(!res.ok) return;
     const data=await res.json();
     autoRuntimeStatus={};
     (data.models || []).forEach(item=>{ autoRuntimeStatus[item.model]=item; });
     if(!autoSortState || !autoSortState.active) renderAutoModels(parseConfig());
   }catch(_){ }
+  finally{ autoRuntimeLoading=false; }
 }
 function autoSortPointerDown(event){
   if(event.button!==undefined && event.button!==0) return;

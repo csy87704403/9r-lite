@@ -15,6 +15,12 @@ import (
 
 var errGatewayTimeout = errors.New("gateway timeout")
 
+type upstreamTimeoutObserverKey struct{}
+
+func withUpstreamTimeoutObserver(ctx context.Context, observer func()) context.Context {
+	return context.WithValue(ctx, upstreamTimeoutObserverKey{}, observer)
+}
+
 type gatewayTimeoutError struct{ stage string }
 
 func (e *gatewayTimeoutError) Error() string        { return "网关超时（非上游断流）：" + e.stage }
@@ -36,7 +42,17 @@ func doUpstreamRequest(client *http.Client, req *http.Request, stream bool) (*ht
 }
 
 func doStreamingRequest(client *http.Client, req *http.Request, headerTimeout, idleTimeout time.Duration) (*http.Response, error) {
-	ctx, cancel := context.WithCancelCause(req.Context())
+	ctx, cancelCause := context.WithCancelCause(req.Context())
+	cancel := func(err error) {
+		// Preserve locally-owned timeouts across asynchronous protocol bridges.
+		// Notify before cancellation wakes readers, so recovery never races the signal.
+		if errors.Is(err, errGatewayTimeout) && ctx.Err() == nil {
+			if observe, ok := req.Context().Value(upstreamTimeoutObserverKey{}).(func()); ok && observe != nil {
+				observe()
+			}
+		}
+		cancelCause(err)
+	}
 	// Copy the client, not its Transport: connections/proxies remain shared and
 	// concurrent non-streaming calls retain their original total timeout.
 	streamClient := *client
