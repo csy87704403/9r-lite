@@ -1917,6 +1917,7 @@ func (s *Server) proxyPostRotating(w http.ResponseWriter, r *http.Request, targe
 			_ = resp.Body.Close()
 			gate.finishResponse()
 			if gate.committed {
+				reportUpstreamReadError(w, readErr)
 				if (readErr == nil || errors.Is(readErr, errAutoStreamComplete)) && len(gate.stream.failure) == 0 && !requestContextCanceled(r.Context()) {
 					s.markProviderKeyActive(p.ID, keyIndex, upstreamModel)
 				}

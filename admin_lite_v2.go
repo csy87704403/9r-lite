@@ -285,6 +285,11 @@ details{margin-top:22px}
 <button class="secondary" onclick="loadUsageStats()" type="button">刷新</button>
 <span id="usageStatus" class="muted"></span>
 </div>
+<div class="card usage-group">
+<div class="card-title-row"><h3>断流模型排行</h3><select id="streamHealthHours" aria-label="断流统计时间范围" onchange="loadUsageStats()"><option value="24">最近 24 小时</option><option value="168">最近 7 天</option></select></div>
+<div class="muted section-note">按断流次数降序排列，断流率 = 断流次数 / 已建立的流式调用数。排除用户取消、客户端断开和输出前的限流等错误；正常结束后缺少 [DONE] 不算断流。仅统计新版启用后的真实调用，按分钟汇总，保留 7 天；页面可见时每 5 秒刷新本地统计，不探测上游。</div>
+<div id="streamHealthRows" class="muted">暂无断流记录；不代表所有模型均已验证稳定。</div>
+</div>
 <div class="muted section-note">Token 只统计上游实际返回的 usage；未返回 usage 的成功调用会单独计入“未报告”。手动和定时探测不计入统计。</div>
 <div id="usageSummary" class="usage-summary"></div>
 <div id="usageGroups"></div>
@@ -320,6 +325,8 @@ let selectedAutoModelID='auto';
 let autoConfigSaveChain=Promise.resolve();
 let autoConfigSaveRevision=0;
 let usageLogItems=[];
+let usageLoadPending=false;
+let usageRefreshQueued=false;
 function parseConfig(){ try { const cfg=JSON.parse(document.getElementById('cfg').value); Object.defineProperty(cfg,'_configRevision',{value:configRevision}); return cfg; } catch { return null; } }
 function showMainTab(name){
   ['api','oauth','auto','groups','usage'].forEach(id=>{
@@ -345,8 +352,19 @@ function usageFailureHTML(item){
 }
 function usageModelRows(models){ return models.map(item=>'<tr><td>'+esc((item.provider_name || item.provider_id)+' / '+item.model)+'</td><td>'+usageNumber(item.today && item.today.upstream_success)+'</td><td class="'+(Number(item.today && item.today.upstream_failed)>0?'err':'')+'">'+usageNumber(item.today && item.today.upstream_failed)+'</td><td>'+usageNumber(item.today && item.today.prompt_tokens)+'</td><td>'+usageNumber(item.today && item.today.completion_tokens)+'</td><td>'+usageNumber(item.today && item.today.total_tokens)+'</td><td>'+usageNumber(item.total && item.total.total_tokens)+'</td><td>'+usageNumber(item.today && item.today.unreported_calls)+'</td><td>'+usageFailureHTML(item)+'</td></tr>').join(''); }
 function usageTable(rows){ return '<div class="usage-table-wrap"><table class="usage-table"><thead><tr><th>实际提供商 / 模型</th><th>成功调用</th><th>失败尝试</th><th>今日输入</th><th>今日输出</th><th>今日总计</th><th>累计总计</th><th>未报告</th><th>最后失败原因</th></tr></thead><tbody>'+rows+'</tbody></table></div>'; }
+function renderStreamHealth(data){
+  const rows=Array.isArray(data && data.stream_health)?data.stream_health:[];
+  const root=document.getElementById('streamHealthRows');
+  if(!rows.length){ root.innerHTML='<div class="muted">此时间范围内暂无断流记录；不代表所有模型均已验证稳定。</div>'; return; }
+  root.innerHTML='<div class="usage-table-wrap"><table class="usage-table"><thead><tr><th>实际提供商 / 模型</th><th>断流次数 ↓</th><th>流式调用</th><th>断流率</th><th>最近断流时间</th><th>最近断流原因</th></tr></thead><tbody>'+rows.map(item=>{
+    const when=item.last_interrupted_at?new Date(item.last_interrupted_at*1000).toLocaleString('zh-CN',{hour12:false}):'未知';
+    const log={...item,last_failure:item.last_interruption || '上游流式响应未正常完成',last_failure_at:item.last_interrupted_at,last_failure_status:200,log_title:'断流日志'};
+    return '<tr><td>'+esc((item.provider_name || item.provider_id)+' / '+item.model)+'</td><td class="err">'+usageNumber(item.interruptions)+'</td><td>'+usageNumber(item.calls)+'</td><td>'+esc((Number(item.interruption_rate || 0)*100).toFixed(1))+'%</td><td>'+esc(when)+'</td><td>'+usageFailureHTML(log)+'</td></tr>';
+  }).join('')+'</tbody></table></div>';
+}
 function renderUsageStats(data){
   usageLogItems=[];
+  renderStreamHealth(data);
   const groups=Array.isArray(data && data.groups)?data.groups:[];
   const today={}; const total={};
   groups.forEach(group=>{ addUsageCounters(today,group.today); addUsageCounters(total,group.total); });
@@ -374,22 +392,32 @@ function showUsageLog(index){
   const when=at ? new Date(at*1000).toLocaleString('zh-CN',{hour12:false}) : '未知';
   const provider=item.provider_name || item.provider_id || '未知提供商';
   const status=Number(item.last_failure_status || 0);
+  document.getElementById('usageLogTitle').textContent=item.log_title || '失败日志';
   document.getElementById('usageLogText').value='模型：'+provider+' / '+(item.model || '')+'\n时间：'+when+'\nHTTP 状态：'+(status || '未知')+'\n\n错误内容：\n'+String(item.last_failure || '');
+  if(item.log_title==='断流日志') document.getElementById('usageLogText').value+='\n\n注：HTTP 200 仅表示连接建立成功，不代表流式回复已正常完成。';
   setText('usageLogStatus','muted','');
   document.getElementById('usageLogModal').classList.add('open');
 }
 function closeUsageLog(){ document.getElementById('usageLogModal').classList.remove('open'); }
 async function copyUsageLog(){ try{ await copyTextValue(document.getElementById('usageLogText').value); setText('usageLogStatus','ok','日志已复制'); }catch(e){ setText('usageLogStatus','err','复制失败：'+e.message); } }
 async function loadUsageStats(){
+  if(usageLoadPending){ usageRefreshQueued=true; return; }
+  usageLoadPending=true;
+  const hours=document.getElementById('streamHealthHours').value;
   try{
     setText('usageStatus','muted','正在加载...');
-    const res=await fetch('/api/admin/usage');
+    const res=await fetch('/api/admin/usage?stream_hours='+encodeURIComponent(hours),{cache:'no-store'});
     const data=await res.json();
     if(!res.ok) throw new Error(data.error || res.statusText);
+    if(hours!==document.getElementById('streamHealthHours').value) return;
     renderUsageStats(data);
     setText('usageStatus','ok','统计日期 '+(data.date || ''));
   }catch(e){ setText('usageStatus','err','加载失败：'+e.message); }
+  finally{ usageLoadPending=false; if(usageRefreshQueued){ usageRefreshQueued=false; loadUsageStats(); } }
 }
+setInterval(()=>{
+  if(!document.hidden && document.getElementById('panel_usage').classList.contains('active') && !usageLoadPending) loadUsageStats();
+},5000);
 function ensureEndpointRow(afterID,id,label,path){
   if(!document.getElementById(id)){
     const after=document.getElementById(afterID);

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -49,10 +50,11 @@ type UsageGroupStats struct {
 }
 
 type UsageStore struct {
-	Version   int                         `json:"version"`
-	Date      string                      `json:"date"`
-	UpdatedAt int64                       `json:"updated_at"`
-	Groups    map[string]*UsageGroupStats `json:"groups"`
+	Version      int                           `json:"version"`
+	Date         string                        `json:"date"`
+	UpdatedAt    int64                         `json:"updated_at"`
+	Groups       map[string]*UsageGroupStats   `json:"groups"`
+	StreamHealth map[string]*StreamHealthStats `json:"stream_health,omitempty"`
 }
 
 type usageRequestInfo struct {
@@ -79,6 +81,7 @@ type usageResponseWriter struct {
 	usage       tokenUsage
 	inspection  sseInspection
 	readErr     error
+	writeErr    error
 }
 
 type usageClientWriter struct {
@@ -182,6 +185,7 @@ func (s *Server) beginUpstreamUsage(w http.ResponseWriter, r *http.Request, p Pr
 	tracked := &usageResponseWriter{target: w, stream: stream}
 	return tracked, func() {
 		tracked.finishStream()
+		interrupted := tracked.streamInterrupted()
 		status := tracked.status
 		if status == 0 {
 			status = http.StatusOK
@@ -221,6 +225,12 @@ func (s *Server) beginUpstreamUsage(w http.ResponseWriter, r *http.Request, p Pr
 			}
 		}
 		s.recordUpstreamUsage(*info, p, model, usageStatus, usage, failureReason, status)
+		if stream && status >= 200 && status <= 299 && tracked.writeErr == nil && strings.Contains(strings.ToLower(tracked.Header().Get("Content-Type")), "text/event-stream") {
+			if tracked.readErr != nil {
+				failureReason = "上游流读取中断：" + truncateString(tracked.readErr.Error(), 1000)
+			}
+			s.recordStreamHealth(p, model, interrupted, failureReason, time.Now())
+		}
 	}
 }
 
@@ -277,7 +287,13 @@ func (w *usageResponseWriter) Write(body []byte) (int, error) {
 		remaining := 8<<20 - w.body.Len()
 		w.body.Write(body[:min(len(body), remaining)])
 	}
-	return w.target.Write(body)
+	n, err := w.target.Write(body)
+	if err != nil && !errors.Is(err, errAutoStreamComplete) && !errors.Is(err, errAutoStreamRejected) {
+		w.writeErr = err
+	} else if n < len(body) && err == nil {
+		w.writeErr = io.ErrShortWrite
+	}
+	return n, err
 }
 
 func (w *usageResponseWriter) Flush() {
@@ -303,6 +319,9 @@ func (w *usageResponseWriter) consumeStream(body []byte) {
 }
 
 func (w *usageResponseWriter) finishStream() {
+	if w.stream && strings.Contains(strings.ToLower(w.Header().Get("Content-Type")), "text/event-stream") {
+		w.inspection.finish()
+	}
 	if len(w.pending) > 0 {
 		w.consumeStreamLine(w.pending)
 		w.pending = nil
@@ -512,6 +531,7 @@ func (s *Server) usageSaveLoop() {
 func (s *Server) saveUsage() error {
 	s.usageMu.Lock()
 	rollUsageDate(&s.usage)
+	pruneStreamHealth(&s.usage, time.Now())
 	b, err := json.MarshalIndent(s.usage, "", "  ")
 	s.usageMu.Unlock()
 	if err != nil {
@@ -524,6 +544,7 @@ func (s *Server) usageSnapshot() UsageStore {
 	s.usageMu.Lock()
 	defer s.usageMu.Unlock()
 	rollUsageDate(&s.usage)
+	pruneStreamHealth(&s.usage, time.Now())
 	b, _ := json.Marshal(s.usage)
 	var snapshot UsageStore
 	_ = json.Unmarshal(b, &snapshot)
@@ -538,7 +559,17 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	hours := 24
+	switch r.URL.Query().Get("stream_hours") {
+	case "", "24":
+	case "168":
+		hours = 168
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "stream_hours must be 24 or 168"})
+		return
+	}
 	snapshot := s.usageSnapshot()
+	w.Header().Set("Cache-Control", "no-store")
 	groups := make([]*UsageGroupStats, 0, len(snapshot.Groups))
 	for _, group := range snapshot.Groups {
 		groups = append(groups, group)
@@ -551,6 +582,7 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"date": snapshot.Date, "updated_at": snapshot.UpdatedAt, "groups": groups,
+		"stream_health": streamHealthRanking(snapshot, hours, time.Now()), "stream_hours": hours,
 	})
 }
 

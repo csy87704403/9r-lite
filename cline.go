@@ -381,7 +381,8 @@ func (s *Server) proxyCline(w http.ResponseWriter, r *http.Request, p ProviderCo
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = copyFlush(w, resp.Body)
+	_, readErr := copyFlush(w, resp.Body)
+	reportUpstreamReadError(w, readErr)
 }
 
 func (s *Server) doClineRequest(ctx context.Context, p ProviderConfig, stream bool, body []byte, allowRefresh bool) (*http.Response, ProviderConfig, error) {

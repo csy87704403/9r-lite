@@ -343,7 +343,8 @@ func (s *Server) proxyAnthropicNative(w http.ResponseWriter, r *http.Request, p 
 	defer resp.Body.Close()
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	_, _ = copyFlush(w, resp.Body)
+	_, readErr := copyFlush(w, resp.Body)
+	reportUpstreamReadError(w, readErr)
 }
 
 func (s *Server) proxyAnthropicAsOpenAI(w http.ResponseWriter, r *http.Request, p ProviderConfig, req chatRequest, upstreamModel string) {
