@@ -523,6 +523,7 @@ func newHTTPClient(proxyAddress string) (*http.Client, error) {
 			IdleConnTimeout:     5 * time.Second,
 			DialContext:         preferIPv4DialContext(),
 			Proxy:               proxyFunc,
+			TLSHandshakeTimeout: 10 * time.Second,
 		},
 	}, nil
 }
@@ -1899,7 +1900,7 @@ func (s *Server) proxyPostRotating(w http.ResponseWriter, r *http.Request, targe
 		for k, v := range headers {
 			upReq.Header.Set(k, v)
 		}
-		resp, err := s.client.Do(upReq)
+		resp, err := doUpstreamRequest(s.client, upReq, strings.Contains(baseHeaders["Accept"], "text/event-stream"))
 		lastErr = err
 		if err != nil {
 			break
@@ -2016,7 +2017,7 @@ func (s *Server) proxyRawWithClient(w http.ResponseWriter, r *http.Request, clie
 		upReq.Header.Set(k, v)
 	}
 
-	resp, err := client.Do(upReq)
+	resp, err := doUpstreamRequest(client, upReq, strings.Contains(upReq.Header.Get("Accept"), "text/event-stream"))
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 		return http.StatusBadGateway

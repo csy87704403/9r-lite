@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -177,7 +176,11 @@ func (w *autoRetryWriter) finishResponse() {
 	}
 	w.stream.finish()
 	if w.readErr != nil {
-		w.stream.fail("upstream stream read failed")
+		if errors.Is(w.readErr, errGatewayTimeout) {
+			w.stream.failure = incompleteStreamError(w.readErr)
+		} else {
+			w.stream.fail("upstream stream read failed")
+		}
 	}
 	if len(w.stream.failure) == 0 && (!w.stream.complete || !w.stream.output) {
 		w.stream.fail("upstream stream ended without a complete model response")
@@ -254,5 +257,5 @@ func (s *Server) commitAutoRequestSuccess(key, candidate string, vision, newImag
 }
 
 func incompleteStreamError(err error) []byte {
-	return mustJSON(map[string]any{"error": map[string]any{"message": fmt.Sprintf("upstream stream interrupted: %v", err), "type": "upstream_error"}})
+	return mustJSON(map[string]any{"error": streamErrorDetail(err)})
 }

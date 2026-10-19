@@ -457,7 +457,7 @@ func (s *Server) doClineAccountRequest(ctx context.Context, p ProviderConfig, ac
 	for k, v := range headers {
 		upReq.Header.Set(k, v)
 	}
-	resp, err := s.client.Do(upReq)
+	resp, err := doUpstreamRequest(s.client, upReq, stream)
 	if err != nil {
 		return nil, p, false, err
 	}

@@ -287,7 +287,7 @@ details{margin-top:22px}
 </div>
 <div class="card usage-group">
 <div class="card-title-row"><h3>断流模型排行</h3><select id="streamHealthHours" aria-label="断流统计时间范围" onchange="loadUsageStats()"><option value="24">最近 24 小时</option><option value="168">最近 7 天</option></select></div>
-<div class="muted section-note">按断流次数降序排列，断流率 = 断流次数 / 已建立的流式调用数。排除用户取消、客户端断开和输出前的限流等错误；正常结束后缺少 [DONE] 不算断流。仅统计新版启用后的真实调用，按分钟汇总，保留 7 天；页面可见时每 5 秒刷新本地统计，不探测上游。</div>
+<div class="muted section-note">按断流次数降序排列，断流率 = 断流次数 / 已建立的流式调用数。排除网关自身超时、用户取消、客户端断开和输出前的限流等错误；正常结束后缺少 [DONE] 不算断流。网关超时可在下方失败日志中查看，修复前的历史次数不会自动扣除。仅统计新版启用后的真实调用，按分钟汇总，保留 7 天；页面可见时每 5 秒刷新本地统计，不探测上游。</div>
 <div id="streamHealthRows" class="muted">暂无断流记录；不代表所有模型均已验证稳定。</div>
 </div>
 <div class="muted section-note">Token 只统计上游实际返回的 usage；未返回 usage 的成功调用会单独计入“未报告”。手动和定时探测不计入统计。</div>

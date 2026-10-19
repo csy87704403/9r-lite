@@ -353,7 +353,7 @@ func (s *Server) proxyQoder(w http.ResponseWriter, r *http.Request, p ProviderCo
 	for k, v := range headers {
 		upReq.Header.Set(k, v)
 	}
-	resp, err := s.client.Do(upReq)
+	resp, err := doUpstreamRequest(s.client, upReq, req.Stream)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 		return
@@ -470,7 +470,10 @@ func qoderStreamToOpenAI(w http.ResponseWriter, r io.Reader) {
 			flusher.Flush()
 		}
 	}
-	_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	if err := scanner.Err(); err != nil {
+		reportUpstreamReadError(w, err)
+		writeSSEData(w, json.RawMessage(incompleteStreamError(err)), flusher)
+	}
 }
 
 func qoderCollectToJSON(w http.ResponseWriter, r io.Reader, model string) {

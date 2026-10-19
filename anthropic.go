@@ -400,7 +400,7 @@ func (s *Server) doAnthropicRequest(ctx context.Context, incoming *http.Request,
 			return nil, err
 		}
 		applyAnthropicUpstreamHeaders(upReq.Header, incoming, p, keys[keyIndex], stream)
-		resp, err := s.client.Do(upReq)
+		resp, err := doUpstreamRequest(s.client, upReq, stream)
 		if err != nil {
 			return nil, err
 		}
@@ -778,7 +778,8 @@ func anthropicStreamToOpenAI(w http.ResponseWriter, r io.Reader, model string) {
 		return
 	}
 	if scanErr != nil {
-		fail(map[string]any{"type": "upstream_error", "message": scanErr.Error()})
+		reportUpstreamReadError(w, scanErr)
+		fail(streamErrorDetail(scanErr))
 		return
 	}
 	if !finished {
@@ -910,7 +911,8 @@ func openAIStreamToAnthropic(w http.ResponseWriter, r io.Reader, model string) {
 		return
 	}
 	if scanErr != nil {
-		fail(map[string]any{"type": "api_error", "message": scanErr.Error()})
+		reportUpstreamReadError(w, scanErr)
+		fail(streamErrorDetail(scanErr))
 		return
 	}
 	if !completed {

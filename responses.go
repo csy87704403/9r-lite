@@ -85,7 +85,7 @@ func (s *Server) doResponsesRequest(ctx context.Context, p ProviderConfig, body 
 		req.Header.Set("Authorization", "Bearer "+keys[keyIndex])
 		req.Header.Set("Accept", acceptHeader(stream))
 		req.Header.Set("User-Agent", "9router-lite/0.1")
-		resp, err := s.client.Do(req)
+		resp, err := doUpstreamRequest(s.client, req, stream)
 		if err != nil {
 			lastErr = err
 			break
@@ -446,6 +446,7 @@ func responsesStreamToChat(w http.ResponseWriter, r io.Reader, model string) {
 		if scanErr == nil {
 			scanErr = errors.New("Responses stream ended before response.completed")
 		}
+		reportUpstreamReadError(w, scanErr)
 		var failure map[string]any
 		_ = json.Unmarshal(incompleteStreamError(scanErr), &failure)
 		writeSSEData(w, failure, flusher)

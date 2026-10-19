@@ -224,8 +224,17 @@ func (s *Server) beginUpstreamUsage(w http.ResponseWriter, r *http.Request, p Pr
 				failureReason = usageFailureReason(status, tracked.inspection.failure)
 			}
 		}
+		// Only our typed cancellation cause identifies a gateway-owned timeout;
+		// upstreams can themselves return an error named "gateway_timeout".
+		gatewayTimeout := errors.Is(tracked.readErr, errGatewayTimeout)
+		if gatewayTimeout {
+			failureReason = "网关超时（不计入上游断流）：" + failureReason
+			if tracked.readErr != nil {
+				failureReason = tracked.readErr.Error()
+			}
+		}
 		s.recordUpstreamUsage(*info, p, model, usageStatus, usage, failureReason, status)
-		if stream && status >= 200 && status <= 299 && tracked.writeErr == nil && strings.Contains(strings.ToLower(tracked.Header().Get("Content-Type")), "text/event-stream") {
+		if stream && !gatewayTimeout && status >= 200 && status <= 299 && tracked.writeErr == nil && strings.Contains(strings.ToLower(tracked.Header().Get("Content-Type")), "text/event-stream") {
 			if tracked.readErr != nil {
 				failureReason = "上游流读取中断：" + truncateString(tracked.readErr.Error(), 1000)
 			}
