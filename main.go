@@ -729,6 +729,7 @@ func mergeDefaultConfig(cfg Config) Config {
 	cfg.DeletedProviderIDs = keysFromSet(deleted)
 	cfg.Providers = merged
 	normalizeConfigModelRefs(&cfg)
+	pruneUnpublishedAutoModels(&cfg)
 	return cfg
 }
 

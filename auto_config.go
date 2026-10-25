@@ -84,6 +84,37 @@ func syncLegacyAutoModel(cfg *Config) {
 	cfg.AutoModel = legacy
 }
 
+// Reconcile loaded/imported Auto lists against publishing, not probe health.
+// Temporary failures must not permanently remove a user's chosen candidates.
+func pruneUnpublishedAutoModels(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	normalizeAutoModelConfigs(cfg)
+	published := make(map[string]map[string]bool, len(cfg.Providers)*2)
+	for _, p := range cfg.Providers {
+		route := providerPublicID(p)
+		if _, exists := published[route]; !exists {
+			published[route] = sliceSet(providerPublishedModelIDs(p))
+		}
+	}
+	// Internal provider IDs take precedence, as in Auto request routing.
+	for _, p := range cfg.Providers {
+		published[p.ID] = sliceSet(providerPublishedModelIDs(p))
+	}
+	for i := range cfg.AutoModels {
+		models := make([]string, 0, len(cfg.AutoModels[i].Models))
+		for _, ref := range cfg.AutoModels[i].Models {
+			route, model, ok := strings.Cut(ref, "/")
+			if ok && published[route][model] {
+				models = append(models, ref)
+			}
+		}
+		cfg.AutoModels[i].Models = models
+	}
+	syncLegacyAutoModel(cfg)
+}
+
 func validAutoModelID(id string) bool {
 	id = strings.TrimSpace(id)
 	if id == "" || len(id) > 64 {
